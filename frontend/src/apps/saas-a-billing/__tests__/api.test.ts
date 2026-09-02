@@ -61,7 +61,20 @@ describe('billingApi', () => {
     expect(captured[1].params).toEqual({})
   })
 
-  it('createRun が month/target_env/distribute/force を body に載せる', async () => {
+  // 集計対象環境はサーバ側で固定されるため既定では送らない（設計 R1）
+  it('createRun が targetEnv 無しなら target_env を送らない', async () => {
+    await billingApi.createRun({ month: MONTH, distribute: true, force: false })
+
+    expect(captured[0].method).toBe('post')
+    expect(captured[0].url).toBe('/runs')
+    expect(JSON.parse(captured[0].data as string)).toEqual({
+      month: MONTH,
+      distribute: true,
+      force: false,
+    })
+  })
+
+  it('createRun が targetEnv を渡されたときだけ target_env を載せる', async () => {
     await billingApi.createRun({
       month: MONTH,
       targetEnv: 'production',
@@ -69,8 +82,6 @@ describe('billingApi', () => {
       force: false,
     })
 
-    expect(captured[0].method).toBe('post')
-    expect(captured[0].url).toBe('/runs')
     expect(JSON.parse(captured[0].data as string)).toEqual({
       month: MONTH,
       target_env: 'production',

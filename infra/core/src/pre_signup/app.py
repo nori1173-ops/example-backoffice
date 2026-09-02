@@ -12,8 +12,10 @@ def handler(event: dict, context) -> dict:
     if not email:
         raise Exception("email attribute is required")
 
-    domain = email.split("@")[-1].lower()
-    if domain != ALLOWED_DOMAIN:
+    address = str(email).strip().lower()
+    if address.count("@") != 1:
+        raise Exception("email format is invalid")
+    if address.split("@")[1] != ALLOWED_DOMAIN:
         raise Exception(f"Signup is restricted to @{ALLOWED_DOMAIN} domain only")
 
     return event

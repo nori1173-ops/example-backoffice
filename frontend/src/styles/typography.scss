@@ -1,0 +1,103 @@
+/*
+ * Vuetify 4 はタイポグラフィ用ユーティリティを Material 3 系（.text-headline-* など）へ入れ替え、
+ * Vuetify 3 の .text-h1〜.text-h6 / .text-subtitle-* / .text-body-* / .text-caption / .text-overline を
+ * 廃止した。既存画面の見出し・注釈がすべて本文サイズで表示されてしまうため、
+ * 旧クラスを Vuetify 3 の値のまま補う（値の出典: vuetify@3 の $typography）。
+ * font-family は指定しない。.v-application が持つ日本語フォントを継承させる。
+ */
+
+.text-h1 {
+  font-size: 6rem !important;
+  font-weight: 300 !important;
+  line-height: 6rem !important;
+  letter-spacing: -0.015625em !important;
+  text-transform: none !important;
+}
+
+.text-h2 {
+  font-size: 3.75rem !important;
+  font-weight: 300 !important;
+  line-height: 3.75rem !important;
+  letter-spacing: -0.0083333333em !important;
+  text-transform: none !important;
+}
+
+.text-h3 {
+  font-size: 3rem !important;
+  font-weight: 400 !important;
+  line-height: 3.125rem !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+
+.text-h4 {
+  font-size: 2.125rem !important;
+  font-weight: 400 !important;
+  line-height: 2.5rem !important;
+  letter-spacing: 0.0073529412em !important;
+  text-transform: none !important;
+}
+
+.text-h5 {
+  font-size: 1.5rem !important;
+  font-weight: 400 !important;
+  line-height: 2rem !important;
+  letter-spacing: normal !important;
+  text-transform: none !important;
+}
+
+.text-h6 {
+  font-size: 1.25rem !important;
+  font-weight: 500 !important;
+  line-height: 2rem !important;
+  letter-spacing: 0.0125em !important;
+  text-transform: none !important;
+}
+
+.text-subtitle-1 {
+  font-size: 1rem !important;
+  font-weight: 400 !important;
+  line-height: 1.75rem !important;
+  letter-spacing: 0.009375em !important;
+  text-transform: none !important;
+}
+
+.text-subtitle-2 {
+  font-size: 0.875rem !important;
+  font-weight: 500 !important;
+  line-height: 1.375rem !important;
+  letter-spacing: 0.0071428571em !important;
+  text-transform: none !important;
+}
+
+.text-body-1 {
+  font-size: 1rem !important;
+  font-weight: 400 !important;
+  line-height: 1.5rem !important;
+  letter-spacing: 0.03125em !important;
+  text-transform: none !important;
+}
+
+.text-body-2 {
+  font-size: 0.875rem !important;
+  font-weight: 400 !important;
+  line-height: 1.25rem !important;
+  letter-spacing: 0.0178571429em !important;
+  text-transform: none !important;
+}
+
+.text-caption {
+  font-size: 0.75rem !important;
+  font-weight: 400 !important;
+  line-height: 1.25rem !important;
+  letter-spacing: 0.0333333333em !important;
+  text-transform: none !important;
+}
+
+.text-overline {
+  font-size: 0.75rem !important;
+  font-weight: 500 !important;
+  line-height: 2rem !important;
+  letter-spacing: 0.1666666667em !important;
+  text-transform: uppercase !important;
+}

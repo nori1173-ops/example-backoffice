@@ -17,6 +17,7 @@
 
 import json
 import os
+import re
 
 import boto3
 from aws_lambda_powertools.utilities.idempotency import (
@@ -26,6 +27,7 @@ from aws_lambda_powertools.utilities.idempotency import (
 )
 
 from example_backoffice.logging import LambdaLogger, get_logger
+from example_backoffice.mail import is_allowed_address
 
 try:  # Lambda ではハンドラと同階層に配置されるため直接 import できる
     from ses_sender import AttachmentNotFoundError, from_address_from_env, send_email
@@ -43,6 +45,9 @@ DLQ_URL_ENV = "DLQ_URL"
 SSM_PREFIX_ENV = "SSM_PREFIX"
 IDEMPOTENCY_TTL_SECONDS = 24 * 60 * 60
 PERMANENT_SLACK_ERRORS = ("channel_not_found", "invalid_auth", "not_in_channel")
+EMAIL_ADDRESS_FIELDS = ("to", "cc", "reply_to")
+APP_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+PARENT_SEGMENT = ".."
 
 logger = get_logger()
 
@@ -104,12 +109,37 @@ def _require(condition: bool, reason: str) -> None:
         raise PermanentError(reason)
 
 
+def _validate_recipients(email: dict) -> None:
+    """宛先を社内ドメインだけに限る（SEC-07）。課金明細の社外配布を送信直前で止める。"""
+    for field in EMAIL_ADDRESS_FIELDS:
+        values = email.get(field)
+        if values is None:
+            continue
+        _require(isinstance(values, list), f"email.{field} は配列である必要があります")
+        for address in values:
+            _require(is_allowed_address(address), f"email.{field} に許可されていないドメインの宛先があります")
+
+
+def _validate_attachments(body: dict) -> None:
+    """添付キーを送信元アプリのプレフィックス配下に限る（設計 8.2 / SEC-07）。"""
+    attachments = body.get("attachments") or []
+    _require(isinstance(attachments, list), "attachments は配列である必要があります")
+    prefix = f"{body['app']}/"
+    for attachment in attachments:
+        _require(isinstance(attachment, dict), "attachments[] がオブジェクトではありません")
+        key = attachment.get("key")
+        _require(isinstance(key, str) and key.startswith(prefix), f"attachments[].key が {prefix} 配下ではありません")
+        _require(PARENT_SEGMENT not in key.split("/"), "attachments[].key に .. は使えません")
+
+
 def validate_message(body: object) -> None:
     """受信側の軽量検証（設計 8.2）。違反は `PermanentError`。"""
     _require(isinstance(body, dict), "メッセージが JSON オブジェクトではありません")
     _require(body.get("schema") == SCHEMA, f"schema が {SCHEMA} ではありません: {body.get('schema')}")
     _require(bool(body.get("message_id")), "message_id がありません")
-    _require(bool(body.get("app")), "app がありません")
+    app_id = body.get("app")
+    _require(bool(app_id), "app がありません")
+    _require(isinstance(app_id, str) and bool(APP_PATTERN.match(app_id)), "app が kebab-case ではありません")
 
     channels = body.get("channels")
     _require(isinstance(channels, list) and bool(channels), "channels がありません")
@@ -122,10 +152,12 @@ def validate_message(body: object) -> None:
         _require(bool(email.get("to")), "email.to がありません")
         _require(bool(email.get("subject")), "email.subject がありません")
         _require("text" in email, "email.text がありません")
+        _validate_recipients(email)
     if SLACK in channels:
         slack = body.get(SLACK)
         _require(isinstance(slack, dict), "channels に slack があるので slack が必要です")
         _require(bool(slack.get("text")), "slack.text がありません")
+    _validate_attachments(body)
 
 
 def _is_permanent(exc: Exception) -> bool:

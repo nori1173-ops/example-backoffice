@@ -1,10 +1,12 @@
 import type { Router } from 'vue-router'
+import { SITE_TITLE, siteEnv } from '@/config/site'
 import { useAuthStore } from '@/stores/auth'
 
-const SITE_TITLE = 'example-backoffice'
+/** 検証サイトのタブをタイトルの先頭で見分けられるようにする（UI-12） */
+const VERIFICATION_PREFIX = '[検証] '
 
 /** 認証済みユーザーが開く必要のないルート（設計 9.6） */
-const GUEST_ONLY_ROUTE_NAMES: readonly string[] = ['login', 'signup']
+const GUEST_ONLY_ROUTE_NAMES: readonly string[] = ['login', 'signup', 'forgot-password']
 
 export function installGuards(router: Router): void {
   router.beforeEach(async (to) => {
@@ -36,6 +38,7 @@ export function installGuards(router: Router): void {
   })
 
   router.afterEach((to) => {
-    document.title = [to.meta.title, SITE_TITLE].filter(Boolean).join(' | ')
+    const title = [to.meta.title, SITE_TITLE].filter(Boolean).join(' | ')
+    document.title = siteEnv() === 'dev' ? `${VERIFICATION_PREFIX}${title}` : title
   })
 }

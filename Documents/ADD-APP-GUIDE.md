@@ -45,8 +45,11 @@ sam init --location ./templates/app --name {app} --no-input \
 ### ステップ 3: SSM 契約を確認する
 
 - `apps/{app}/template.yaml` の `Parameters` の `Default` が DESIGN.md 4.2 のキー一覧と一致していることを確認する（雛形は一致した状態で生成される。キー名を変えない）。
-- `samconfig.toml` の `[production.deploy.parameters]` が prod のキー名（`/example-backoffice/prod/...`）を上書きしていることを確認する。
+- **CloudWatch アラームを持つなら `OpsTopicArn` を足す。** `Type: AWS::SSM::Parameter::Value<String>` / `Default: /example-backoffice/dev/ops/topic-arn` のパラメータを定義し、全アラームの `AlarmActions` に `!Ref OpsTopicArn` を繋ぐ（DESIGN.md 4.2 / 8.1）。core が書き手なので **core をデプロイした後でないとアプリのデプロイが失敗する**。トピックのメール購読は CloudFormation では担保できず、手で作る（DESIGN.md 13.4 の手順 6）。
+- `samconfig.toml` の `[production.deploy.parameters]` が prod のキー名（`/example-backoffice/prod/...`）を上書きしていることを確認する。`OpsTopicArn` も両 config-env に書く。
+- **`tests/infra/test_samconfig.py` に新アプリを登録する。** `SAMCONFIGS` / `STACK_NAMES` にパスとスタック名を足し、`EXPECTED_OVERRIDES` に dev / prod それぞれの環境依存パラメータ（`Env` / `LogLevel` / `PortalUrl` / `OpsTopicArn` など）の期待値を書く。これで `[production]` に dev のキーが残る事故を機械検査できる。
 - アプリ固有の秘密（外部 API の認証情報など）は `/example-backoffice/{env}/apps/{app}/...` に SecureString で手動登録する。`/apps/{app}/` 配下の階層はアプリが自由に決めてよい（例: saas-a-billing は `targets/{target_env}/base-url` のように集計対象環境で分けている）。
+- **集計対象環境をスタックパラメータで固定する方式（saas-a-billing の `TargetEnv`）は、あのアプリ固有の作りである。** 外部システムに検証／本番の 2 面があり、取り違えると業務上の事故になるアプリだけが真似すればよい。雛形には含まれていない。
 
 ```bash
 aws ssm get-parameters-by-path --path /example-backoffice/dev --recursive --query 'Parameters[].Name'
@@ -212,6 +215,8 @@ PR の説明に転記して使う。
 - [ ] 秘密情報（トークン・パスワード・Webhook URL）をログに出していない
 - [ ] バッチがある場合、Scheduler の DLQ と Lambda の `OnFailure` 送信先がある
 - [ ] ステートマシンを使う場合、`statemachine/*.asl.json` がリポジトリにあり、`ExecutionsFailed` / `ExecutionsTimedOut` のアラームがある
+- [ ] アラームを持つ場合、`OpsTopicArn`（`AWS::SSM::Parameter::Value<String>`、`Default: /example-backoffice/dev/ops/topic-arn`）を足し、全アラームの `AlarmActions` に繋いでいる（samconfig の `[production]` は prod のキー名を上書き）
+- [ ] `tests/infra/test_samconfig.py` の `SAMCONFIGS` / `STACK_NAMES` / `EXPECTED_OVERRIDES` に新アプリを登録した
 - [ ] 30 秒を超える処理を API から同期実行していない
 
 ### フロント

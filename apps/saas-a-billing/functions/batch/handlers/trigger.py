@@ -149,7 +149,7 @@ def _start_execution(target_env: str, month: str, now: datetime) -> str:
 @LambdaLogger.contextualize
 def handler(event: dict, context) -> dict:
     settings = repo.get_settings()
-    target_env = settings["target_env"]
+    target_env = repo.target_env()
     now = _now()
     month = _target_month(settings, now)
     run = repo.get_run(target_env, month)

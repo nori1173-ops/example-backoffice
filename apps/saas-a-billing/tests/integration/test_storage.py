@@ -21,6 +21,7 @@ PRODUCTION_PREFIX = "saas-a-billing/production/2026/10"
 VERIFICATION_PREFIX = "saas-a-billing/verification/2026/10"
 XLSX_FILENAME = "saas_a_billing_2026-10.xlsx"
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+LIFECYCLE_TAGGING = "lifecycle=expire-90"
 
 
 @pytest.fixture
@@ -39,7 +40,7 @@ def part_data() -> dict:
     return {
         "tenant_cd": TENANT_CD,
         "tenant_name": "サンプル建設",
-        "devices": [{"device_cd": "10000001-01-LoggerA-400", "device_name": "観測局1", "amount": 1350}],
+        "devices": [{"device_cd": "10000001-01-LoggerA-400", "device_name": "観測局1", "amount": 1400}],
     }
 
 
@@ -127,6 +128,32 @@ def test_presign_returns_expires_at_in_future(bucket):
     _, expires_at = storage.presign_xlsx(storage.xlsx_key(PRODUCTION, MONTH), XLSX_FILENAME)
     assert expires_at.tzinfo is not None
     assert before + timedelta(seconds=300) <= expires_at <= datetime.now(JST) + timedelta(seconds=300)
+
+
+def tags(bucket: str, key: str) -> dict:
+    return {tag["Key"]: tag["Value"] for tag in s3().get_object_tagging(Bucket=bucket, Key=key)["TagSet"]}
+
+
+def test_put_part_tags_intermediate_artifact(bucket):
+    key = storage.put_part(PRODUCTION, MONTH, TENANT_CD, part_data())
+    assert storage.INTERMEDIATE_TAGGING == LIFECYCLE_TAGGING
+    assert tags(bucket, key) == {"lifecycle": "expire-90"}
+
+
+def test_put_tenants_tags_intermediate_artifact(bucket):
+    key = storage.put_tenants(PRODUCTION, MONTH, [{"tenant_cd": TENANT_CD, "tenant_name": "サンプル建設"}])
+    assert storage.get_tenants(PRODUCTION, MONTH)[0]["tenant_cd"] == TENANT_CD
+    assert tags(bucket, key) == {"lifecycle": "expire-90"}
+
+
+def test_put_result_is_not_tagged_for_expiry(bucket):
+    key = storage.put_result(PRODUCTION, MONTH, result_data())
+    assert tags(bucket, key) == {}
+
+
+def test_put_xlsx_is_not_tagged_for_expiry(bucket):
+    key = storage.put_xlsx(PRODUCTION, MONTH, b"PK\x03\x04dummy-xlsx")
+    assert tags(bucket, key) == {}
 
 
 def test_re_put_overwrites_same_key(bucket):

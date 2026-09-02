@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDisplay } from 'vuetify'
 import { apps } from '@/apps/registry'
+import { SITE_ENV_COLORS, SITE_ENV_LABELS, siteEnv } from '@/config/site'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 
@@ -10,13 +11,27 @@ const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 const ui = useUiStore()
-const { mobile } = useDisplay()
+const { mdAndUp } = useDisplay()
+
+// 狭い画面ではドロワーが一時表示で画面を覆うため、閉じた状態から始める（UI-02）
+watch(mdAndUp, (wide) => { ui.drawer = wide }, { immediate: true })
+
+function closeOnNarrow(): void {
+  if (!mdAndUp.value) {
+    ui.drawer = false
+  }
+}
 
 function allowed(requiredGroups?: string[]): boolean {
   return !requiredGroups?.length || requiredGroups.some((group) => auth.groups.includes(group))
 }
 
 const visibleApps = computed(() => apps.filter((app) => allowed(app.requiredGroups)))
+
+// dev サイトと本番サイトの取り違えを防ぐため常時表示する（UI-12）
+const site = computed(() => siteEnv())
+const siteLabel = computed(() => SITE_ENV_LABELS[site.value])
+const siteColor = computed(() => SITE_ENV_COLORS[site.value])
 
 const currentApp = computed(() => apps.find((app) => app.id === route.meta.appId))
 
@@ -27,10 +42,10 @@ const currentNav = computed(() =>
 )
 
 function toggleNav(): void {
-  if (mobile.value) {
-    ui.toggleDrawer()
-  } else {
+  if (mdAndUp.value) {
     ui.toggleRail()
+  } else {
+    ui.toggleDrawer()
   }
 }
 
@@ -48,9 +63,9 @@ async function logout(): Promise<void> {
   <v-app>
     <v-navigation-drawer
       v-model="ui.drawer"
-      :rail="ui.rail && !mobile"
-      :temporary="mobile"
-      :permanent="!mobile"
+      :rail="ui.rail && mdAndUp"
+      :temporary="!mdAndUp"
+      :permanent="mdAndUp"
       expand-on-hover
       width="260"
     >
@@ -63,6 +78,7 @@ async function logout(): Promise<void> {
           title="ホーム"
           :to="{ name: 'home' }"
           exact
+          @click="closeOnNarrow"
         />
         <v-divider class="my-1" />
         <v-list-item
@@ -71,6 +87,7 @@ async function logout(): Promise<void> {
           :prepend-icon="app.icon"
           :title="app.title"
           :to="`/${app.id}`"
+          @click="closeOnNarrow"
         />
       </v-list>
 
@@ -83,6 +100,7 @@ async function logout(): Promise<void> {
             prepend-icon="mdi-shield-key-outline"
             title="セキュリティ"
             :to="{ name: 'mfa' }"
+            @click="closeOnNarrow"
           />
           <v-list-item
             prepend-icon="mdi-logout"
@@ -99,6 +117,16 @@ async function logout(): Promise<void> {
       border="b"
     >
       <v-app-bar-nav-icon @click="toggleNav" />
+      <v-chip
+        data-test="site-env"
+        :color="siteColor"
+        variant="flat"
+        size="small"
+        label
+        class="me-3 flex-0-0"
+      >
+        {{ siteLabel }}
+      </v-chip>
       <v-app-bar-title>{{ currentApp?.title ?? 'example-backoffice' }}</v-app-bar-title>
       <template #append>
         <span class="text-body-2 d-none d-sm-inline">{{ auth.email }}</span>
@@ -140,9 +168,19 @@ async function logout(): Promise<void> {
     <v-snackbar
       v-model="ui.snackbar.visible"
       :color="ui.snackbar.color"
+      :timeout="ui.snackbar.color === 'error' ? -1 : 5000"
       location="bottom right"
     >
       {{ ui.snackbar.text }}
+      <template #actions>
+        <v-btn
+          data-test="snackbar-close"
+          variant="text"
+          @click="ui.snackbar.visible = false"
+        >
+          閉じる
+        </v-btn>
+      </template>
     </v-snackbar>
   </v-app>
 </template>

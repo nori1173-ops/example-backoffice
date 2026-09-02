@@ -10,6 +10,9 @@ export default tseslint.config(
   {
     files: ['**/*.vue'],
     languageOptions: { parserOptions: { parser: tseslint.parser } },
+    // .ts 側は typescript-eslint が no-undef を切っている。SFC でも未定義識別子は
+    // vue-tsc が検出するため、ブラウザのグローバル（setTimeout 等）を誤検知させない
+    rules: { 'no-undef': 'off' },
   },
   {
     rules: {

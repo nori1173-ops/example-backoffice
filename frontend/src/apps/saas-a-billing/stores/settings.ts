@@ -13,10 +13,17 @@ import type {
 } from '../types'
 
 const VERSION_CONFLICT = 'VERSION_CONFLICT'
+const TARGET_ENV_FIXED = 'TARGET_ENV_FIXED'
 const FORBIDDEN = 403
 
-function noTargets(): Record<TargetEnv, boolean> {
-  return { verification: false, production: false }
+const SAVE_ERRORS: Record<string, string> = {
+  [VERSION_CONFLICT]: '他の人が更新しました。画面を読み込み直してから保存してください。',
+  [TARGET_ENV_FIXED]:
+    '集計対象環境はこのサイトで固定されています。画面を読み込み直してから保存してください。',
+}
+
+function noTargets(): Partial<Record<TargetEnv, boolean>> {
+  return {}
 }
 
 function messageOf(error: unknown, fallback: string): string {
@@ -35,7 +42,7 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
   const prices = ref<PriceVersion[]>([])
   const audits = ref<AuditEntry[]>([])
   const slackMode = ref<SlackMode | null>(null)
-  const targets = ref<Record<TargetEnv, boolean>>(noTargets())
+  const targets = ref<Partial<Record<TargetEnv, boolean>>>(noTargets())
   const saasaHost = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
@@ -62,7 +69,7 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
 
   /**
    * 楽観ロックの `version` は保存中の設定のものを載せる（設計 8 章）。
-   * `target_env` を変えると接続先ホストも変わるため、成功時は取り直す。
+   * `target_env` はサイト固定で送らない（設計 R1）。成功時は SSM 由来の項目ごと取り直す。
    */
   async function save(patch: Partial<EditableSettings>): Promise<boolean> {
     if (!settings.value) {
@@ -73,10 +80,8 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
     try {
       await billingApi.updateSettings({ ...patch, version: settings.value.version })
     } catch (e: unknown) {
-      error.value =
-        extractApiError(e)?.code === VERSION_CONFLICT
-          ? '他の人が更新しました。画面を読み込み直してから保存してください。'
-          : messageOf(e, '設定の保存に失敗しました')
+      const code = extractApiError(e)?.code ?? ''
+      error.value = SAVE_ERRORS[code] ?? messageOf(e, '設定の保存に失敗しました')
       return false
     } finally {
       loading.value = false

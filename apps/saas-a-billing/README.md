@@ -11,7 +11,7 @@ example-backoffice のアプリスタック。設計は
 | パス | 内容 |
 | --- | --- |
 | `template.yaml` | HTTP API / 6 関数 / ステートマシン / DynamoDB / DLQ 2 本 / アラーム 4 本 / LogGroup 8 本 / SSM `/apps/saas-a-billing/api-domain` |
-| `samconfig.toml` | `[default]`（dev）と `[production]`。prod は SSM の**キー名**を上書きする |
+| `samconfig.toml` | `[default]`（dev）と `[production]`。prod は SSM の**キー名**を上書きする。`TargetEnv` は dev=`verification` / prod=`production` |
 | `functions/` | 6 関数が共有する 1 パッケージ（`CodeUri` は 1 つ、Handler だけを分ける） |
 | `statemachine/run.asl.json` | `saas-a-billing-run` の定義。関数 ARN は `DefinitionSubstitutions` で注入する |
 | `tests/` | pytest（`unit` / `integration`）。テンプレートの検査は `tests/infra/` 側 |
@@ -56,10 +56,27 @@ sam build --use-container && sam deploy --config-env production  # prod
 デプロイ順は shared → core → app → edge（プラットフォーム設計 3.3）。デプロイすると
 `/example-backoffice/{env}/apps/saas-a-billing/api-domain` が SSM に書かれ、
 `scripts/deploy-edge.sh {env}` がそれを読んで CloudFront の origin にする。
+`OpsTopicArn`（SSM 型パラメータ `/example-backoffice/{env}/ops/topic-arn`）を受けるため、
+**core より先にはデプロイできない**。
 
-デプロイ前に集計対象環境の接続情報を SecureString で登録しておく（設計 14.1）。
+## 集計対象環境はサイト固定（設計 3.7）
+
+`TargetEnv` パラメータ（`AllowedValues: verification / production`）が全 Lambda の
+環境変数 `TARGET_ENV` になり、画面・API・実行入力のいずれからも変更できない。
+
+| サイト | `TargetEnv` | 読む SSM | ラベル |
+| --- | --- | --- | --- |
+| dev | `verification` | `targets/verification/*` | 検証環境（オレンジ） |
+| prod | `production` | `targets/production/*` | 本番（緑） |
+
+- IAM も固定環境のパスに絞ってあるため、**もう一方の環境の SSM は読めない**。
+- `PUT /settings` / `POST /runs` に固定値と違う `target_env` が来たら 400 `TARGET_ENV_FIXED`。
+- ラベル（環境バッジ・件名 `[検証環境]`・Excel の `_verification`・S3 プレフィックス・`RUN#{target_env}`）は維持する。
+
+デプロイ前に**固定環境の**接続情報を SecureString で登録しておく（設計 14.1）。
 
 ```bash
+# dev は verification の 3 本、prod は production の 3 本だけを登録する
 for LEAF in base-url user-id password; do
   aws ssm put-parameter --type SecureString --overwrite \
     --name "/example-backoffice/dev/apps/saas-a-billing/targets/verification/$LEAF" --value "<値>"
@@ -80,10 +97,12 @@ CloudFront 経由は `https://backoffice-dev.example-cloud.com/api/saas-a-billin
 
 | アラーム | 監視対象 |
 | --- | --- |
-| `StateMachineFailedAlarm` | `ExecutionsFailed + ExecutionsTimedOut`（1 日）|
-| `LambdaErrorsAlarm` | 自スタック 6 関数の `Errors` の合算（1 日）|
-| `SchedulerDlqAlarm` / `TriggerFailureAlarm` | 各 SQS の `ApproximateNumberOfMessagesVisible` |
+| `StateMachineFailedAlarm` | `ExecutionsFailed + ExecutionsTimedOut`（期間 300 秒）|
+| `LambdaErrorsAlarm` | 自スタック 6 関数の `Errors` の合算（期間 300 秒）|
+| `SchedulerDlqAlarm` / `TriggerFailureAlarm` | 各 SQS の `ApproximateNumberOfMessagesVisible`（期間 300 秒） |
 
+- 4 本とも `AlarmActions` を `OpsTopicArn`（core の SNS トピック `example-backoffice-ops-{env}`）に接続している。`EvaluationPeriods: 1` / `TreatMissingData: notBreaching`
+- **トピックのメール購読は手で作る**（CloudFormation のインライン購読は確認期限切れで破棄され、再デプロイでも復活しない）。購読が Confirmed でないとアラームは誰にも届かない。手順はリポジトリ直下の [README.md](../../README.md) と [scripts/README.md](../../scripts/README.md)
+- 疎通確認: `aws cloudwatch set-alarm-state --alarm-name example-backoffice-saas-a-billing-lambda-errors-dev --state-value ALARM --state-reason smoke`
 - 業務上の失敗は `MarkFailed`（`End: true`）が受け止めるため `ExecutionsFailed` には計上されない。`StateMachineFailedAlarm` が拾うのは実行タイムアウト・`States.Runtime`・`MarkFailed` 自体の失敗で、業務失敗の通知は Slack / メール（設計 6.8）と実行履歴で見る
 - Scheduler ロールの Scheduler DLQ への `sqs:SendMessage` は SAM が `ScheduleV2` の `DeadLetterConfig.Arn` から自動生成するため、テンプレートに明示していない
-- アラームの通知先（SNS）は core の `OpsTopic` に SSM 契約が無いため未接続。CloudWatch コンソールで状態を見る

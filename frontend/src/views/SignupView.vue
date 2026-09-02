@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { SubmitEventPromise } from 'vuetify'
+import ResendCodeButton from '@/components/ResendCodeButton.vue'
 import { useAuthStore } from '@/stores/auth'
 import { passwordPolicyRule } from '@/utils/password'
 
@@ -10,6 +11,7 @@ const email = ref('')
 const password = ref('')
 const confirmationCode = ref('')
 const confirmed = ref(false)
+const notice = ref<string | null>(null)
 
 const step = computed(() => {
   if (confirmed.value) {
@@ -47,11 +49,22 @@ async function submitRegistration(event: SubmitEventPromise): Promise<void> {
   confirmed.value = auth.pending === null
 }
 
+async function resend(): Promise<void> {
+  notice.value = null
+  try {
+    await auth.resendCode(email.value)
+  } catch {
+    return
+  }
+  notice.value = '確認コードを再送しました'
+}
+
 async function submitConfirmation(event: SubmitEventPromise): Promise<void> {
   const { valid } = await event
   if (!valid) {
     return
   }
+  notice.value = null
   try {
     await auth.confirmRegistration(email.value, confirmationCode.value)
   } catch {
@@ -72,6 +85,15 @@ async function submitConfirmation(event: SubmitEventPromise): Promise<void> {
       @click:close="auth.error = null"
     >
       {{ auth.error }}
+    </v-alert>
+
+    <v-alert
+      v-if="notice"
+      type="success"
+      variant="tonal"
+      class="mb-4"
+    >
+      {{ notice }}
     </v-alert>
 
     <v-window :model-value="step">
@@ -131,6 +153,14 @@ async function submitConfirmation(event: SubmitEventPromise): Promise<void> {
           >
             確認する
           </v-btn>
+          <ResendCodeButton
+            class="mt-2"
+            :loading="auth.isLoading"
+            @resend="resend"
+          />
+          <p class="text-caption text-medium-emphasis text-center mt-2">
+            メールが届かない場合は迷惑メールフォルダもご確認ください。
+          </p>
         </v-form>
       </v-window-item>
 

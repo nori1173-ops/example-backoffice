@@ -33,6 +33,20 @@ DEFAULT_ALLOWED_IP = "203.0.113.10/32"
 
 ORIGIN_VERIFY_HEADER = "x-origin-verify"
 
+HSTS_MAX_AGE_SECONDS = 31536000
+CSP_DIRECTIVES = {
+    "default-src": "'self'",
+    "script-src": "'self'",
+    "style-src": "'self' 'unsafe-inline'",
+    "img-src": "'self' data: blob:",
+    "font-src": "'self' data:",
+    "connect-src": "'self' https://cognito-idp.${AWS::Region}.amazonaws.com",
+    "frame-ancestors": "'none'",
+    "base-uri": "'self'",
+    "object-src": "'none'",
+    "form-action": "'self'",
+}
+
 
 def _load_or_skip(load_template) -> dict:
     template = load_template(TEMPLATE_PATH)
@@ -144,16 +158,43 @@ def test_no_custom_error_responses(load_template):
 
 
 def test_default_behavior_uses_caching_optimized_and_edge_guard(load_template):
-    """default は S3 origin + CachingOptimized + SecurityHeadersPolicy + edge-guard（設計 5.2 / 12.3）。"""
+    """default は S3 origin + CachingOptimized + 自前のセキュリティヘッダ + edge-guard（設計 5.2 / 12.3）。"""
     template = _load_or_skip(load_template)
     behavior = _default_behavior(template)
     spa_origins = [o for _c, o in _origins(template) if "S3OriginConfig" in o]
     assert len(spa_origins) == 1, "S3 origin はちょうど 1 つであること"
     assert behavior.get("TargetOriginId") == spa_origins[0].get("Id")
     assert behavior.get("CachePolicyId") == CACHING_OPTIMIZED
-    assert behavior.get("ResponseHeadersPolicyId") == "67f7725c-6f97-4210-82d7-5512b31e9d03"
+    assert behavior.get("ResponseHeadersPolicyId") == {"Fn::GetAtt": "SecurityHeadersPolicy.Id"}
     assert behavior.get("Compress") is True
     assert behavior.get("FunctionAssociations") == [{"EventType": "viewer-request", "FunctionARN": EDGE_GUARD_ARN}]
+
+
+def test_security_headers_policy_sets_a_csp(load_template):
+    """AWS 管理ポリシーは CSP を持たないため自前で持つ（SEC-04 / 計画 R4）。
+
+    Amplify は ID / access / refresh トークンを localStorage に置くので、XSS が 1 件でも
+    入るとトークンごと持ち出される。connect-src は self と Cognito だけに絞る。
+    """
+    template = _load_or_skip(load_template)
+    config = _properties(template, "SecurityHeadersPolicy")["ResponseHeadersPolicyConfig"]
+    security = config["SecurityHeadersConfig"]
+
+    csp = security["ContentSecurityPolicy"]
+    assert csp["Override"] is True
+    directives = dict(
+        part.strip().split(" ", 1) for part in csp["ContentSecurityPolicy"]["Fn::Sub"].split(";") if part.strip()
+    )
+    assert directives == CSP_DIRECTIVES
+
+    assert security["ContentTypeOptions"] == {"Override": True}
+    assert security["FrameOptions"] == {"Override": True, "FrameOption": "DENY"}
+    assert security["ReferrerPolicy"] == {"Override": True, "ReferrerPolicy": "strict-origin-when-cross-origin"}
+    hsts = security["StrictTransportSecurity"]
+    assert hsts["AccessControlMaxAgeSec"] == HSTS_MAX_AGE_SECONDS
+    assert hsts["IncludeSubdomains"] is True
+    assert hsts["Preload"] is False
+    assert hsts["Override"] is True
 
 
 def test_api_behavior_uses_caching_disabled_and_all_viewer_except_host(load_template):

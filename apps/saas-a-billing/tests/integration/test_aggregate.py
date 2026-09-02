@@ -505,7 +505,8 @@ def test_missing_devices_from_previous_month_same_target_env(aws):
     assert result["summary"]["total_amount"] == TOTAL_AMOUNT
 
 
-def test_missing_devices_does_not_cross_target_env(aws):
+def test_missing_devices_does_not_cross_target_env(aws, monkeypatch):
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
     prepare(aws, target_env=PRODUCTION)
     put_previous_run(aws, VERIFICATION)
 
@@ -762,7 +763,8 @@ def test_verification_subject_has_suffix_and_filename_has_verification(aws):
     assert message["attachments"][0]["filename"] == "saas_a_billing_2026-10_verification.xlsx"
 
 
-def test_production_has_no_verification_markers(aws):
+def test_production_has_no_verification_markers(aws, monkeypatch):
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
     prepare(aws, target_env=PRODUCTION, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(target_env=PRODUCTION), None)
@@ -771,6 +773,20 @@ def test_production_has_no_verification_markers(aws):
     assert "[検証環境]" not in message["email"]["subject"]
     assert "【検証環境】" not in message["slack"]["text"]
     assert message["attachments"][0]["filename"] == "saas_a_billing_2026-10.xlsx"
+
+
+def test_ignores_stale_target_env_in_execution_input(aws, monkeypatch):
+    """実行入力に古い `target_env` が残っていても、集計は `TARGET_ENV` 側で行う（計画 R1 / SP-01）。"""
+    monkeypatch.setenv("TARGET_ENV", VERIFICATION)
+    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+
+    aggregate.handler(make_event(target_env=PRODUCTION), None)
+
+    assert result_of(VERIFICATION)["target_env"] == VERIFICATION
+    assert run_of(VERIFICATION)["status"] == repo.DISTRIBUTED
+    assert storage.get_result(PRODUCTION, MONTH) is None
+    message = queued_messages(aws)[0]
+    assert message["email"]["subject"].endswith("[検証環境]")
 
 
 def test_notify_failure_keeps_succeeded_and_records_error(aws, monkeypatch):

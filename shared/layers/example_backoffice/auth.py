@@ -51,6 +51,9 @@ def get_claims(event: dict) -> Claims:
     if not isinstance(raw, dict):
         raise UnauthorizedError("JWT クレームがありません")
 
+    if raw.get("token_use") not in (None, "id"):
+        raise UnauthorizedError("ID トークンで呼び出してください")
+
     sub = raw.get("sub")
     if not sub:
         raise UnauthorizedError("sub クレームがありません")

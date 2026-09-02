@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
+import { formatCount, formatDate, formatYen } from '@/utils/format'
 import type { Band, PriceTable, PriceVersion } from '../types'
 
 interface BandForm {
@@ -40,26 +41,16 @@ const current = computed(
 
 const scheduled = computed(() => sorted.value.filter((version) => version.effective_from > today()))
 
-function pad(value: number): string {
-  return String(value).padStart(2, '0')
-}
-
 function today(): string {
-  const now = new Date()
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
-}
-
-function yen(value: number): string {
-  return `${value.toLocaleString('ja-JP')} 円`
+  return formatDate(new Date())
 }
 
 function bandLabel(versionBands: Band[], index: number): string {
-  const max = versionBands[index].max_items.toLocaleString('ja-JP')
+  const max = formatCount(versionBands[index].max_items)
   if (index === 0) {
     return `${max} 項目まで`
   }
-  const min = (versionBands[index - 1].max_items + 1).toLocaleString('ja-JP')
-  return `${min}〜${max} 項目`
+  return `${formatCount(versionBands[index - 1].max_items + 1)}〜${max} 項目`
 }
 
 function toBandForm(band: Band): BandForm {
@@ -164,19 +155,19 @@ watch(() => props.versions, seed, { immediate: true })
           >
             <td>{{ bandLabel(current.bands, index) }}</td>
             <td class="text-right">
-              {{ yen(band.price_3y) }}
+              {{ formatYen(band.price_3y) }}
             </td>
             <td class="text-right">
-              {{ yen(band.price_1y) }}
+              {{ formatYen(band.price_1y) }}
             </td>
           </tr>
           <tr>
             <td>カメラ地点</td>
             <td class="text-right">
-              {{ yen(current.camera.price_3y) }}
+              {{ formatYen(current.camera.price_3y) }}
             </td>
             <td class="text-right">
-              {{ yen(current.camera.price_1y) }}
+              {{ formatYen(current.camera.price_1y) }}
             </td>
           </tr>
         </tbody>
@@ -415,11 +406,12 @@ watch(() => props.versions, seed, { immediate: true })
                     :key="band.max_items"
                     class="text-body-2"
                   >
-                    〜{{ band.max_items.toLocaleString('ja-JP') }}: {{ band.price_3y }} / {{ band.price_1y }}
+                    〜{{ formatCount(band.max_items) }}: {{ formatYen(band.price_3y) }} /
+                    {{ formatYen(band.price_1y) }}
                   </div>
                 </td>
                 <td class="text-no-wrap">
-                  {{ version.camera.price_3y }} / {{ version.camera.price_1y }}
+                  {{ formatYen(version.camera.price_3y) }} / {{ formatYen(version.camera.price_1y) }}
                 </td>
                 <td>{{ version.note }}</td>
                 <td>{{ version.created_by_email }}</td>

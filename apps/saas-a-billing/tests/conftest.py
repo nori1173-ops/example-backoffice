@@ -15,6 +15,7 @@ from moto import mock_aws
 
 REGION = "ap-northeast-1"
 ENV = "dev"
+TARGET_ENV = "verification"
 APP_ID = "saas-a-billing"
 FIXTURES_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
 SSM_PREFIX = f"/example-backoffice/{ENV}/apps/{APP_ID}"
@@ -39,6 +40,7 @@ def _aws_credentials(monkeypatch):
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
     monkeypatch.setenv("ENV", ENV)
+    monkeypatch.setenv("TARGET_ENV", TARGET_ENV)
     monkeypatch.setenv("APP_NAME", APP_ID)
     monkeypatch.setenv("S3_PREFIX", APP_ID)
     monkeypatch.setenv("SSM_PREFIX", SSM_PREFIX)
@@ -256,8 +258,8 @@ def make_result_device(**overrides) -> dict:
         "last_received_at": "2026/10/20 23:55:00",
         "boundary_only": False,
         "judgement": "billable",
-        "unit_price": 650,
-        "amount": 650,
+        "unit_price": 750,
+        "amount": 750,
         "flags": [],
         "note": "",
     }
@@ -294,7 +296,7 @@ def _sample_result_tenants() -> list[dict]:
             tenant_name="第二テナント",
             retention_period=1,
             device_count_api=3,
-            subtotal=2800,
+            subtotal=3000,
             counts={"billable": 3, "no_data": 0, "excluded": 0, "review": 1},
             devices=[
                 make_result_device(
@@ -310,8 +312,8 @@ def _sample_result_tenants() -> list[dict]:
                     first_received_at="2026/09/21 08:00:00",
                     last_received_at="2026/09/21 08:00:00",
                     boundary_only=True,
-                    unit_price=1400,
-                    amount=1400,
+                    unit_price=1500,
+                    amount=1500,
                     note="境界日のみ受信",
                 ),
                 make_result_device(
@@ -324,8 +326,8 @@ def _sample_result_tenants() -> list[dict]:
                     is_camera=True,
                     camera_source="settings",
                     retention=1,
-                    unit_price=1400,
-                    amount=1400,
+                    unit_price=1500,
+                    amount=1500,
                 ),
                 make_result_device(
                     device_cd="20000003-01-LoggerA-400",
@@ -363,7 +365,7 @@ def _sample_result_tenants() -> list[dict]:
         make_result_tenant(
             tenant_cd="TNT001",
             device_count_api=5,
-            subtotal=3200,
+            subtotal=3450,
             counts={"billable": 3, "no_data": 1, "excluded": 1, "review": 2},
             devices=[
                 make_result_device(group_cds=["GRP002"], group_names=["現場B"]),
@@ -372,8 +374,8 @@ def _sample_result_tenants() -> list[dict]:
                     device_name="観測局2",
                     device_description="堤防右岸",
                     item_count=984,
-                    unit_price=1200,
-                    amount=1200,
+                    unit_price=1300,
+                    amount=1300,
                 ),
                 make_result_device(
                     device_cd="10000003-01-LoggerA-400",
@@ -400,8 +402,8 @@ def _sample_result_tenants() -> list[dict]:
                     group_cds=["GRP003"],
                     group_names=["現場C"],
                     item_count=2000,
-                    unit_price=1350,
-                    amount=1350,
+                    unit_price=1400,
+                    amount=1400,
                     flags=["OVER_MAX_ITEMS"],
                 ),
             ],
@@ -410,7 +412,7 @@ def _sample_result_tenants() -> list[dict]:
             tenant_cd="TNT004",
             tenant_name="未設定テナント",
             retention_period=None,
-            subtotal=650,
+            subtotal=750,
             counts={"billable": 1, "no_data": 0, "excluded": 0, "review": 1},
             devices=[
                 make_result_device(
@@ -477,7 +479,7 @@ def make_result(**overrides) -> dict:
             "review_count": 4,
             "failed_tenant_count": 1,
             "missing_count": 1,
-            "total_amount": 6650,
+            "total_amount": 7200,
         },
         "tenants": _sample_result_tenants(),
         "missing_devices": [

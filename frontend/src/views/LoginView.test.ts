@@ -18,6 +18,7 @@ interface AuthMock {
   login: Mock
   submitChallenge: Mock
   confirmRegistration: Mock
+  resendCode: Mock
 }
 
 const holder = vi.hoisted(() => ({ auth: null as unknown as AuthMock }))
@@ -34,6 +35,7 @@ vi.mock('@/stores/auth', async () => {
     login: vi.fn(),
     submitChallenge: vi.fn(),
     confirmRegistration: vi.fn(),
+    resendCode: vi.fn(),
   }) as AuthMock
   return { useAuthStore: () => holder.auth }
 })
@@ -51,6 +53,7 @@ async function mountLogin(fullPath = '/login'): Promise<VueWrapper> {
       { path: '/', name: 'home', component: StubView },
       { path: '/login', name: 'login', component: StubView },
       { path: '/signup', name: 'signup', component: StubView },
+      { path: '/forgot-password', name: 'forgot-password', component: StubView },
       { path: '/sample-billing/settings', name: 'billing-settings', component: StubView },
     ],
   })
@@ -83,6 +86,7 @@ describe('LoginView', () => {
     holder.auth.login.mockReset()
     holder.auth.submitChallenge.mockReset()
     holder.auth.confirmRegistration.mockReset()
+    holder.auth.resendCode.mockReset()
   })
 
   it('初期状態はパスワード入力ステップ', async () => {
@@ -196,5 +200,56 @@ describe('LoginView', () => {
 
     expect(holder.auth.pending).toBeNull()
     expect(wrapper.find('input[type="email"]').isVisible()).toBe(true)
+  })
+
+  it('パスワード入力ステップにパスワード再設定の導線がある', async () => {
+    const wrapper = await mountLogin()
+
+    const link = wrapper
+      .findAll('a')
+      .find((anchor) => anchor.text().includes('パスワードをお忘れ'))
+    expect(link?.attributes('href')).toBe('/forgot-password')
+  })
+
+  it('UserNotConfirmedException のとき確認コード入力への導線を出す', async () => {
+    const wrapper = await mountLogin()
+    const error = new Error('User is not confirmed.')
+    error.name = 'UserNotConfirmedException'
+    holder.auth.login.mockImplementation(async () => {
+      holder.auth.error = 'アカウントが確認されていません'
+      throw error
+    })
+
+    await wrapper.find('input[type="email"]').setValue('newbie@example.co.jp')
+    await wrapper.find('input[autocomplete="current-password"]').setValue('Passw0rd!')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+
+    const button = wrapper
+      .findAll('button')
+      .find((candidate) => candidate.text().includes('確認コードを入力'))
+    expect(button).toBeDefined()
+
+    await button!.trigger('click')
+    await flushPromises()
+
+    expect(holder.auth.pending).toEqual({
+      kind: 'confirm-signup',
+      username: 'newbie@example.co.jp',
+    })
+    expect(wrapper.find('input[autocomplete="one-time-code"]').isVisible()).toBe(true)
+  })
+
+  it('確認コード入力ステップから再送できる', async () => {
+    const wrapper = await mountLogin()
+
+    holder.auth.pending = { kind: 'confirm-signup', username: 'newbie@example.co.jp' }
+    await flushPromises()
+
+    await wrapper.find('[data-test="resend-code"]').trigger('click')
+    await flushPromises()
+
+    expect(holder.auth.resendCode).toHaveBeenCalledWith('newbie@example.co.jp')
+    expect(wrapper.text()).toContain('確認コードを再送しました')
   })
 })

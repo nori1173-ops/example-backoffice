@@ -475,6 +475,31 @@ def test_from_ssm_raises_when_any_parameter_missing(aws_mock):
     assert "password" in str(raised.value)
 
 
+def test_from_ssm_rejects_non_https_base_url(aws_mock):
+    """`http://` の接続先は設定エラーとして弾く（SEC-06）。"""
+    client = boto3.client("ssm", region_name=REGION)
+    prefix = f"{SSM_PREFIX}/targets/production"
+    for leaf, value in (("base-url", "http://saasa.example.com"), ("user-id", USER_ID), ("password", PASSWORD)):
+        client.put_parameter(Name=f"{prefix}/{leaf}", Value=value, Type="SecureString")
+
+    with pytest.raises(TargetEnvNotConfiguredError) as raised:
+        SaasACredentials.from_ssm(SSM_PREFIX, "production")
+
+    assert "https" in str(raised.value)
+    assert PASSWORD not in str(raised.value)
+
+
+def test_from_ssm_rejects_schemeless_base_url(aws_mock):
+    """スキームの無い値も弾く（SEC-06）。"""
+    client = boto3.client("ssm", region_name=REGION)
+    prefix = f"{SSM_PREFIX}/targets/production"
+    for leaf, value in (("base-url", "saasa.example.com"), ("user-id", USER_ID), ("password", PASSWORD)):
+        client.put_parameter(Name=f"{prefix}/{leaf}", Value=value, Type="SecureString")
+
+    with pytest.raises(TargetEnvNotConfiguredError):
+        SaasACredentials.from_ssm(SSM_PREFIX, "production")
+
+
 def test_from_ssm_uses_target_env_in_key(ssm_targets):
     client = boto3.client("ssm", region_name=REGION)
     prefix = f"{SSM_PREFIX}/targets/production"

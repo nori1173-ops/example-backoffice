@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { SubmitEventPromise } from 'vuetify'
+import ResendCodeButton from '@/components/ResendCodeButton.vue'
 import TotpEnroll from '@/components/TotpEnroll.vue'
 import { useAuthStore } from '@/stores/auth'
 import { passwordPolicyRule } from '@/utils/password'
@@ -21,6 +22,7 @@ const newPassword = ref('')
 const signupCode = ref('')
 const localError = ref<string | null>(null)
 const notice = ref<string | null>(null)
+const unconfirmedEmail = ref<string | null>(null)
 
 const step = computed(() => auth.pending?.kind ?? 'password')
 
@@ -65,6 +67,7 @@ function restart(): void {
   auth.error = null
   localError.value = null
   notice.value = null
+  unconfirmedEmail.value = null
   password.value = ''
   totpCode.value = ''
   newPassword.value = ''
@@ -96,12 +99,40 @@ async function submitPassword(event: SubmitEventPromise): Promise<void> {
   }
   localError.value = null
   notice.value = null
+  unconfirmedEmail.value = null
   try {
     await auth.login(email.value, password.value)
-  } catch {
+  } catch (e: unknown) {
+    // 未確認のまま詰まらないよう、確認コード入力へ戻れる導線を出す
+    if (e instanceof Error && e.name === 'UserNotConfirmedException') {
+      unconfirmedEmail.value = email.value
+    }
     return
   }
   await proceed()
+}
+
+function goToConfirmSignup(): void {
+  const username = unconfirmedEmail.value
+  if (!username) {
+    return
+  }
+  auth.error = null
+  localError.value = null
+  notice.value = null
+  signupCode.value = ''
+  auth.pending = { kind: 'confirm-signup', username }
+}
+
+async function resend(): Promise<void> {
+  localError.value = null
+  notice.value = null
+  try {
+    await auth.resendCode(confirmTarget.value)
+  } catch {
+    return
+  }
+  notice.value = '確認コードを再送しました'
 }
 
 async function submitChallenge(response: string): Promise<void> {
@@ -142,6 +173,7 @@ async function submitSignupCode(event: SubmitEventPromise): Promise<void> {
   } catch {
     return
   }
+  unconfirmedEmail.value = null
   // サインアップ画面から持ち越された pending にはパスワードが伴わないため、自動サインインしない
   if (!password.value) {
     auth.pending = null
@@ -201,9 +233,14 @@ async function submitSignupCode(event: SubmitEventPromise): Promise<void> {
             :rules="passwordRules"
             prepend-inner-icon="mdi-lock-outline"
             :append-inner-icon="showPassword ? 'mdi-eye-off-outline' : 'mdi-eye-outline'"
-            class="mb-4"
+            class="mb-2"
             @click:append-inner="showPassword = !showPassword"
           />
+          <div class="text-end text-body-2 mb-4">
+            <RouterLink :to="{ name: 'forgot-password' }">
+              パスワードをお忘れの方
+            </RouterLink>
+          </div>
           <v-btn
             type="submit"
             color="primary"
@@ -212,6 +249,17 @@ async function submitSignupCode(event: SubmitEventPromise): Promise<void> {
             :loading="auth.isLoading"
           >
             サインイン
+          </v-btn>
+          <v-btn
+            v-if="unconfirmedEmail"
+            variant="tonal"
+            color="primary"
+            block
+            class="mt-3"
+            prepend-icon="mdi-email-check-outline"
+            @click="goToConfirmSignup"
+          >
+            確認コードを入力する
           </v-btn>
         </v-form>
       </v-window-item>
@@ -303,6 +351,11 @@ async function submitSignupCode(event: SubmitEventPromise): Promise<void> {
           >
             確認してサインイン
           </v-btn>
+          <ResendCodeButton
+            class="mt-2"
+            :loading="auth.isLoading"
+            @resend="resend"
+          />
         </v-form>
       </v-window-item>
     </v-window>

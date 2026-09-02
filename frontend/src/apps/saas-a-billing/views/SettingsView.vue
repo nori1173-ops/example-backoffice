@@ -1,13 +1,15 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, onUnmounted, reactive, ref, watch } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import { useUiStore } from '@/stores/ui'
+import { formatDateTime } from '@/utils/format'
 import EnvBadge from '../components/EnvBadge.vue'
 import PriceTableEditor from '../components/PriceTableEditor.vue'
 import { useSettingsStore } from '../stores/settings'
 import type { AuditEntry, PriceTable, SettingsView, TargetEnv } from '../types'
 
 interface SettingsForm {
-  target_env: TargetEnv
   cutoff_day: string
   cutoff_time: string
   auto_retry_days: string
@@ -54,13 +56,42 @@ const AUDIT_TARGET_LABELS: Record<AuditEntry['target'], string> = {
   price: '単価表',
 }
 
+/** 監査表はフォームと同じ語で読ませる（UI-17）。未知のキーは生のまま出す。 */
+const FIELD_LABELS: Record<string, string> = {
+  target_env: '集計対象環境',
+  cutoff_day: '締め日',
+  cutoff_time: '締め時刻',
+  auto_retry_days: '自動再実行上限日数',
+  auto_run_enabled: '自動実行',
+  auto_run_from_month: '自動実行の開始月',
+  mail_enabled: 'メール配布',
+  slack_enabled: 'Slack 配布',
+  mail_to: 'メール宛先 To',
+  mail_cc: 'メール宛先 Cc',
+  slack_channel_id: 'Slack チャンネル ID',
+  slack_channel_label: 'Slack チャンネル表示名',
+  slack_mention: 'Slack メンション',
+  slack_template: 'Slack 文面',
+  exclude_keywords: '除外キーワード',
+  camera_format_names: 'カメラ扱いフォーマット名',
+  effective_from: '適用開始日',
+  bands: '項目数帯',
+  camera: 'カメラ地点の単価',
+  note: '備考',
+}
+
+/** v-combobox multiple は Enter か blur までチップにならない（UI-11）。 */
+type ListField = 'mail_to' | 'mail_cc' | 'exclude_keywords' | 'camera_format_names'
+
 const auth = useAuthStore()
 const store = useSettingsStore()
+const ui = useUiStore()
 const isAdmin = computed(() => auth.groups.includes('admin'))
-const saved = ref(false)
+const snapshot = ref('')
+const leaveDialog = ref(false)
+let leaveResolve: ((leave: boolean) => void) | null = null
 
 const form = reactive<SettingsForm>({
-  target_env: 'verification',
   cutoff_day: '',
   cutoff_time: '',
   auto_retry_days: '',
@@ -78,11 +109,13 @@ const form = reactive<SettingsForm>({
   camera_format_names: [],
 })
 
+// 空フォームを初期スナップショットにする。未取得を「未保存の編集」と誤判定すると再取得を飛ばす
+snapshot.value = JSON.stringify(form)
+
 function seed(settings: SettingsView | null): void {
   if (!settings) {
     return
   }
-  form.target_env = settings.target_env
   form.cutoff_day = String(settings.cutoff_day)
   form.cutoff_time = settings.cutoff_time
   form.auto_retry_days = String(settings.auto_retry_days)
@@ -98,7 +131,22 @@ function seed(settings: SettingsView | null): void {
   form.slack_template = settings.slack_template
   form.exclude_keywords = [...settings.exclude_keywords]
   form.camera_format_names = [...settings.camera_format_names]
+  snapshot.value = JSON.stringify(form)
 }
+
+/**
+ * 入力途中の値を捨てずに確定する（UI-11）。
+ * 入力欄の実値を見るので、打ちかけを消してから離れたときは何も足さない。
+ */
+function commitPending(event: FocusEvent, field: ListField): void {
+  const value = (event.target as HTMLInputElement | null)?.value?.trim() ?? ''
+  if (!value || form[field].includes(value)) {
+    return
+  }
+  form[field] = [...form[field], value]
+}
+
+const isDirty = computed(() => JSON.stringify(form) !== snapshot.value)
 
 function inRange(value: string, min: number, max: number): boolean {
   return INTEGER_PATTERN.test(value) && Number(value) >= min && Number(value) <= max
@@ -163,19 +211,27 @@ const errors = computed(() => {
 })
 
 const hasError = computed(() => Object.values(errors.value).some((messages) => messages.length))
+
+// 集計対象環境はサイトごとに固定で、画面からは変更できない（設計 R1 / UI-08）
+const fixedEnv = computed<TargetEnv | null>(() => store.settings?.target_env ?? null)
+const fixedEnvLabel = computed(() =>
+  fixedEnv.value ? TARGET_ENV_LABELS[fixedEnv.value] : '未取得',
+)
+const targetReady = computed(() => !!fixedEnv.value && !!store.targets[fixedEnv.value])
+
 const canSave = computed(
-  () => isAdmin.value && !hasError.value && store.targets[form.target_env] && !store.loading,
+  () => isAdmin.value && !hasError.value && targetReady.value && !store.loading,
 )
 
-const unregisteredEnvLabels = computed(() =>
-  (Object.keys(TARGET_ENV_LABELS) as TargetEnv[])
-    .filter((env) => !store.targets[env])
-    .map((env) => TARGET_ENV_LABELS[env]),
+const targetEnvHint = computed(() =>
+  fixedEnv.value && !targetReady.value
+    ? `${fixedEnvLabel.value}の接続情報（SSM）が未登録です。管理者が SSM に登録すると保存・実行ができます。`
+    : '',
 )
 
 const saveBlockedReason = computed(() => {
-  if (!store.targets[form.target_env]) {
-    return `${TARGET_ENV_LABELS[form.target_env]}の接続情報（SSM）が未登録のため保存できません`
+  if (!targetReady.value) {
+    return `${fixedEnvLabel.value}の接続情報（SSM）が未登録のため保存できません`
   }
   if (hasError.value) {
     return '入力エラーがあるため保存できません'
@@ -183,39 +239,77 @@ const saveBlockedReason = computed(() => {
   return ''
 })
 
-function formatDateTime(iso: string): string {
-  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso)
-  return parts ? `${parts[1]}/${parts[2]}/${parts[3]} ${parts[4]}:${parts[5]}` : iso
-}
-
 function changedKeys(entry: AuditEntry): string {
   const keys = Object.keys(entry.after).filter(
     (key) => JSON.stringify(entry.before[key]) !== JSON.stringify(entry.after[key]),
   )
-  return keys.join(', ') || '—'
+  return keys.map((key) => FIELD_LABELS[key] ?? key).join('、') || '—'
 }
 
 async function save(): Promise<void> {
-  saved.value = false
-  saved.value = await store.save({
+  const ok = await store.save({
     ...form,
     cutoff_day: Number(form.cutoff_day),
     auto_retry_days: Number(form.auto_retry_days),
   })
+  if (ok) {
+    ui.notify('設定を保存しました', 'success')
+  } else {
+    ui.notify(store.error ?? '設定の保存に失敗しました', 'error')
+  }
 }
 
 async function addPrice(price: PriceTable): Promise<void> {
-  await store.addPrice(price)
+  const ok = await store.addPrice(price)
+  if (ok) {
+    ui.notify('単価の改定を登録しました', 'success')
+  } else {
+    ui.notify(store.error ?? '単価表の追加に失敗しました', 'error')
+  }
+}
+
+function answerLeave(leave: boolean): void {
+  leaveDialog.value = false
+  if (leave) {
+    seed(store.settings)
+  }
+  leaveResolve?.(leave)
+  leaveResolve = null
+}
+
+/** 編集途中の離脱で黙って消えないようにする（UI-09）。 */
+onBeforeRouteLeave(async () => {
+  if (!isDirty.value) {
+    return true
+  }
+  leaveDialog.value = true
+  return await new Promise<boolean>((resolve) => {
+    leaveResolve = resolve
+  })
+})
+
+function warnUnload(event: BeforeUnloadEvent): void {
+  if (isDirty.value) {
+    event.preventDefault()
+  }
 }
 
 watch(() => store.settings, seed, { immediate: true })
 
-onMounted(async () => {
+// 編集中でなければ画面に入るたびに取り直す（他の人の更新を古い値で上書きしないため）
+onActivated(async () => {
+  window.addEventListener('beforeunload', warnUnload)
+  if (store.settings && isDirty.value) {
+    return
+  }
   await store.fetch()
   if (isAdmin.value) {
     await store.fetchAudits()
   }
 })
+
+onDeactivated(() => window.removeEventListener('beforeunload', warnUnload))
+onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 </script>
 
 <template>
@@ -234,29 +328,41 @@ onMounted(async () => {
       border
       class="mb-4"
     >
-      <v-card-text
-        data-test="target-summary"
-        class="d-flex align-center flex-wrap ga-4"
-      >
-        <div class="d-flex align-center ga-2">
-          <span class="text-body-2 text-medium-emphasis">集計対象環境</span>
-          <EnvBadge
-            v-if="store.settings"
-            :target-env="store.settings.target_env"
-          />
-        </div>
-        <div class="text-body-2">
-          <span class="text-medium-emphasis me-2">接続先ホスト</span>
-          <span class="font-weight-medium">{{ store.saasaHost ?? '未登録' }}</span>
-        </div>
-        <div class="text-body-2">
-          <span class="text-medium-emphasis me-2">Slack の動作方式</span>
-          <span
-            data-test="slack-mode"
-            class="font-weight-medium"
+      <v-card-text data-test="target-summary">
+        <div class="d-flex align-center flex-wrap ga-4">
+          <div
+            data-test="target-env-fixed"
+            class="d-flex align-center ga-2"
           >
-            {{ store.slackMode === 'webhook' ? 'Webhook フォールバック' : 'Bot token' }}
-          </span>
+            <span class="text-body-2 text-medium-emphasis">集計対象環境</span>
+            <EnvBadge
+              v-if="fixedEnv"
+              :target-env="fixedEnv"
+            />
+            <span class="text-caption text-medium-emphasis">
+              このサイトでは固定です（画面からは変更できません）
+            </span>
+          </div>
+          <div class="text-body-2">
+            <span class="text-medium-emphasis me-2">接続先ホスト</span>
+            <span class="font-weight-medium">{{ store.saasaHost ?? '未登録' }}</span>
+          </div>
+          <div class="text-body-2">
+            <span class="text-medium-emphasis me-2">Slack の動作方式</span>
+            <span
+              data-test="slack-mode"
+              class="font-weight-medium"
+            >
+              {{ store.slackMode === 'webhook' ? 'Webhook フォールバック' : 'Bot token' }}
+            </span>
+          </div>
+        </div>
+        <div
+          v-if="targetEnvHint"
+          data-test="target-env-hint"
+          class="text-caption text-warning mt-2"
+        >
+          {{ targetEnvHint }}
         </div>
       </v-card-text>
     </v-card>
@@ -291,58 +397,12 @@ onMounted(async () => {
       {{ store.error }}
     </v-alert>
 
-    <v-alert
-      v-if="saved"
-      type="success"
-      variant="tonal"
-      class="mb-4"
-    >
-      設定を保存しました。
-    </v-alert>
-
     <v-card
       variant="flat"
       border
       class="mb-4"
     >
       <v-card-text>
-        <div class="text-body-2 text-medium-emphasis mb-1">
-          集計対象環境
-        </div>
-        <v-btn-toggle
-          v-model="form.target_env"
-          data-test="target-env"
-          mandatory
-          density="comfortable"
-          variant="outlined"
-          divided
-          :disabled="!isAdmin"
-          class="mb-1"
-        >
-          <v-btn
-            value="verification"
-            data-test="target-env-verification"
-            :disabled="!store.targets.verification"
-          >
-            検証環境
-          </v-btn>
-          <v-btn
-            value="production"
-            data-test="target-env-production"
-            :disabled="!store.targets.production"
-          >
-            本番
-          </v-btn>
-        </v-btn-toggle>
-        <div
-          v-if="unregisteredEnvLabels.length"
-          data-test="target-env-hint"
-          class="text-caption text-warning mb-4"
-        >
-          {{ unregisteredEnvLabels.join('・') }}は接続情報（SSM）が未登録のため選べません。
-          管理者が SSM に接続情報を登録すると選択できます。
-        </div>
-
         <v-row dense>
           <v-col
             cols="12"
@@ -354,7 +414,7 @@ onMounted(async () => {
               label="締め日（毎月）"
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.cutoff_day"
             />
           </v-col>
@@ -370,7 +430,7 @@ onMounted(async () => {
               persistent-hint
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.cutoff_time"
             />
           </v-col>
@@ -384,7 +444,7 @@ onMounted(async () => {
               label="自動再実行上限日数"
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.auto_retry_days"
             />
           </v-col>
@@ -399,7 +459,7 @@ onMounted(async () => {
               placeholder="YYYY-MM"
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.auto_run_from_month"
             />
           </v-col>
@@ -448,34 +508,40 @@ onMounted(async () => {
           <v-col
             cols="12"
             sm="6"
+            @focusout="commitPending($event, 'mail_to')"
           >
             <v-combobox
               v-model="form.mail_to"
               data-test="mail-to"
               label="メール宛先 To"
+              hint="入力して Enter で追加します"
+              persistent-hint
               multiple
               chips
               closable-chips
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.mail_to"
             />
           </v-col>
           <v-col
             cols="12"
             sm="6"
+            @focusout="commitPending($event, 'mail_cc')"
           >
             <v-combobox
               v-model="form.mail_cc"
               data-test="mail-cc"
               label="メール宛先 Cc"
+              hint="入力して Enter で追加します"
+              persistent-hint
               multiple
               chips
               closable-chips
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.mail_cc"
             />
           </v-col>
@@ -502,7 +568,7 @@ onMounted(async () => {
               placeholder="C0123ABCD"
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.slack_channel_id"
             />
           </v-col>
@@ -518,7 +584,7 @@ onMounted(async () => {
               persistent-hint
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
             />
           </v-col>
           <v-col
@@ -532,7 +598,7 @@ onMounted(async () => {
               placeholder="<!here>"
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
             />
           </v-col>
           <v-col cols="12">
@@ -544,7 +610,7 @@ onMounted(async () => {
               auto-grow
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
               :error-messages="errors.slack_template"
               :hint="`使えるプレースホルダ: ${ALLOWED_PLACEHOLDERS.join(' ')}`"
               persistent-hint
@@ -553,37 +619,39 @@ onMounted(async () => {
           <v-col
             cols="12"
             sm="6"
+            @focusout="commitPending($event, 'exclude_keywords')"
           >
             <v-combobox
               v-model="form.exclude_keywords"
               data-test="exclude-keywords"
               label="除外キーワード"
-              hint="テナント説明欄・地点備考欄に含まれたら課金対象外"
+              hint="入力して Enter で追加します（テナント説明欄・地点備考欄に含まれたら課金対象外）"
               persistent-hint
               multiple
               chips
               closable-chips
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
             />
           </v-col>
           <v-col
             cols="12"
             sm="6"
+            @focusout="commitPending($event, 'camera_format_names')"
           >
             <v-combobox
               v-model="form.camera_format_names"
               data-test="camera-format-names"
               label="カメラ扱いフォーマット名"
-              hint="フォーマット名の完全一致。受信が無いカメラ地点の補強用"
+              hint="入力して Enter で追加します（フォーマット名の完全一致）"
               persistent-hint
               multiple
               chips
               closable-chips
               density="comfortable"
               variant="outlined"
-              :readonly="!isAdmin"
+              :disabled="!isAdmin"
             />
           </v-col>
         </v-row>
@@ -597,6 +665,24 @@ onMounted(async () => {
         </div>
       </v-card-text>
       <v-card-actions v-if="isAdmin">
+        <v-chip
+          v-if="isDirty"
+          data-test="dirty-chip"
+          color="warning"
+          size="small"
+          label
+        >
+          未保存の変更があります
+        </v-chip>
+        <v-btn
+          v-if="isDirty"
+          data-test="discard-changes"
+          variant="text"
+          size="small"
+          @click="seed(store.settings)"
+        >
+          変更を破棄
+        </v-btn>
         <v-spacer />
         <span
           v-if="saveBlockedReason"
@@ -669,5 +755,37 @@ onMounted(async () => {
         </tbody>
       </v-table>
     </v-card>
+
+    <v-dialog
+      v-model="leaveDialog"
+      max-width="420"
+      persistent
+    >
+      <v-card data-test="leave-dialog">
+        <v-card-item>
+          <v-card-title>未保存の変更があります</v-card-title>
+        </v-card-item>
+        <v-card-text class="text-body-2">
+          この画面を離れると、保存していない変更は失われます。
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn
+            data-test="leave-stay"
+            @click="answerLeave(false)"
+          >
+            このまま編集を続ける
+          </v-btn>
+          <v-btn
+            data-test="leave-discard"
+            color="error"
+            variant="flat"
+            @click="answerLeave(true)"
+          >
+            破棄して移動する
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </div>
 </template>

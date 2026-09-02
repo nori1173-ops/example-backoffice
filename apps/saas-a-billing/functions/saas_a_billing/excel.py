@@ -24,6 +24,7 @@ COLOR_EXCLUDED = "#DFE9F8"
 COLOR_FAILED = "#E0E0E0"
 COLOR_MISSING_TEXT = "#808080"
 COLOR_REVIEW_TEXT = "#C00000"
+COLOR_TOTAL_HIGHLIGHT = "#FFF2CC"
 RETENTION_3Y = ("#C6EFCE", "#006100")
 RETENTION_1Y = ("#E4DFEC", "#3F3151")
 
@@ -32,6 +33,10 @@ FONT_SIZE = 10
 CURRENCY_FORMAT = '"¥"#,##0'
 DATETIME_FORMAT = "yyyy/mm/dd hh:mm"
 COUNT_FORMAT = "#,##0"
+
+TOTAL_LABEL = "合計金額"
+TOTAL_FONT_SIZE = 14
+TOTAL_ROW_HEIGHT = 22
 
 SHEET1_NAME = "請求照合"
 SHEET2_NAME = "全地点（管理用）"
@@ -164,6 +169,10 @@ def _amount(device: dict) -> int:
     return int(device.get("amount") or 0)
 
 
+def _total_amount(result: dict) -> int:
+    return sum(_amount(device) for device in _billable_devices(result))
+
+
 def _cell_properties(fill: str | None = None, font_color: str | None = None, **extra) -> dict:
     properties = dict(extra)
     if fill:
@@ -234,6 +243,14 @@ class _Formats:
     def header(self):
         return self.get(bold=True, bottom=1, align="center")
 
+    def total_headline(self, **extra):
+        """処理仕様ブロックの合計金額（本文より大きく太字・薄い黄色）。"""
+        return self.get(bold=True, font_size=TOTAL_FONT_SIZE, bg_color=COLOR_TOTAL_HIGHLIGHT, **extra)
+
+    def total_row(self, **extra):
+        """表の合計行（本文と同じ大きさで太字・同じ塗り）。"""
+        return self.get(bold=True, bg_color=COLOR_TOTAL_HIGHLIGHT, **extra)
+
     def retention(self, retention: int | None, fill: str | None = None):
         """保存期間セル（行色より優先して塗る。不明は塗らずに赤字）。"""
         if retention == 3:
@@ -255,9 +272,15 @@ class _Writer:
             self.worksheet.write_datetime(row, col, value, fmt)
         elif value is None or value == "":
             self.worksheet.write_blank(row, col, None, fmt)
+        elif isinstance(value, str):
+            self.worksheet.write_string(row, col, value, fmt)
         else:
             self.worksheet.write(row, col, value, fmt)
-        self._widths[col] = max(self._widths.get(col, 0), column_width([_display(value)]))
+        self.reserve_width(col, column_width([_display(value)]))
+
+    def reserve_width(self, col: int, width: int) -> None:
+        """列幅の下限を上げる（本文より大きいフォントのセル用）。"""
+        self._widths[col] = max(self._widths.get(col, 0), width)
 
     def row(self, row: int, cells: list[tuple]) -> None:
         for col, (value, fmt) in enumerate(cells):
@@ -265,7 +288,7 @@ class _Writer:
 
     def line(self, row: int, text: str, fmt=None) -> None:
         """列幅に数えない 1 行のテキスト（処理仕様・見出し・脚注）。"""
-        self.worksheet.write(row, 0, text, fmt)
+        self.worksheet.write_string(row, 0, text, fmt)
 
     def apply_widths(self) -> None:
         for col, width in self._widths.items():
@@ -285,7 +308,12 @@ def build_workbook(result: dict) -> bytes:
     stream = io.BytesIO()
     workbook = xlsxwriter.Workbook(
         stream,
-        {"in_memory": True, "default_format_properties": {"font_name": FONT_NAME, "font_size": FONT_SIZE}},
+        {
+            "in_memory": True,
+            "strings_to_formulas": False,
+            "strings_to_urls": False,
+            "default_format_properties": {"font_name": FONT_NAME, "font_size": FONT_SIZE},
+        },
     )
     _write_sheet1(workbook, result)
     _write_sheet2(workbook, result)
@@ -304,7 +332,17 @@ def _write_spec_block(writer: _Writer, formats: _Formats, result: dict) -> int:
         else:
             fmt = formats.get()
         writer.line(index, line, fmt)
-    return len(lines) + 1
+    return _write_total_amount(writer, formats, result, len(lines))
+
+
+def _write_total_amount(writer: _Writer, formats: _Formats, result: dict, row: int) -> int:
+    """処理仕様ブロックの末尾に置く合計金額（ラベルは画面と同じ「合計金額」）。"""
+    total = _total_amount(result)
+    writer.line(row, TOTAL_LABEL, formats.total_headline())
+    writer.write(row, 1, total, formats.total_headline(align="right", num_format=CURRENCY_FORMAT))
+    writer.reserve_width(1, column_width([_display(total)]) * TOTAL_FONT_SIZE // FONT_SIZE)
+    writer.worksheet.set_row(row, TOTAL_ROW_HEIGHT)
+    return row + 2
 
 
 def _write_total_block(writer: _Writer, formats: _Formats, result: dict, row: int) -> int:
@@ -318,12 +356,13 @@ def _write_total_block(writer: _Writer, formats: _Formats, result: dict, row: in
     writer.line(row, "合計", formats.heading())
     writer.row(row + 1, [(name, formats.header()) for name in ("区分", "地点数", "金額")])
     for offset, (name, group) in enumerate(breakdown, start=2):
+        cell = formats.total_row if offset == 2 else formats.get
         writer.row(
             row + offset,
             [
-                (name, formats.get()),
-                (len(group), formats.get(num_format=COUNT_FORMAT)),
-                (sum(_amount(device) for device in group), formats.get(num_format=CURRENCY_FORMAT)),
+                (name, cell()),
+                (len(group), cell(num_format=COUNT_FORMAT)),
+                (sum(_amount(device) for device in group), cell(num_format=CURRENCY_FORMAT)),
             ],
         )
     return row + len(breakdown) + 3
@@ -470,8 +509,10 @@ def _write_tenant_summary(writer: _Writer, formats: _Formats, tenants: list[dict
     writer.line(row, "テナント別サマリ", formats.heading())
     writer.row(row + 1, [(name, formats.header()) for name in SUMMARY_COLUMNS])
     count = formats.get(num_format=COUNT_FORMAT)
+    subtotals = []
     for offset, tenant in enumerate(tenants, start=2):
         counts = _tenant_counts(tenant)
+        subtotals.append(counts["subtotal"])
         retention = tenant.get("retention_period")
         writer.row(
             row + offset,
@@ -488,7 +529,10 @@ def _write_tenant_summary(writer: _Writer, formats: _Formats, tenants: list[dict
                 (counts["subtotal"], formats.get(num_format=CURRENCY_FORMAT)),
             ],
         )
-    return row + len(tenants) + 3
+    total_row = row + len(tenants) + 2
+    writer.write(total_row, 8, TOTAL_LABEL, formats.total_row(align="right", top=1))
+    writer.write(total_row, 9, sum(subtotals), formats.total_row(num_format=CURRENCY_FORMAT, top=1))
+    return total_row + 2
 
 
 def _detail_cells(formats: _Formats, tenant: dict, device: dict) -> list[tuple]:

@@ -60,7 +60,9 @@ with Diagram(
         attachments = S3("attachments\nバケット")
         ops = SimpleNotificationServiceSns("Ops トピック\n(基盤担当メール)")
 
-    ssm = SystemsManagerParameterStore("SSM Parameter Store\n契約レジストリ\n/example-backoffice/{env}/\n(shared レイヤの ARN も)")
+    ssm = SystemsManagerParameterStore(
+        "SSM Parameter Store\n契約レジストリ\n/example-backoffice/{env}/\n(shared レイヤの ARN も)"
+    )
     slack = Slack("Slack")
 
     user >> Edge(label="HTTPS") >> cf

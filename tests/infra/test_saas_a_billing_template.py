@@ -36,6 +36,7 @@ SSM_PARAMETER_DEFAULTS = {
     "NotifyQueueArn": "/example-backoffice/dev/notify/queue-arn",
     "AttachmentsBucket": "/example-backoffice/dev/attachments/bucket",
     "SharedLayerArn": "/example-backoffice/dev/shared/layer-arn",
+    "OpsTopicArn": "/example-backoffice/dev/ops/topic-arn",
 }
 
 API_FUNCTION = "ApiFunction"
@@ -80,12 +81,18 @@ S3_PREFIX_ARN = {"Fn::Sub": f"arn:aws:s3:::${{AttachmentsBucket}}/{APP_ID}/*"}
 S3_BUCKET_ARN = {"Fn::Sub": "arn:aws:s3:::${AttachmentsBucket}"}
 
 _SSM_ARN = "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}"
+# 集計対象環境はサイトごとに固定（計画 R1 / SP-01）。SSM も IAM も固定環境の 3 本だけに絞る。
+# `get_parameters_by_path` はパスそのものの ARN にも権限が要るため、パスと配下の 2 本を並べる。
+_TARGET_PATH = f"{_SSM_ARN}/apps/{APP_ID}/targets/${{TargetEnv}}"
+TARGET_SSM_RESOURCES = [{"Fn::Sub": _TARGET_PATH}, {"Fn::Sub": f"{_TARGET_PATH}/*"}]
 API_SSM_RESOURCES = [
-    {"Fn::Sub": f"{_SSM_ARN}/apps/{APP_ID}/*"},
+    *TARGET_SSM_RESOURCES,
     {"Fn::Sub": f"{_SSM_ARN}/edge/origin-verify-secret"},
     {"Fn::Sub": f"{_SSM_ARN}/shared/slack/mode"},
 ]
-TARGET_SSM_RESOURCES = [{"Fn::Sub": f"{_SSM_ARN}/apps/{APP_ID}/targets/*"}]
+
+TARGET_ENVS = ["verification", "production"]
+TARGET_ENV_BY_CONFIG_ENV = {"default": "verification", PROD_CONFIG_ENV: "production"}
 
 ALARMS = {
     "StateMachineFailedAlarm": "AWS/States",
@@ -93,6 +100,11 @@ ALARMS = {
     "SchedulerDlqAlarm": "AWS/SQS",
     "TriggerFailureAlarm": "AWS/SQS",
 }
+
+# 月次バッチの失敗を当日中に拾うため、評価期間は 5 分（SP-04）
+MAX_ALARM_PERIOD_SECONDS = 300
+THROTTLING_BURST_LIMIT = 20
+THROTTLING_RATE_LIMIT = 10
 
 BATCH_FUNCTIONS = ("InitFunction", "CollectTenantFunction", "AggregateFunction", "MarkFailedFunction")
 
@@ -170,15 +182,39 @@ def _covers(actions: list[str], operation: str) -> bool:
 
 
 def test_ssm_parameter_defaults_match_contract(template):
-    """SSM 型パラメータ 6 本の `Default` が設計 4.2 のキー名と一致する。"""
+    """SSM 型パラメータすべての `Default` が設計 4.2 のキー名と一致する。"""
     parameters = template["Parameters"]
     for name, key in SSM_PARAMETER_DEFAULTS.items():
         assert parameters[name]["Type"] == "AWS::SSM::Parameter::Value<String>", name
         assert parameters[name]["Default"] == key, name
 
 
-def test_prod_samconfig_overrides_all_six_ssm_keys(samconfig):
-    """prod で 6 本すべてのキー名を上書きする（ADD-APP-GUIDE の「よくある失敗」対策）。
+def test_target_env_parameter_is_fixed_per_site(template):
+    """集計対象環境はパラメータで固定する（計画 R1 / SP-01）。
+
+    画面や実行入力で切り替えられると、検証データが本番ラベルで配布されうる。
+    """
+    parameter = template["Parameters"]["TargetEnv"]
+    assert parameter["Type"] == "String"
+    assert parameter["AllowedValues"] == TARGET_ENVS
+    assert parameter["Default"] == "verification"
+
+
+def test_all_functions_receive_target_env(template):
+    """6 関数すべてが `TARGET_ENV` を持つ（Globals 経由）。ラムダ側はこれを正とする。"""
+    variables = template["Globals"]["Function"]["Environment"]["Variables"]
+    assert variables["TARGET_ENV"] == {"Ref": "TargetEnv"}
+
+
+def test_samconfig_fixes_target_env_per_environment(samconfig):
+    """dev は検証環境、prod は本番環境に固定する（計画 R1）。"""
+    for config_env, target_env in TARGET_ENV_BY_CONFIG_ENV.items():
+        overrides = samconfig[config_env]["deploy"]["parameters"]["parameter_overrides"]
+        assert f"TargetEnv={target_env}" in overrides, config_env
+
+
+def test_prod_samconfig_overrides_all_ssm_keys(samconfig):
+    """prod で SSM 型パラメータすべてのキー名を上書きする（ADD-APP-GUIDE の「よくある失敗」対策）。
 
     1 本でも dev のまま残ると、prod スタックが dev の Cognito / キュー / バケットを掴む。
     あわせてコスト配分タグ（設計 14.2）が dev / prod 双方に付くことも見る。
@@ -316,11 +352,12 @@ def test_sqs_permission_scoped_to_notify_queue_arn(template):
     assert granted == set(NOTIFY_FUNCTIONS)
 
 
-def test_ssm_permission_scoped_to_app_origin_verify_and_slack_mode(template):
-    """api が読む SSM は 3 つに限定する（`GET /settings` が `slack_mode` を読む）。
+def test_ssm_permission_scoped_to_fixed_target_env(template):
+    """api が読む SSM は固定環境の接続情報・origin-verify・slack/mode だけに限定する。
 
     接続情報の登録有無は `get_parameters_by_path` の**名前**で判定し、`base-url` と
-    `shared/slack/mode` は `get_parameter` で値を読むため、両方の操作が要る。
+    `shared/slack/mode` は `get_parameter` で値を読むため、両方の操作が要る。固定して
+    いない環境のパスに権限を残すと、SP-01 の取り違えが IAM では止められない。
     """
     statements = _statements_for(template, API_FUNCTION, "ssm:")
     assert len(statements) == 1
@@ -392,6 +429,17 @@ def test_schedule_is_cron_0600_asia_tokyo_with_flexible_off(template):
     assert properties["RetryPolicy"] == {"MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600}
 
 
+def test_schedule_name_is_scoped_to_the_environment(template):
+    """Name 未指定だと論理 ID がそのままスケジュール名になり dev / prod が衝突する。
+
+    EventBridge Scheduler の名前は口座 + リージョンで一意。prod の作成が
+    `TriggerFunctionSchedule already exists` で失敗した（設計 14.2 の命名規約）。
+    """
+    properties = _properties(template, TRIGGER_FUNCTION)["Events"]["Schedule"]["Properties"]
+    name = properties["Name"]
+    assert name == {"Fn::Sub": f"${{ProjectName}}-{APP_ID}-trigger-${{Env}}"}
+
+
 def test_schedule_has_dlq(template):
     """Scheduler の Invoke 失敗を落とさず溜める（設計 11.1 / 14.2）。"""
     schedule = _properties(template, TRIGGER_FUNCTION)["Events"]["Schedule"]["Properties"]
@@ -424,7 +472,7 @@ def test_state_machine_uses_definition_uri_and_substitutions(template):
 
 
 def test_alarms_exist_for_state_machine_and_lambda_and_dlqs(template):
-    """設計 14.2 の 4 本。しきい値は 1 日で 1 件以上。"""
+    """設計 14.2 の 4 本。しきい値は 1 件以上。"""
     alarms = _by_type(template, "AWS::CloudWatch::Alarm")
     assert set(alarms) == set(ALARMS)
     for logical_id in ALARMS:
@@ -445,6 +493,43 @@ def test_alarms_exist_for_state_machine_and_lambda_and_dlqs(template):
     lambda_alarm = json.dumps(_properties(template, "LambdaErrorsAlarm"))
     for logical_id in FUNCTIONS:
         assert logical_id in lambda_alarm, logical_id
+
+
+def test_all_alarms_notify_the_ops_topic(template):
+    """4 本すべてを SNS へ繋ぐ（SP-02）。
+
+    配布トグルが OFF のとき業務通知は出ないため、AlarmActions が無いと prod の失敗が無音になる。
+    """
+    for logical_id in ALARMS:
+        properties = _properties(template, logical_id)
+        assert properties.get("AlarmActions") == [{"Ref": "OpsTopicArn"}], logical_id
+        # 復帰通知は付けない。スタック作成直後の INSUFFICIENT_DATA -> OK でも 1 通ずつ届き、
+        # 障害 1 件が ALARM + OK の 2 通になるため（レビュー S-2 の裁定）。
+        assert "OKActions" not in properties, logical_id
+
+
+def test_alarm_periods_detect_within_five_minutes(template):
+    """評価期間が 1 日だと月次バッチの失敗を翌日まで検知できない（SP-04）。"""
+    for logical_id in ALARMS:
+        properties = _properties(template, logical_id)
+        periods = [
+            (metric.get("MetricStat") or {}).get("Period")
+            for metric in properties.get("Metrics") or []
+            if "MetricStat" in metric
+        ]
+        if "Period" in properties:
+            periods.append(properties["Period"])
+        assert periods, logical_id
+        for period in periods:
+            assert period == MAX_ALARM_PERIOD_SECONDS, logical_id
+
+
+def test_http_api_is_throttled(template):
+    """POST /runs は認証済み全ユーザーに開いているため既定のスロットルを絞る（SEC-05）。"""
+    settings = _properties(template, "HttpApi")["DefaultRouteSettings"]
+    assert settings["ThrottlingBurstLimit"] == THROTTLING_BURST_LIMIT
+    assert settings["ThrottlingRateLimit"] == THROTTLING_RATE_LIMIT
+    assert settings["DetailedMetricsEnabled"] is True
 
 
 def test_all_log_groups_retain_365_days(template):

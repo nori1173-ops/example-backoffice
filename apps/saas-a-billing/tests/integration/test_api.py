@@ -22,7 +22,15 @@ from saas_a_billing.messages import DEFAULT_SLACK_TEMPLATE
 from saas_a_billing.period import JST
 
 from example_backoffice import origin_verify as origin_verify_module
-from tests.conftest import ORIGIN_VERIFY_SECRET, REGION, make_api_event, make_price_table, make_result, make_settings
+from tests.conftest import (
+    ORIGIN_VERIFY_SECRET,
+    REGION,
+    SSM_PREFIX,
+    make_api_event,
+    make_price_table,
+    make_result,
+    make_settings,
+)
 
 VERIFICATION = "verification"
 PRODUCTION = "production"
@@ -127,6 +135,11 @@ def put_audit_item(api, at: str, index: int) -> None:
     )
 
 
+def unregister_target(api, target_env: str = VERIFICATION, leaf: str = "base-url") -> None:
+    """固定環境の接続情報を 1 本落とし、SSM 未登録の状態を作る。"""
+    api.ssm.delete_parameter(Name=f"{SSM_PREFIX}/targets/{target_env}/{leaf}")
+
+
 def settings_payload(**overrides) -> dict:
     payload = {
         "target_env": VERIFICATION,
@@ -204,8 +217,27 @@ def test_get_settings_includes_saasa_host_targets_and_slack_mode(api):
     result = call("GET", "/settings")
 
     assert data(result)["saasa_host"] == "saasa-verification.example.com"
-    assert data(result)["targets"] == {VERIFICATION: True, PRODUCTION: False}
+    assert data(result)["targets"] == {VERIFICATION: True}
     assert data(result)["slack_mode"] == "webhook"
+
+
+def test_get_settings_returns_fixed_target_env(api, monkeypatch):
+    """集計対象環境はサイト固定（計画 R1 / SP-01）。保存済みの値ではなく `TARGET_ENV` を返す。"""
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
+    put_settings_item(api, target_env=VERIFICATION)
+
+    result = call("GET", "/settings")
+
+    assert data(result)["target_env"] == PRODUCTION
+
+
+def test_get_settings_overrides_stored_target_env(api):
+    """固定値と違う値が保存されていても、読み出しで固定値に上書きする。"""
+    put_settings_item(api, target_env=PRODUCTION)
+
+    result = call("GET", "/settings")
+
+    assert data(result)["target_env"] == VERIFICATION
 
 
 def test_get_settings_does_not_return_password(api):
@@ -247,10 +279,34 @@ def test_put_settings_version_conflict_returns_409(api):
     assert error_code(result) == "VERSION_CONFLICT"
 
 
-def test_put_settings_rejects_unregistered_target_env(api):
+def test_put_settings_rejects_target_env_change(api):
+    """固定値と異なる `target_env` は 400（計画 R1 / SP-01）。"""
     put_settings_item(api)
 
     result = call("PUT", "/settings", body=settings_payload(target_env=PRODUCTION), groups=ADMIN)
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "TARGET_ENV_FIXED"
+
+
+def test_put_settings_keeps_fixed_target_env_when_omitted(api):
+    """`target_env` を省略した保存は通り、固定値のまま保たれる。"""
+    put_settings_item(api)
+    payload = settings_payload()
+    del payload["target_env"]
+
+    result = call("PUT", "/settings", body=payload, groups=ADMIN)
+
+    assert result["statusCode"] == 200
+    assert data(result)["target_env"] == VERIFICATION
+
+
+def test_put_settings_rejects_unregistered_target_env(api):
+    """固定環境の接続情報が SSM に無ければ保存できない。"""
+    put_settings_item(api)
+    unregister_target(api)
+
+    result = call("PUT", "/settings", body=settings_payload(), groups=ADMIN)
 
     assert result["statusCode"] == 400
     assert error_code(result) == "TARGET_ENV_NOT_CONFIGURED"
@@ -421,6 +477,57 @@ def test_put_settings_accepts_mail_to_when_mail_enabled(api):
     assert data(result)["mail_enabled"] is True
 
 
+def test_put_settings_rejects_external_mail_to(api):
+    put_settings_item(api)
+
+    result = call("PUT", "/settings", body=settings_payload(mail_to=["evil@example.com"]), groups=ADMIN)
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "MAIL_DOMAIN_NOT_ALLOWED"
+    assert "evil@example.com" in result["body"]
+
+
+def test_put_settings_rejects_external_mail_cc(api):
+    put_settings_item(api)
+
+    result = call("PUT", "/settings", body=settings_payload(mail_cc=["evil@example.com"]), groups=ADMIN)
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "MAIL_DOMAIN_NOT_ALLOWED"
+    assert "evil@example.com" in result["body"]
+
+
+@pytest.mark.parametrize("address", ["a@evil-example.co.jp", "a@example.co.jp.evil.com", "a@sub.example.co.jp"])
+def test_put_settings_rejects_lookalike_mail_domain(api, address):
+    put_settings_item(api)
+
+    result = call("PUT", "/settings", body=settings_payload(mail_to=[address]), groups=ADMIN)
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "MAIL_DOMAIN_NOT_ALLOWED"
+    assert address in result["body"]
+
+
+def test_put_settings_rejects_external_mail_to_even_when_mail_disabled(api):
+    put_settings_item(api)
+
+    result = call(
+        "PUT", "/settings", body=settings_payload(mail_enabled=False, mail_to=["evil@example.com"]), groups=ADMIN
+    )
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "MAIL_DOMAIN_NOT_ALLOWED"
+
+
+def test_put_settings_accepts_uppercase_internal_mail_domain(api):
+    put_settings_item(api)
+
+    result = call("PUT", "/settings", body=settings_payload(mail_to=["DEVA@EXAMPLE.CO.JP"]), groups=ADMIN)
+
+    assert result["statusCode"] == 200
+    assert data(result)["mail_to"] == ["DEVA@EXAMPLE.CO.JP"]
+
+
 def test_put_settings_rejects_unknown_slack_placeholder(api):
     put_settings_item(api)
 
@@ -521,6 +628,37 @@ def test_get_runs_filters_by_target_env(api):
     assert [run["target_env"] for run in data(result)] == [PRODUCTION]
 
 
+def test_get_runs_defaults_to_fixed_target_env(api):
+    """クエリ省略時はサイト固定環境だけを返す（設計 8 章 / FINAL-review Must-1）。"""
+    put_run_item(api, target_env=VERIFICATION, month="2026-08")
+    put_run_item(api, target_env=PRODUCTION, month="2026-09")
+
+    result = call("GET", "/runs")
+
+    assert [run["target_env"] for run in data(result)] == [VERIFICATION]
+    assert [run["month"] for run in data(result)] == ["2026-08"]
+
+
+def test_get_runs_omits_request_history(api):
+    """一覧は実行者メールの履歴を返さない（画面で使わず応答が膨らむだけ。Should-5）。"""
+    put_run_item(api, request_history=[{"actor_email": ACTOR_EMAIL, "at": NOW.isoformat()}])
+
+    result = call("GET", "/runs")
+
+    assert "request_history" not in data(result)[0]
+    assert ACTOR_EMAIL not in result["body"]
+
+
+def test_get_run_includes_request_history(api):
+    """詳細では従来どおり返す（誰がいつ実行したかの追跡に使う）。"""
+    history = [{"actor_email": ACTOR_EMAIL, "at": NOW.isoformat()}]
+    put_run_item(api, request_history=history)
+
+    result = call("GET", f"/runs/{CLOSED_MONTH}")
+
+    assert data(result)["run"]["request_history"] == history
+
+
 def test_get_runs_caps_limit_at_100(api, monkeypatch):
     captured = {}
 
@@ -563,7 +701,7 @@ def test_get_run_redacts_token_and_internal_fields(api):
     with_detail = call("GET", f"/runs/{CLOSED_MONTH}", query={"detail": "true"})
 
     assert data(without_detail)["run"]["status"] == repo.RUNNING
-    assert data(with_detail)["result"]["summary"]["total_amount"] == 6650
+    assert data(with_detail)["result"]["summary"]["total_amount"] == 7200
     assert_no_sensitive_fields(without_detail)
     assert_no_sensitive_fields(with_detail)
 
@@ -576,7 +714,7 @@ def test_get_run_detail_includes_result_json(api):
     result = call("GET", f"/runs/{CLOSED_MONTH}", query={"detail": "true"})
 
     assert data(result)["run"]["status"] == repo.SUCCEEDED
-    assert data(result)["result"]["summary"]["total_amount"] == 6650
+    assert data(result)["result"]["summary"]["total_amount"] == 7200
 
 
 def test_get_run_detail_false_returns_run_only(api):
@@ -686,13 +824,90 @@ def test_post_runs_allows_open_period_month(api):
     assert data(result)["month"] == OPEN_MONTH
 
 
-def test_post_runs_rejects_unregistered_target_env(api):
+def test_post_runs_rejects_target_env_mismatch(api):
+    """固定値と異なる `target_env` の実行要求は 400（計画 R1 / SP-01）。"""
     put_settings_item(api)
 
     result = call("POST", "/runs", body=run_payload(target_env=PRODUCTION))
 
     assert result["statusCode"] == 400
+    assert error_code(result) == "TARGET_ENV_FIXED"
+
+
+def test_post_runs_accepts_matching_target_env(api):
+    """固定値と同じ `target_env` の明示指定は受け付ける（省略可）。"""
+    put_settings_item(api)
+
+    result = call("POST", "/runs", body=run_payload(target_env=VERIFICATION))
+
+    assert result["statusCode"] == 202
+    assert data(result)["target_env"] == VERIFICATION
+
+
+def test_post_runs_ignores_stored_target_env(api):
+    """保存済みの設定が本番でも、実行は固定環境で走る。"""
+    put_settings_item(api, target_env=PRODUCTION)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 202
+    assert data(result)["target_env"] == VERIFICATION
+    assert repo.get_run(PRODUCTION, CLOSED_MONTH) is None
+
+
+def test_post_runs_rejects_unregistered_target_env(api):
+    """固定環境の接続情報が SSM に無ければ実行できない。"""
+    put_settings_item(api)
+    unregister_target(api)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 400
     assert error_code(result) == "TARGET_ENV_NOT_CONFIGURED"
+
+
+def test_post_runs_defaults_distribute_to_false(api):
+    """`distribute` を省略した curl / スクリプトからの実行で配布しない（SP-07）。"""
+    put_settings_item(api)
+
+    result = call("POST", "/runs", body={"month": CLOSED_MONTH})
+
+    assert result["statusCode"] == 202
+    assert repo.get_run(VERIFICATION, CLOSED_MONTH)["distribute"] is False
+
+
+def test_post_runs_records_requester_in_history(api):
+    """誰がいつ実行したかを RUN に残す（SEC-10 / 計画 R8）。"""
+    put_settings_item(api)
+
+    call("POST", "/runs", body=run_payload())
+
+    history = repo.get_run(VERIFICATION, CLOSED_MONTH)["request_history"]
+    assert len(history) == 1
+    assert history[0]["requested_by"] == "test-sub"
+    assert history[0]["requested_by_email"] == ACTOR_EMAIL
+    assert history[0]["requested_at"]
+    assert history[0]["trigger"] == "manual"
+
+
+def test_post_runs_appends_history_without_overwriting(api):
+    """再実行しても前回の実行者を消さない（SEC-10 / 計画 R8）。"""
+    put_settings_item(api)
+    call("POST", "/runs", body=run_payload())
+    repo.finish_failed(VERIFICATION, CLOSED_MONTH, 1, "失敗")
+
+    result = call(
+        "POST",
+        "/runs",
+        body=run_payload(distribute=False),
+        sub="other-sub",
+        email="devbot@example.co.jp",
+    )
+
+    assert result["statusCode"] == 202
+    history = repo.get_run(VERIFICATION, CLOSED_MONTH)["request_history"]
+    assert [entry["requested_by"] for entry in history] == ["test-sub", "other-sub"]
+    assert [entry["distribute"] for entry in history] == [True, False]
 
 
 def test_post_runs_rejects_non_boolean_distribute_and_force(api):

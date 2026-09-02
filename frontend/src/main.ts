@@ -3,6 +3,7 @@ import { createApp } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
 import vuetify from './plugins/vuetify'
+import './styles/typography.scss'
 import router from './router'
 import { configureAmplify } from './config/amplify'
 

@@ -4,6 +4,7 @@ moto の実テーブルに対して読み書きし、条件付き書き込みが
 確認する。条件不成立は botocore の `ConditionalCheckFailedException` で表れる。
 """
 
+import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
@@ -24,6 +25,32 @@ EXECUTION_ARN = "arn:aws:states:ap-northeast-1:000000000000:execution:saas-a-bil
 SAASA_HOST = "saasa-verification.example.com"
 PREVIOUS_ATTEMPT_FIELDS = ("error", "finished_at", "execution_arn", "summary", "api_token", "token_expires_at")
 TOKEN_FIELDS = ("api_token", "token_expires_at")
+LOGGER_NAME = "example_backoffice"
+
+
+def test_target_env_falls_back_to_verification_with_warning(monkeypatch, caplog):
+    """`TARGET_ENV` が不正なら本番ではなく検証環境として扱い、気付けるよう警告する（計画 R1）。"""
+    monkeypatch.setenv("TARGET_ENV", "staging")
+    caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
+
+    assert repo.target_env() == VERIFICATION
+    assert "TARGET_ENV" in caplog.text
+
+
+def test_target_env_unset_falls_back_to_verification_with_warning(monkeypatch, caplog):
+    monkeypatch.delenv("TARGET_ENV", raising=False)
+    caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
+
+    assert repo.target_env() == VERIFICATION
+    assert "TARGET_ENV" in caplog.text
+
+
+def test_target_env_does_not_warn_when_configured(monkeypatch, caplog):
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
+    caplog.set_level(logging.WARNING, logger=LOGGER_NAME)
+
+    assert repo.target_env() == PRODUCTION
+    assert caplog.text == ""
 
 
 @pytest.fixture
@@ -110,6 +137,22 @@ def test_get_settings_returns_existing(table):
     assert settings["cutoff_day"] == 15
     assert settings["mail_to"] == ["a@b.jp"]
     assert "PK" not in settings
+
+
+def test_get_settings_overrides_stored_target_env(table):
+    """集計対象環境はサイト固定。保存済みの値が違っても読み出しで固定値に直す（計画 R1 / SP-01）。"""
+    table.put_item(Item={"PK": "SETTINGS", "SK": "current", "version": 3, "target_env": PRODUCTION})
+
+    assert repo.get_settings()["target_env"] == VERIFICATION
+
+
+def test_get_settings_seeds_fixed_target_env(table, monkeypatch):
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
+
+    settings = repo.get_settings()
+
+    assert settings["target_env"] == PRODUCTION
+    assert table.get_item(Key={"PK": "SETTINGS", "SK": "current"})["Item"]["target_env"] == PRODUCTION
 
 
 def test_get_settings_fills_distribution_toggles_for_legacy_item(table):
@@ -388,6 +431,31 @@ def test_acquire_run_with_force_removes_previous_attempt_fields(table):
     for name in PREVIOUS_ATTEMPT_FIELDS:
         assert name not in run
         assert name not in raw_run(table)
+
+
+def test_acquire_run_keeps_only_the_latest_history_entries(table):
+    """履歴は直近 `REQUEST_HISTORY_LIMIT` 件に切り詰める（SEC-10 / 計画 R8）。"""
+    acquire(requested_by="actor-0")
+    for index in range(1, repo.REQUEST_HISTORY_LIMIT + 3):
+        repo.finish_failed(VERIFICATION, MONTH, index, "失敗")
+        acquire(requested_by=f"actor-{index}", run_token=f"run-token-{index}")
+
+    history = repo.get_run(VERIFICATION, MONTH)["request_history"]
+
+    assert len(history) == repo.REQUEST_HISTORY_LIMIT
+    assert history[-1]["requested_by"] == f"actor-{repo.REQUEST_HISTORY_LIMIT + 2}"
+    assert history[0]["requested_by"] == "actor-3"
+
+
+def test_acquire_run_history_survives_previous_attempt_cleanup(table):
+    """再取得の REMOVE で履歴を消さない（SEC-10 / 計画 R8）。"""
+    acquire(requested_by=ACTOR, requested_by_email=ACTOR_EMAIL)
+    repo.finish_failed(VERIFICATION, MONTH, 1, "失敗")
+
+    run = acquire(trigger="scheduled", run_token="run-token-2")
+
+    assert [entry["requested_by"] for entry in run["request_history"]] == [ACTOR, repo.SYSTEM_ACTOR]
+    assert [entry["trigger"] for entry in run["request_history"]] == ["manual", "scheduled"]
 
 
 def test_run_keys_are_separated_by_target_env(table):

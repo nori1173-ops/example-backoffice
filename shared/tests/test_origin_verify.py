@@ -74,6 +74,37 @@ def test_sam_local_bypasses_verification(monkeypatch):
     assert result["statusCode"] == 200
 
 
+def test_skip_is_ignored_when_env_is_prod(monkeypatch):
+    """prod では `ORIGIN_VERIFY_SKIP` を無視する（SEC-03 / SP-08）。"""
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("ORIGIN_VERIFY_SKIP", "1")
+
+    result = handler(make_event(), None)
+
+    assert result["statusCode"] == 403
+    assert error_code(result) == "ORIGIN_FORBIDDEN"
+
+
+def test_sam_local_is_ignored_when_env_is_prod(monkeypatch):
+    """prod では `AWS_SAM_LOCAL` も無視する（SEC-03 / SP-08）。"""
+    monkeypatch.setenv("ENV", "prod")
+    monkeypatch.setenv("AWS_SAM_LOCAL", "true")
+
+    result = handler(make_event(), None)
+
+    assert result["statusCode"] == 403
+
+
+def test_skip_is_ignored_when_env_is_unset(monkeypatch):
+    """`ENV` 未設定は環境不明なので fail-closed（SEC-03 / SP-08）。"""
+    monkeypatch.delenv("ENV", raising=False)
+    monkeypatch.setenv("ORIGIN_VERIFY_SKIP", "1")
+
+    result = handler(make_event(), None)
+
+    assert result["statusCode"] == 403
+
+
 def test_secret_lookup_failure_returns_403(monkeypatch):
     def _raise():
         raise RuntimeError("SSM に到達できません")

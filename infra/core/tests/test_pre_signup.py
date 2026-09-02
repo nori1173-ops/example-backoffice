@@ -41,5 +41,29 @@ def test_rejects_missing_email():
 
 
 def test_rejects_email_without_at():
-    with pytest.raises(Exception, match="example.co.jp"):
+    with pytest.raises(Exception, match="format"):
         handler(make_event("noatmark"), None)
+
+
+def test_rejects_multiple_at_marks():
+    """`a@evil.com@example.co.jp` のような多重 `@` を弾く（SEC-13）。"""
+    with pytest.raises(Exception, match="format"):
+        handler(make_event("a@evil.com@example.co.jp"), None)
+
+
+def test_allows_surrounding_whitespace_and_uppercase():
+    """前後空白と大文字は正規化してから判定する（SEC-13）。"""
+    event = make_event(" DEVA@EXAMPLE.CO.JP ")
+
+    assert handler(event, None) == event
+
+
+def test_rejects_domain_with_suffix():
+    """`example.co.jp` で始まるだけのドメインを弾く（SEC-13）。"""
+    with pytest.raises(Exception, match="example.co.jp"):
+        handler(make_event("a@example.co.jp.evil.com"), None)
+
+
+def test_rejects_subdomain():
+    with pytest.raises(Exception, match="example.co.jp"):
+        handler(make_event("a@mail.example.co.jp"), None)

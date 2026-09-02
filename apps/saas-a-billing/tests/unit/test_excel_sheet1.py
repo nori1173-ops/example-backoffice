@@ -7,12 +7,15 @@ import openpyxl
 import pytest
 from saas_a_billing.excel import (
     COLOR_REVIEW_TEXT,
+    COLOR_TOTAL_HIGHLIGHT,
     CURRENCY_FORMAT,
     FONT_NAME,
     RETENTION_1Y,
     RETENTION_3Y,
     SHEET1_COLUMNS,
     SHEET1_NAME,
+    TOTAL_FONT_SIZE,
+    TOTAL_LABEL,
     build_workbook,
     column_width,
     spec_block_lines,
@@ -157,19 +160,45 @@ def test_spec_block_lists_failed_tenants_in_red_when_present(result, sheet1):
 def test_total_block_has_count_and_amount(sheet1):
     row = find_row(sheet1, "課金地点")
     assert at(sheet1, row, 1).value == 7
-    assert at(sheet1, row, 2).value == 6650
+    assert at(sheet1, row, 2).value == 7200
 
 
 def test_total_block_has_retention_breakdown(sheet1):
     three_years = find_row(sheet1, "保存期間 3年")
-    assert (at(sheet1, three_years, 1).value, at(sheet1, three_years, 2).value) == (4, 3850)
+    assert (at(sheet1, three_years, 1).value, at(sheet1, three_years, 2).value) == (4, 4200)
     one_year = find_row(sheet1, "保存期間 1年")
-    assert (at(sheet1, one_year, 1).value, at(sheet1, one_year, 2).value) == (3, 2800)
+    assert (at(sheet1, one_year, 1).value, at(sheet1, one_year, 2).value) == (3, 3000)
 
 
 def test_total_block_has_camera_breakdown(sheet1):
     row = find_row(sheet1, "うちカメラ")
-    assert (at(sheet1, row, 1).value, at(sheet1, row, 2).value) == (2, 2800)
+    assert (at(sheet1, row, 1).value, at(sheet1, row, 2).value) == (2, 3000)
+
+
+def test_spec_block_ends_with_total_amount_row(sheet1):
+    assert TOTAL_LABEL == "合計金額"
+    label, amount = at(sheet1, SPEC_BLOCK_ROWS, 0), at(sheet1, SPEC_BLOCK_ROWS, 1)
+    assert label.value == TOTAL_LABEL
+    assert amount.value == 7200
+    assert amount.data_type == "n"
+    assert amount.number_format == CURRENCY_FORMAT
+
+
+def test_total_amount_row_is_bold_large_and_highlighted(sheet1):
+    label, amount = at(sheet1, SPEC_BLOCK_ROWS, 0), at(sheet1, SPEC_BLOCK_ROWS, 1)
+    assert TOTAL_FONT_SIZE >= 14
+    assert label.font.bold is True and amount.font.bold is True
+    assert label.font.size == amount.font.size == TOTAL_FONT_SIZE
+    assert amount.alignment.horizontal == "right"
+    assert fill_color(label) == fill_color(amount) == argb(COLOR_TOTAL_HIGHLIGHT)
+
+
+def test_total_block_grand_total_is_bold_and_highlighted(sheet1):
+    amount = at(sheet1, find_row(sheet1, "課金地点"), 2)
+    assert amount.value == 7200
+    assert amount.font.bold is True
+    assert amount.number_format == CURRENCY_FORMAT
+    assert fill_color(amount) == argb(COLOR_TOTAL_HIGHLIGHT)
 
 
 def test_tenant_header_shows_cd_name_retention_count_subtotal(sheet1):
@@ -178,7 +207,7 @@ def test_tenant_header_shows_cd_name_retention_count_subtotal(sheet1):
     assert at(sheet1, row, 5).value == "3年"
     assert "課金 3 地点" in at(sheet1, row, 7).value
     assert "小計" in at(sheet1, row, 7).value
-    assert at(sheet1, row, 8).value == 3200
+    assert at(sheet1, row, 8).value == 3450
 
 
 def test_only_billable_devices_are_listed(sheet1):
@@ -220,8 +249,8 @@ def test_device_row_columns(sheet1):
         984,
         "3年",
         "-",
-        1200,
-        1200,
+        1300,
+        1300,
         None,
     ]
 
@@ -246,7 +275,7 @@ def test_amount_is_numeric_with_currency_format(sheet1):
     assert CURRENCY_FORMAT == '"¥"#,##0'
     row = find_row(sheet1, "10000002-01-LoggerA-400", col=1)
     unit_price, amount = at(sheet1, row, 7), at(sheet1, row, 8)
-    assert (unit_price.value, amount.value) == (1200, 1200)
+    assert (unit_price.value, amount.value) == (1300, 1300)
     assert unit_price.data_type == "n" and amount.data_type == "n"
     assert unit_price.number_format == CURRENCY_FORMAT
     assert amount.number_format == CURRENCY_FORMAT
@@ -257,7 +286,7 @@ def test_subtotal_equals_sum_of_device_amounts(sheet1):
     subtotal_row = find_row_containing(sheet1, "■ TNT001") + 2 + len(rows)
     assert at(sheet1, subtotal_row, 7).value == "小計"
     subtotal = at(sheet1, subtotal_row, 8)
-    assert subtotal.value == sum(row[8] for row in rows) == 3200
+    assert subtotal.value == sum(row[8] for row in rows) == 3450
     assert subtotal.data_type != "f"
 
 

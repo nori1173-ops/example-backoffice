@@ -19,6 +19,7 @@ import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import date
+from urllib.parse import urlparse
 
 import requests
 from aws_lambda_powertools.utilities import parameters
@@ -47,6 +48,7 @@ RETRY_METHODS = frozenset(["GET", "POST"])
 
 CREDENTIAL_LEAVES = ("base-url", "user-id", "password")
 PARAMETER_MAX_AGE = 300
+REQUIRED_SCHEME = "https"
 
 
 class TargetEnvNotConfiguredError(Exception):
@@ -102,7 +104,10 @@ class SaasACredentials:
         missing = [leaf for leaf in CREDENTIAL_LEAVES if not values.get(leaf)]
         if missing:
             raise TargetEnvNotConfiguredError(f"{path} の接続情報が揃っていません: {', '.join(missing)}")
-        return cls(base_url=values["base-url"], user_id=values["user-id"], password=values["password"])
+        base_url = values["base-url"]
+        if urlparse(base_url).scheme != REQUIRED_SCHEME:
+            raise TargetEnvNotConfiguredError(f"{path}/base-url は {REQUIRED_SCHEME} で始まる必要があります")
+        return cls(base_url=base_url, user_id=values["user-id"], password=values["password"])
 
 
 class SaasAClient:

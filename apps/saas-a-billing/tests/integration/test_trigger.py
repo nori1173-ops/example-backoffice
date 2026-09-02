@@ -319,8 +319,10 @@ def test_execution_name_format(aws):
     assert re.fullmatch(rf"{VERIFICATION}-{OCTOBER}-1-[0-9a-f]{{8}}", name)
 
 
-def test_uses_settings_target_env(aws):
-    put_settings(aws, target_env=PRODUCTION)
+def test_uses_environment_target_env(aws, monkeypatch):
+    """集計対象環境は `TARGET_ENV` が正で、保存済みの設定値は使わない（計画 R1 / SP-01）。"""
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
+    put_settings(aws, target_env=VERIFICATION)
 
     result = trigger.handler({}, None)
 

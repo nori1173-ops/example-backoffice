@@ -92,3 +92,26 @@ def test_unknown_top_level_property_is_rejected(validator, valid_message):
     valid_message["priority"] = "high"
     with pytest.raises(ValidationError):
         validator.validate(valid_message)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "/saas-a-billing/2026/10/x.xlsx",
+        "../saas-a-billing/2026/10/x.xlsx",
+        "saas-a-billing/../secret.xlsx",
+        "saas_a_billing/2026/10/x.xlsx",
+        "saas-a-billing//x.xlsx",
+        "x.xlsx",
+    ],
+)
+def test_attachment_key_must_be_under_an_app_prefix(validator, valid_message, key):
+    """添付キーは `{app}/` 配下に限る（設計 8.2 / SEC-07）。app との一致は notifier が見る。"""
+    valid_message["attachments"][0]["key"] = key
+    with pytest.raises(ValidationError):
+        validator.validate(valid_message)
+
+
+def test_attachment_key_under_app_prefix_passes(validator, valid_message):
+    valid_message["attachments"][0]["key"] = "saas-a-billing/production/2026/10/x.xlsx"
+    validator.validate(valid_message)

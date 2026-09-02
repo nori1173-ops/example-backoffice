@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import {
+  confirmResetPassword,
   confirmSignIn,
   fetchAuthSession,
   getCurrentUser,
+  resendSignUpCode,
+  resetPassword,
   signIn,
   signUp,
   type SignInOutput,
@@ -231,5 +234,85 @@ describe('useAuthStore', () => {
     expect(store.isAuthenticated).toBe(false)
     expect(store.groups).toEqual([])
     expect(store.pending).toBeNull()
+  })
+
+  it('requestPasswordReset が resetPassword を呼ぶ', async () => {
+    vi.mocked(resetPassword).mockResolvedValue({
+      isPasswordReset: false,
+      nextStep: { resetPasswordStep: 'CONFIRM_RESET_PASSWORD_WITH_CODE' },
+    } as unknown as Awaited<ReturnType<typeof resetPassword>>)
+    const store = useAuthStore()
+
+    await store.requestPasswordReset(EMAIL)
+
+    expect(resetPassword).toHaveBeenCalledWith({ username: EMAIL })
+    expect(store.error).toBeNull()
+    expect(store.isLoading).toBe(false)
+  })
+
+  it('submitPasswordReset が confirmResetPassword を呼ぶ', async () => {
+    const store = useAuthStore()
+
+    await store.submitPasswordReset(EMAIL, '123456', 'NewPassw0rd')
+
+    expect(confirmResetPassword).toHaveBeenCalledWith({
+      username: EMAIL,
+      confirmationCode: '123456',
+      newPassword: 'NewPassw0rd',
+    })
+    expect(store.isLoading).toBe(false)
+  })
+
+  it('resendCode が resendSignUpCode を呼ぶ', async () => {
+    const store = useAuthStore()
+
+    await store.resendCode(EMAIL)
+
+    expect(resendSignUpCode).toHaveBeenCalledWith({ username: EMAIL })
+    expect(store.isLoading).toBe(false)
+  })
+
+  it('CodeMismatchException が日本語メッセージになる', async () => {
+    const error = new Error('Invalid verification code provided.')
+    error.name = 'CodeMismatchException'
+    vi.mocked(confirmResetPassword).mockRejectedValue(error)
+    const store = useAuthStore()
+
+    await expect(store.submitPasswordReset(EMAIL, '000000', 'NewPassw0rd')).rejects.toThrow(error)
+
+    expect(store.error).toBe('確認コードが正しくありません')
+  })
+
+  it('LimitExceededException が日本語メッセージになる', async () => {
+    const error = new Error('Attempt limit exceeded, please try after some time.')
+    error.name = 'LimitExceededException'
+    vi.mocked(resendSignUpCode).mockRejectedValue(error)
+    const store = useAuthStore()
+
+    await expect(store.resendCode(EMAIL)).rejects.toThrow(error)
+
+    expect(store.error).toBe('試行回数の上限に達しました。しばらく時間をおいてから再試行してください')
+  })
+
+  it('UserLambdaValidationException は社内メールアドレスの案内になる', async () => {
+    const error = new Error('PreSignUp failed with error 社外ドメイン.')
+    error.name = 'UserLambdaValidationException'
+    vi.mocked(signUp).mockRejectedValue(error)
+    const store = useAuthStore()
+
+    await expect(store.register('outside@example.com', 'Passw0rd!2345')).rejects.toThrow(error)
+
+    expect(store.error).toContain('@example.co.jp')
+  })
+
+  it('辞書に無い例外は汎用文言に例外名を添える', async () => {
+    const error = new Error('Something went wrong')
+    error.name = 'UnknownCognitoException'
+    vi.mocked(signIn).mockRejectedValue(error)
+    const store = useAuthStore()
+
+    await expect(store.login(EMAIL, 'Passw0rd!')).rejects.toThrow(error)
+
+    expect(store.error).toBe('予期しないエラーが発生しました（UnknownCognitoException）')
   })
 })

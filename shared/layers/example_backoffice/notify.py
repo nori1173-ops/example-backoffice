@@ -26,6 +26,7 @@ VALID_CHANNELS = ("email", "slack")
 JST = timezone(timedelta(hours=9))
 MAX_MESSAGE_BYTES = 256 * 1024
 EXPIRE_TAGGING = "lifecycle=expire"
+FORBIDDEN_FILENAME_CHARS = '\r\n"'
 
 APP_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 APP_MIN_LENGTH = 3
@@ -114,6 +115,12 @@ def _text(value: object, field: str) -> str:
 
 
 def _ascii_filename(value: str, field: str) -> str:
+    """ファイル名は ASCII のみ。CR / LF / `"` はヘッダ差し込みに使えるので拒否する（SEC-07）。
+
+    違反時のメッセージには値を載せない（生の CRLF をログへ流し込ませないため）。
+    """
+    if any(char in value for char in FORBIDDEN_FILENAME_CHARS):
+        raise NotifyValidationError(f'{field} に改行と " は使えません')
     if not value.isascii():
         raise NotifyValidationError(f"{field} は ASCII のみ使えます: {value}")
     return value

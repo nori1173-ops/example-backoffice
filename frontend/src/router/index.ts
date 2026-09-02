@@ -22,6 +22,12 @@ const routes: RouteRecordRaw[] = [
     meta: { requiresAuth: false, layout: 'auth', title: 'サインアップ' },
   },
   {
+    path: '/forgot-password',
+    name: 'forgot-password',
+    component: () => import('@/views/ForgotPasswordView.vue'),
+    meta: { requiresAuth: false, layout: 'auth', title: 'パスワードの再設定' },
+  },
+  {
     path: '/',
     component: () => import('@/layouts/ShellLayout.vue'),
     meta: { layout: 'shell' },

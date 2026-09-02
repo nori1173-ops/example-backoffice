@@ -115,6 +115,45 @@ Resources:
         - Key: Name
           Value: Bucket
 
+  # AWS 管理の Managed-SecurityHeadersPolicy は CSP を持たない。Amplify がトークンを
+  # localStorage に置くため、XSS 1 件でトークンごと持ち出されないよう自前で持つ（設計 7.2）。
+  # 依存はすべてローカル配信（外部 CDN / Google Fonts を使わない）なので 'self' 中心で組める。
+  # style-src の 'unsafe-inline' は Vuetify のインラインスタイル属性のために外せない。
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${ProjectName}-security-headers-${Env}'
+        Comment: SPA 向けのセキュリティヘッダ（CSP + HSTS + nosniff + Referrer-Policy）
+        SecurityHeadersConfig:
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self';
+              script-src 'self';
+              style-src 'self' 'unsafe-inline';
+              img-src 'self' data: blob:;
+              font-src 'self' data:;
+              connect-src 'self' https://cognito-idp.${AWS::Region}.amazonaws.com;
+              frame-ancestors 'none';
+              base-uri 'self';
+              object-src 'none';
+              form-action 'self'
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            Override: true
+            FrameOption: DENY
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            # preload は example-cloud.com 全体に効くため付けない
+            Preload: false
+
   Oac:
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
@@ -246,7 +285,7 @@ Resources:
             - HEAD
             - OPTIONS
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
-          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          ResponseHeadersPolicyId: !GetAtt SecurityHeadersPolicy.Id
           Compress: true
           FunctionAssociations:
             - EventType: viewer-request

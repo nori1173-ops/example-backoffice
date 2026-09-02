@@ -250,6 +250,8 @@ Resources:
   #       Monthly:
   #         Type: ScheduleV2
   #         Properties:
+  #           # Name は必須。省くと論理 ID がスケジュール名になり dev / prod で衝突する
+  #           Name: !Sub ${ProjectName}-{{cookiecutter.app_id}}-monthly-${Env}
   #           ScheduleExpression: cron(0 1 20 * ? *)
   #           ScheduleExpressionTimezone: Asia/Tokyo
   #           Input: '{"trigger": "scheduled"}'

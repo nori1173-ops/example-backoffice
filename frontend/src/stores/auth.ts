@@ -1,10 +1,13 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import {
+  confirmResetPassword,
   confirmSignIn,
   confirmSignUp,
   fetchAuthSession,
   getCurrentUser,
+  resendSignUpCode,
+  resetPassword,
   signIn,
   signOut,
   signUp,
@@ -15,20 +18,31 @@ import { PASSWORD_POLICY_MESSAGE } from '@/utils/password'
 
 const TOTP_ISSUER = 'example-backoffice'
 
+const GENERIC_ERROR = '予期しないエラーが発生しました'
+
 const AMPLIFY_ERROR_MESSAGES: Record<string, string> = {
   NotAuthorizedException: 'メールアドレスまたはパスワードが正しくありません',
   UserNotFoundException: 'メールアドレスまたはパスワードが正しくありません',
-  UserNotConfirmedException: 'アカウントが確認されていません',
-  PasswordResetRequiredException: 'パスワードのリセットが必要です',
-  TooManyRequestsException: 'しばらく時間をおいてから再試行してください',
-  LimitExceededException: 'しばらく時間をおいてから再試行してください',
-  CodeMismatchException: 'コードが正しくありません',
-  ExpiredCodeException: 'コードの有効期限が切れています',
-  EnableSoftwareTokenMFAException: 'MFA の設定に失敗しました',
+  UserNotConfirmedException: 'アカウントが確認されていません。確認コードを入力してください',
+  PasswordResetRequiredException:
+    'パスワードの再設定が必要です。「パスワードをお忘れの方」から手続きしてください',
+  TooManyRequestsException: 'アクセスが集中しています。しばらく時間をおいてから再試行してください',
+  TooManyFailedAttemptsException:
+    '失敗が続いたため一時的に制限されています。しばらく時間をおいてから再試行してください',
+  LimitExceededException: '試行回数の上限に達しました。しばらく時間をおいてから再試行してください',
+  CodeMismatchException: '確認コードが正しくありません',
+  ExpiredCodeException: '確認コードの有効期限が切れています。コードを再送してください',
+  CodeDeliveryFailureException: '確認コードを送信できませんでした。メールアドレスを確認してください',
+  EnableSoftwareTokenMFAException: '認証コードが正しくありません。認証アプリの表示を確認してください',
+  SoftwareTokenMFANotFoundException:
+    '認証アプリが登録されていません。サインインし直して登録してください',
   InvalidPasswordException: PASSWORD_POLICY_MESSAGE,
+  InvalidParameterException: '入力内容が正しくありません',
   UsernameExistsException: 'このメールアドレスは既に登録されています',
+  UserLambdaValidationException: '社内メールアドレス（@example.co.jp）でのみ登録できます',
   UserAlreadyAuthenticatedException:
     '既にサインインしています。サインアウトしてからやり直してください',
+  NetworkError: 'ネットワークに接続できませんでした。通信環境を確認してください',
 }
 
 export type Pending =
@@ -38,11 +52,19 @@ export type Pending =
   | { kind: 'confirm-signup'; username: string }
   | null
 
+/** 辞書に無い Cognito 例外は、原因追跡のために例外名だけ控えめに添える */
 function toJaMessage(error: unknown): string {
-  if (error instanceof Error) {
-    return AMPLIFY_ERROR_MESSAGES[error.name] ?? error.message
+  if (!(error instanceof Error)) {
+    return GENERIC_ERROR
   }
-  return '予期しないエラーが発生しました'
+  const known = AMPLIFY_ERROR_MESSAGES[error.name]
+  if (known) {
+    return known
+  }
+  if (!error.name || error.name === 'Error') {
+    return error.message || GENERIC_ERROR
+  }
+  return `${GENERIC_ERROR}（${error.name}）`
 }
 
 /** ID トークンの `cognito:groups` は配列でも `"[admin, ops]"` 形式の文字列でも来る */
@@ -184,6 +206,49 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  async function resendCode(username: string): Promise<void> {
+    isLoading.value = true
+    error.value = null
+    try {
+      await resendSignUpCode({ username })
+    } catch (e: unknown) {
+      error.value = toJaMessage(e)
+      throw e
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  async function requestPasswordReset(username: string): Promise<void> {
+    isLoading.value = true
+    error.value = null
+    try {
+      await resetPassword({ username })
+    } catch (e: unknown) {
+      error.value = toJaMessage(e)
+      throw e
+    } finally {
+      isLoading.value = false
+    }
+  }
+
+  async function submitPasswordReset(
+    username: string,
+    code: string,
+    newPassword: string,
+  ): Promise<void> {
+    isLoading.value = true
+    error.value = null
+    try {
+      await confirmResetPassword({ username, confirmationCode: code, newPassword })
+    } catch (e: unknown) {
+      error.value = toJaMessage(e)
+      throw e
+    } finally {
+      isLoading.value = false
+    }
+  }
+
   async function logout(): Promise<void> {
     isLoading.value = true
     error.value = null
@@ -215,6 +280,9 @@ export const useAuthStore = defineStore('auth', () => {
     submitChallenge,
     register,
     confirmRegistration,
+    resendCode,
+    requestPasswordReset,
+    submitPasswordReset,
     logout,
   }
 })

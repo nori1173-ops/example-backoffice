@@ -75,7 +75,7 @@ def _notify(settings: dict, target_env: str, month: str, attempt: int, summary: 
 
 @LambdaLogger.contextualize
 def handler(event: dict, context) -> dict:
-    target_env = event["target_env"]
+    target_env = repo.target_env()
     month = event["month"]
     attempt = event["attempt"]
     run_id = event.get("run_id") or f"{target_env}-{month}-{attempt}"

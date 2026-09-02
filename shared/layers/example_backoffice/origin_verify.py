@@ -19,6 +19,7 @@ from example_backoffice.logging import get_logger
 from example_backoffice.response import CONTENT_TYPE_JSON, error
 
 HEADER = "x-origin-verify"
+PROD_ENV = "prod"
 CACHE_SECONDS = 300
 ERROR_CODE = "ORIGIN_FORBIDDEN"
 ERROR_MESSAGE = "CloudFront 経由でないリクエストです"
@@ -37,7 +38,10 @@ def _get_secret() -> str:
 
 
 def _is_skipped() -> bool:
-    """ローカル実行では検証を飛ばす。"""
+    """ローカル実行では検証を飛ばす。prod と環境不明のときは何があっても飛ばさない（SEC-03 / SP-08）。"""
+    env = os.environ.get("ENV") or ""
+    if env in ("", PROD_ENV):
+        return False
     return os.environ.get("ORIGIN_VERIFY_SKIP") == "1" or os.environ.get("AWS_SAM_LOCAL") == "true"
 
 

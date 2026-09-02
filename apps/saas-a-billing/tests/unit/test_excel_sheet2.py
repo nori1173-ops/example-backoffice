@@ -1,6 +1,7 @@
 """`excel.py` のシート2「全地点（管理用）」のユニットテスト（設計 6.5 / 6.6 / 13 章）。"""
 
 import io
+import zipfile
 from datetime import datetime
 
 import openpyxl
@@ -12,6 +13,7 @@ from saas_a_billing.excel import (
     COLOR_MISSING_TEXT,
     COLOR_NO_DATA,
     COLOR_REVIEW_TEXT,
+    COLOR_TOTAL_HIGHLIGHT,
     CURRENCY_FORMAT,
     DATETIME_FORMAT,
     DETAIL_COLUMNS,
@@ -20,11 +22,13 @@ from saas_a_billing.excel import (
     SHEET1_NAME,
     SHEET2_NAME,
     SUMMARY_COLUMNS,
+    TOTAL_FONT_SIZE,
+    TOTAL_LABEL,
     build_workbook,
     spec_block_lines,
 )
 
-from tests.conftest import make_result
+from tests.conftest import make_result, make_result_device, make_result_tenant
 
 ALL_DEVICE_CDS = (
     "10000001-01-LoggerA-400",
@@ -42,6 +46,7 @@ ALL_DEVICE_CDS = (
 )
 DEVICE_CD_COLUMN = 4
 AMOUNT_COLUMN = 12
+HOSTILE_DEVICE_CD = "90000001-01-LoggerA-400"
 
 
 def argb(color: str) -> str:
@@ -158,12 +163,36 @@ def test_tenant_summary_columns(sheet2):
 
 def test_tenant_summary_subtotal_matches_devices(sheet2):
     row = find_row(sheet2, "TNT001")
-    assert [at(sheet2, row, col).value for col in range(2, 10)] == ["3年", 5, 3, 1, 1, 2, 0, 3200]
+    assert [at(sheet2, row, col).value for col in range(2, 10)] == ["3年", 5, 3, 1, 1, 2, 0, 3450]
     subtotal = at(sheet2, row, 9)
     assert subtotal.number_format == CURRENCY_FORMAT
     assert subtotal.data_type != "f"
     amounts = [row[AMOUNT_COLUMN] for row in detail_rows(sheet2) if row[0] == "TNT001"]
-    assert sum(amount for amount in amounts if amount is not None) == 3200
+    assert sum(amount for amount in amounts if amount is not None) == 3450
+
+
+def test_sheet2_spec_block_ends_with_total_amount_row(result, sheet2):
+    row = len(spec_block_lines(result))
+    label, amount = at(sheet2, row, 0), at(sheet2, row, 1)
+    assert label.value == TOTAL_LABEL == "合計金額"
+    assert (amount.value, amount.data_type, amount.number_format) == (7200, "n", CURRENCY_FORMAT)
+    assert TOTAL_FONT_SIZE >= 14
+    assert label.font.bold is True and amount.font.bold is True
+    assert label.font.size == amount.font.size == TOTAL_FONT_SIZE
+    assert amount.alignment.horizontal == "right"
+    assert fill_color(label) == fill_color(amount) == argb(COLOR_TOTAL_HIGHLIGHT)
+
+
+def test_tenant_summary_ends_with_total_row(sheet2):
+    header = find_row(sheet2, "テナントCD")
+    total_row = find_row(sheet2, TOTAL_LABEL, col=8)
+    assert total_row == header + 6
+    amount = at(sheet2, total_row, 9)
+    assert amount.value == sum(at(sheet2, header + offset, 9).value for offset in range(1, 6)) == 7200
+    assert amount.font.bold is True
+    assert amount.number_format == CURRENCY_FORMAT
+    assert fill_color(amount) == argb(COLOR_TOTAL_HIGHLIGHT)
+    assert fill_color(at(sheet2, total_row, 8)) == argb(COLOR_TOTAL_HIGHLIGHT)
 
 
 def test_detail_table_has_fifteen_columns(sheet2):
@@ -282,7 +311,7 @@ def test_last_received_at_is_datetime_type_with_format(sheet2):
 
 def test_excluded_unit_price_has_strikethrough(sheet2):
     excluded = at(sheet2, device_row(sheet2, "10000004-01-LoggerA-400"), 11)
-    assert excluded.value == 650
+    assert excluded.value == 750
     assert excluded.font.strike is True
     assert at(sheet2, device_row(sheet2, "10000001-01-LoggerA-400"), 11).font.strike is not True
 
@@ -318,3 +347,58 @@ def test_build_workbook_returns_bytes_and_opens_in_openpyxl(result):
     assert isinstance(data, bytes)
     assert data[:2] == b"PK"
     assert openpyxl.load_workbook(io.BytesIO(data)).sheetnames == [SHEET1_NAME, SHEET2_NAME]
+
+
+def hostile_result(**device_overrides) -> dict:
+    """外部 API 由来の名前だけを差し替えた最小の `result`（SEC-01）。"""
+    return make_result(
+        tenants=[
+            make_result_tenant(
+                tenant_cd="TNT900",
+                tenant_name="=SUM(1)",
+                device_count_api=1,
+                subtotal=750,
+                counts={"billable": 1, "no_data": 0, "excluded": 0, "review": 0},
+                devices=[make_result_device(device_cd=HOSTILE_DEVICE_CD, **device_overrides)],
+            )
+        ],
+        missing_devices=[],
+    )
+
+
+def test_formula_like_names_are_written_as_text():
+    """`=` `+` `@` で始まる名前が数式セルにならない（SEC-01）。"""
+    worksheet = load(hostile_result(device_name="+1", group_names=["@x"], format_name="=SUM(1)"))[SHEET2_NAME]
+    row = device_row(worksheet, HOSTILE_DEVICE_CD)
+
+    assert [at(worksheet, row, col).value for col in (1, 3, 5, 6)] == ["=SUM(1)", "@x", "+1", "=SUM(1)"]
+    assert {at(worksheet, row, col).data_type for col in (1, 3, 5, 6)} == {"s"}
+
+
+def test_array_formula_like_names_are_written_as_text():
+    """`{=...}` も配列数式にしない（SEC-01）。"""
+    worksheet = load(hostile_result(device_name="{=SUM(1)}"))[SHEET2_NAME]
+    cell = at(worksheet, device_row(worksheet, HOSTILE_DEVICE_CD), 5)
+
+    assert cell.value == "{=SUM(1)}"
+    assert cell.data_type == "s"
+
+
+def test_url_like_names_do_not_become_hyperlinks():
+    """`strings_to_urls` を切っているのでリンク化しない（SEC-01）。"""
+    worksheet = load(hostile_result(device_name="http://attacker.example/x"))[SHEET2_NAME]
+    cell = at(worksheet, device_row(worksheet, HOSTILE_DEVICE_CD), 5)
+
+    assert cell.value == "http://attacker.example/x"
+    assert cell.hyperlink is None
+
+
+def test_workbook_has_no_formula_elements():
+    """シート XML に `<f>` 要素が 1 つも無い（SEC-01）。"""
+    hostile = hostile_result(device_name='=HYPERLINK("http://attacker.example/","請求書")')
+
+    with zipfile.ZipFile(io.BytesIO(build_workbook(hostile))) as archive:
+        sheets = [name for name in archive.namelist() if name.startswith("xl/worksheets/sheet")]
+        assert sheets
+        for name in sheets:
+            assert b"<f>" not in archive.read(name)

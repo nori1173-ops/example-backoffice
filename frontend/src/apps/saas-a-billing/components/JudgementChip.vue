@@ -16,7 +16,7 @@ export const JUDGEMENT_FILLS: Record<ChipJudgement, string> = {
 export const MISSING_TEXT_COLOR = '#808080'
 export const REVIEW_TEXT_COLOR = '#C00000'
 
-const LABELS: Record<ChipJudgement, string> = {
+export const JUDGEMENT_LABELS: Record<ChipJudgement, string> = {
   billable: '課金',
   no_data: '通信なし',
   excluded: '除外',
@@ -24,7 +24,7 @@ const LABELS: Record<ChipJudgement, string> = {
   missing: '消えた地点',
 }
 
-const REVIEW_REASONS: Record<string, string> = {
+export const REVIEW_REASONS: Record<string, string> = {
   OVER_MAX_ITEMS: '項目数が上限帯を超過・上限帯の仮単価（OVER_MAX_ITEMS）',
   NO_ITEMS: '項目数が 0・0 円（NO_ITEMS）',
   RETENTION_UNKNOWN: '保存期間が不明・3年扱いの仮単価（RETENTION_UNKNOWN）',
@@ -38,7 +38,7 @@ const props = withDefaults(defineProps<{ judgement: ChipJudgement; flags?: strin
   flags: () => [],
 })
 
-const label = computed(() => LABELS[props.judgement])
+const label = computed(() => JUDGEMENT_LABELS[props.judgement])
 
 const chipStyle = computed(() => ({
   '--chip-fill': JUDGEMENT_FILLS[props.judgement],

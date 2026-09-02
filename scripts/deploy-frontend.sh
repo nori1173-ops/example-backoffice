@@ -90,6 +90,7 @@ echo "  UserPoolId     : ${USER_POOL_ID}"
 echo "  ClientId       : ${CLIENT_ID}"
 echo "  SpaBucket      : ${SPA_BUCKET}"
 echo "  DistributionId : ${DISTRIBUTION_ID}"
+echo "  SiteEnv        : ${ENV_NAME}（アプリバーのバッジと document.title に出る）"
 
 echo ""
 echo "--- npm ci ---"
@@ -101,6 +102,7 @@ echo "--- npm run build ---"
   cd "${FRONTEND_DIR}"
   VITE_COGNITO_USER_POOL_ID="${USER_POOL_ID}" \
     VITE_COGNITO_CLIENT_ID="${CLIENT_ID}" \
+    VITE_SITE_ENV="${ENV_NAME}" \
     npm run build
 )
 

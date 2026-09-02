@@ -24,4 +24,4 @@ s3_prefix = "example-backoffice-shared-prod"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 tags = "Project=example-backoffice App=shared Env=prod"
-parameter_overrides = "ProjectName=example-backoffice Env=prod SlackMode=webhook"
+parameter_overrides = "ProjectName=example-backoffice Env=prod SlackMode=bot"

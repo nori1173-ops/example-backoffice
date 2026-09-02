@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import EnvBadge from './EnvBadge.vue'
+import { useUiStore } from '@/stores/ui'
+import RunConfirmSummary from './RunConfirmSummary.vue'
 import { useRunsStore } from '../stores/runs'
 import type { SettingsView, TargetEnv } from '../types'
 
@@ -10,13 +11,20 @@ const open = defineModel<boolean>({ required: true })
 const MONTH_PATTERN = /^\d{4}-(?:0[1-9]|1[0-2])$/
 const MAX_MONTHS_BACK = 24
 const ENV_LABELS: Record<TargetEnv, string> = { verification: '検証環境', production: '本番' }
+// 集計対象環境はサイトごとに固定（設計 R1 / UI-08）。取り違えないよう文言と色で明示する
+const ENV_HEADLINES: Record<TargetEnv, string> = {
+  verification: '検証環境の SaaS_A を集計',
+  production: '本番 SaaS_A を集計（実データ）',
+}
+const ENV_COLORS: Record<TargetEnv, string> = { verification: 'orange', production: 'green' }
 
 const store = useRunsStore()
-const targetEnv = ref<TargetEnv>('verification')
+const ui = useUiStore()
 const month = ref('')
 const distribute = ref(false)
 const force = ref(false)
 const confirming = ref(false)
+const distributeAck = ref(false)
 
 function pad(value: number): string {
   return String(value).padStart(2, '0')
@@ -55,33 +63,34 @@ function reset(): void {
   confirming.value = false
   distribute.value = false
   force.value = false
+  distributeAck.value = false
   if (!props.settings) {
     return
   }
-  targetEnv.value = props.settings.target_env
   month.value = latestClosedMonth(props.settings, new Date())
 }
 
-const targets = computed<Record<TargetEnv, boolean>>(
-  () => props.settings?.targets ?? { verification: false, production: false },
+// 固定環境のキーだけが届く（設計 R1）
+const targets = computed<Partial<Record<TargetEnv, boolean>>>(() => props.settings?.targets ?? {})
+
+const fixedEnv = computed<TargetEnv | null>(() => props.settings?.target_env ?? null)
+const targetReady = computed(() => !!fixedEnv.value && !!targets.value[fixedEnv.value])
+
+const targetHint = computed(() =>
+  fixedEnv.value && !targetReady.value
+    ? `${ENV_LABELS[fixedEnv.value]}の接続情報（SSM）が未登録のため実行できません`
+    : '',
 )
 
 const monthValid = computed(() => MONTH_PATTERN.test(month.value))
-const canSubmit = computed(() => monthValid.value && targets.value[targetEnv.value])
+const canSubmit = computed(() => monthValid.value && targetReady.value)
 
-const mailTo = computed(() => props.settings?.mail_to ?? [])
-const mailCc = computed(() => props.settings?.mail_cc ?? [])
 const mailEnabled = computed(() => props.settings?.mail_enabled ?? false)
 const slackEnabled = computed(() => props.settings?.slack_enabled ?? false)
 
-/** Slack は配布トグルが OFF か チャンネル ID が空なら投函先から外れる（設計 6.8）。 */
-const slackTarget = computed(() => {
-  const config = props.settings
-  if (!config?.slack_enabled || !config.slack_channel_id) {
-    return null
-  }
-  return config.slack_channel_label || config.slack_channel_id
-})
+// 配布は実際の宛先を読んだ確認を挟む（設計 R6 / UI-07）
+const confirmed = computed(() => !distribute.value || distributeAck.value)
+const dangerous = computed(() => props.settings?.target_env === 'production' && distribute.value)
 
 /**
  * 設定で有効になっている配布先。両方 OFF でも配布チェックは操作でき、
@@ -100,12 +109,16 @@ const distributeTargets = computed(() => {
 
 async function submit(): Promise<void> {
   open.value = false
-  await store.createRun({
+  const accepted = await store.createRun({
     month: month.value,
-    targetEnv: targetEnv.value,
     distribute: distribute.value,
     force: force.value,
   })
+  if (accepted) {
+    ui.notify(`${month.value} の実行を受け付けました`, 'info')
+  } else {
+    ui.notify(store.error ?? '実行の開始に失敗しました', 'error')
+  }
 }
 
 watch([open, () => props.settings], ([isOpen]) => {
@@ -138,35 +151,29 @@ reset()
       </v-card-text>
 
       <v-card-text v-else-if="!confirming">
-        <div class="text-body-2 text-medium-emphasis mb-1">
-          集計対象環境
-        </div>
-        <v-btn-toggle
-          v-model="targetEnv"
-          data-test="run-env"
-          mandatory
-          density="comfortable"
-          variant="outlined"
-          divided
-          class="mb-1"
-        >
-          <v-btn
-            value="verification"
-            data-test="run-env-verification"
-            :disabled="!targets.verification"
+        <div class="mb-4">
+          <div class="text-body-2 text-medium-emphasis mb-2">
+            集計対象環境
+          </div>
+          <v-chip
+            data-test="run-fixed-env"
+            :color="ENV_COLORS[settings.target_env]"
+            variant="flat"
+            size="large"
+            label
           >
-            検証環境
-          </v-btn>
-          <v-btn
-            value="production"
-            data-test="run-env-production"
-            :disabled="!targets.production"
+            {{ ENV_HEADLINES[settings.target_env] }}
+          </v-chip>
+          <div class="text-caption text-medium-emphasis mt-1">
+            このサイトでは固定です（接続先: {{ settings.saasa_host ?? '未登録' }}）。
+          </div>
+          <div
+            v-if="targetHint"
+            data-test="run-target-hint"
+            class="text-caption text-warning mt-1"
           >
-            本番
-          </v-btn>
-        </v-btn-toggle>
-        <div class="text-caption text-medium-emphasis mb-4">
-          接続情報が未登録の環境は選べません。
+            {{ targetHint }}
+          </div>
         </div>
 
         <v-text-field
@@ -205,41 +212,20 @@ reset()
         v-else
         data-test="run-confirm"
       >
-        <div class="d-flex align-center ga-2 mb-3">
-          <EnvBadge :target-env="targetEnv" />
-          <span class="text-body-2">{{ settings.saasa_host ?? '接続先ホスト不明' }}</span>
-        </div>
-        <p class="text-body-2 mb-3">
-          {{ ENV_LABELS[targetEnv] }}の {{ month }} を集計します。
-        </p>
-        <template v-if="distribute">
-          <div class="text-body-2 font-weight-medium mb-1">
-            配布先
-          </div>
-          <ul class="text-body-2 ps-5 mb-0">
-            <li v-if="mailEnabled">
-              メール To: {{ mailTo.join(', ') || '未設定' }}
-            </li>
-            <li v-if="mailEnabled && mailCc.length">
-              メール Cc: {{ mailCc.join(', ') }}
-            </li>
-            <li v-if="slackTarget">
-              Slack: {{ slackTarget }}
-              <span v-if="settings.slack_mode === 'webhook'">
-                （Webhook フォールバック中のためチャンネル ID は無視されます）
-              </span>
-            </li>
-            <li v-if="!mailEnabled && !slackTarget">
-              設定で配布が無効のため送付しません
-            </li>
-          </ul>
-        </template>
-        <p
-          v-else
-          class="text-body-2 mb-0"
-        >
-          配布しません（画面と Excel の確認のみ）。
-        </p>
+        <RunConfirmSummary
+          :settings="settings"
+          :month="month"
+          :distribute="distribute"
+        />
+        <v-checkbox
+          v-if="distribute"
+          v-model="distributeAck"
+          data-test="distribute-ack"
+          label="上の配布先へ送ることを確認しました"
+          density="compact"
+          hide-details
+          class="mt-2"
+        />
       </v-card-text>
 
       <v-card-text
@@ -275,11 +261,12 @@ reset()
         <v-btn
           v-if="confirming"
           data-test="run-submit"
-          color="primary"
+          :color="dangerous ? 'error' : 'primary'"
           variant="flat"
+          :disabled="!confirmed"
           @click="submit"
         >
-          実行
+          {{ dangerous ? '本番へ配布して実行' : '実行' }}
         </v-btn>
         <v-btn
           v-else

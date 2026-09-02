@@ -61,16 +61,13 @@ describe('runs ストア', () => {
     expect(store.error).toBeNull()
   })
 
-  it('fetchRuns が targetEnv をそのまま渡す', async () => {
+  // 集計対象環境はサイト固定なのでフィルタを渡さない（設計 R1）
+  it('fetchRuns が環境フィルタを渡さない', async () => {
     const store = useRunsStore()
 
-    await store.fetchRuns('production')
-    expect(billingApi.listRuns).toHaveBeenLastCalledWith({ targetEnv: 'production' })
-    expect(store.targetEnvFilter).toBe('production')
-
     await store.fetchRuns()
-    expect(billingApi.listRuns).toHaveBeenLastCalledWith({ targetEnv: undefined })
-    expect(store.targetEnvFilter).toBeNull()
+
+    expect(billingApi.listRuns).toHaveBeenLastCalledWith()
   })
 
   it('エラー時に error がセットされ loading が false に戻る', async () => {
@@ -84,8 +81,15 @@ describe('runs ストア', () => {
     expect(store.runs).toEqual([])
   })
 
-  it('download が署名付き URL を取得して window.open する', async () => {
+  // ポップアップブロックを避けるためアンカー遷移で開く（UI-15 / 設計 R4）
+  it('download が署名付き URL をアンカー遷移で開く', async () => {
     const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    let href = ''
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, 'click')
+      .mockImplementation(function (this: HTMLAnchorElement) {
+        href = this.href
+      })
     vi.mocked(billingApi.getDownloadUrl).mockResolvedValue({
       url: 'https://example.invalid/report.xlsx?sig=1',
       expires_at: '2026-11-21T06:05:00+09:00',
@@ -95,11 +99,54 @@ describe('runs ストア', () => {
     await store.download(MONTH, 'production')
 
     expect(billingApi.getDownloadUrl).toHaveBeenCalledWith(MONTH, 'production')
-    expect(open).toHaveBeenCalledWith(
-      'https://example.invalid/report.xlsx?sig=1',
-      '_blank',
-      'noopener,noreferrer',
+    expect(click).toHaveBeenCalledTimes(1)
+    expect(href).toBe('https://example.invalid/report.xlsx?sig=1')
+    expect(open).not.toHaveBeenCalled()
+    expect(document.querySelector('a[href*="report.xlsx"]')).toBeNull()
+  })
+
+  it('ダウンロード中は downloading に対象のキーが入る', async () => {
+    let release: (value: null) => void = () => {}
+    vi.mocked(billingApi.getDownloadUrl).mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve
+      }),
     )
+    const store = useRunsStore()
+
+    const pending = store.download(MONTH, 'verification')
+    expect(store.downloading).toBe(`verification#${MONTH}`)
+
+    release(null)
+    await pending
+    expect(store.downloading).toBeNull()
+  })
+
+  it('ダウンロードに失敗しても downloading が残らない', async () => {
+    vi.mocked(billingApi.getDownloadUrl).mockRejectedValue(new Error('boom'))
+    const store = useRunsStore()
+
+    await store.download(MONTH, 'verification')
+
+    expect(store.error).not.toBeNull()
+    expect(store.downloading).toBeNull()
+  })
+
+  // 409 の生文言「RUN を取得できません: ALREADY_SUCCEEDED」が画面に出ていた
+  it.each([
+    ['ALREADY_SUCCEEDED', '強制再実行'],
+    ['ALREADY_RUNNING', '実行中'],
+  ])('createRun の 409 %s を日本語にする', async (code, expected) => {
+    vi.mocked(billingApi.createRun).mockRejectedValue({
+      response: { data: { data: null, error: { code, message: `RUN を取得できません: ${code}` } } },
+    })
+    const store = useRunsStore()
+
+    const accepted = await store.createRun({ month: MONTH, distribute: false, force: false })
+
+    expect(accepted).toBeNull()
+    expect(store.error).toContain(expected)
+    expect(store.error).not.toContain(code)
   })
 
   it('createRun 後に pollRun が開始される', async () => {
@@ -119,7 +166,6 @@ describe('runs ストア', () => {
 
     await store.createRun({
       month: MONTH,
-      targetEnv: 'verification',
       distribute: false,
       force: false,
     })

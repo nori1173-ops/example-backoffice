@@ -1,52 +1,30 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
+import { DASH, formatCount, formatDate, formatDateTime, formatYen } from '@/utils/format'
 import { billingApi } from '../api'
 import EnvBadge from '../components/EnvBadge.vue'
 import RunDialog from '../components/RunDialog.vue'
 import StatusChip from '../components/StatusChip.vue'
-import { useRunsStore } from '../stores/runs'
-import type { RunStatus, RunSummary, SettingsView, TargetEnv } from '../types'
+import { runKey, useRunsStore } from '../stores/runs'
+import type { RunStatus, RunSummary, SettingsView } from '../types'
 
-type EnvFilter = TargetEnv | 'all'
-
-const DASH = '—'
 const AUTO_RUN_HOUR = 6
 const MAX_MONTHS_AHEAD = 24
 /** API は succeeded / distributed 以外の月を 404 にするため、キーの有無ではなく状態で判定する（設計 8 章）。 */
 const DOWNLOADABLE: readonly RunStatus[] = ['succeeded', 'distributed']
+const DOWNLOAD_BLOCKED_REASON = '成功・配布済みの月のみ'
+/** 自動実行や他の人が起こした RUN も進むように、実行中の間だけ一覧を取り直す（UI-04）。 */
+const ACTIVE_STATUSES: readonly RunStatus[] = ['queued', 'running']
+const POLL_INTERVAL_MS = 10_000
 
 const store = useRunsStore()
 const settings = ref<SettingsView | null>(null)
-const envFilter = ref<EnvFilter>(store.targetEnvFilter ?? 'all')
 const runDialog = ref(false)
-
-function pad(value: number): string {
-  return String(value).padStart(2, '0')
-}
-
-/** API は JST オフセット付きの ISO 8601 を返すので、表示は文字列のまま組み替える。 */
-function formatDateTime(iso: string | undefined): string {
-  if (!iso) {
-    return DASH
-  }
-  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso)
-  return parts ? `${parts[1]}/${parts[2]}/${parts[3]} ${parts[4]}:${parts[5]}` : iso
-}
-
-function formatDate(date: Date): string {
-  return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
-}
-
-function formatCount(value: number | undefined): string {
-  return value === undefined ? DASH : value.toLocaleString('ja-JP')
-}
-
-function formatYen(value: number | undefined): string {
-  return value === undefined ? DASH : `¥${value.toLocaleString('ja-JP')}`
-}
+const lastUpdated = ref<Date | null>(null)
+let timer: ReturnType<typeof setInterval> | null = null
 
 function monthKey(date: Date): string {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}`
+  return formatDate(date).slice(0, 7)
 }
 
 /**
@@ -91,7 +69,7 @@ const nextAutoRunLabel = computed(() => {
     return DASH
   }
   const at = nextAutoRunAt(settings.value, new Date())
-  return at ? formatDate(at) : '自動実行は無効'
+  return at ? formatDateTime(at) : '自動実行は無効'
 })
 
 function canDownload(run: RunSummary): boolean {
@@ -105,22 +83,59 @@ function distributionLabel(run: RunSummary): string {
   return run.distribute ? '未配布' : '配布なし'
 }
 
-function reload(filter: EnvFilter): Promise<void> {
-  return store.fetchRuns(filter === 'all' ? undefined : filter)
+const activeRuns = computed(() => store.runs.filter((run) => ACTIVE_STATUSES.includes(run.status)))
+
+function downloadKey(run: RunSummary): string {
+  return runKey(run.month, run.target_env)
 }
 
-watch(envFilter, (value) => {
-  void reload(value)
-})
+function stopPolling(): void {
+  if (timer) {
+    clearInterval(timer)
+    timer = null
+  }
+}
 
-onMounted(async () => {
-  await reload(envFilter.value)
+function syncPolling(): void {
+  if (!activeRuns.value.length) {
+    stopPolling()
+    return
+  }
+  timer ??= setInterval(() => void reload(), POLL_INTERVAL_MS)
+}
+
+async function reload(): Promise<void> {
+  await store.fetchRuns()
+  lastUpdated.value = new Date()
+  syncPolling()
+}
+
+/** 実行中の行は個別にも追跡する。`pollRun` は同じ月の多重起動を防いでいる。 */
+async function refresh(): Promise<void> {
+  await reload()
+  for (const run of activeRuns.value) {
+    void store.pollRun(run.month, run.target_env)
+  }
+}
+
+async function loadSettings(): Promise<void> {
   try {
     settings.value = await billingApi.getSettings()
   } catch {
     settings.value = null
   }
+}
+
+// keep-alive 配下では onMounted が再発火しないため、画面に入るたびに取り直す（UI-04）
+onActivated(async () => {
+  await refresh()
+  if (!settings.value) {
+    await loadSettings()
+  }
 })
+
+onDeactivated(stopPolling)
+onUnmounted(stopPolling)
 </script>
 
 <template>
@@ -136,6 +151,15 @@ onMounted(async () => {
       </div>
       <v-spacer />
       <v-btn
+        data-test="refresh"
+        variant="text"
+        prepend-icon="mdi-refresh"
+        :loading="store.loading"
+        @click="refresh"
+      >
+        更新
+      </v-btn>
+      <v-btn
         color="primary"
         prepend-icon="mdi-play-outline"
         @click="runDialog = true"
@@ -150,30 +174,23 @@ onMounted(async () => {
       class="mb-4"
     >
       <v-card-text class="d-flex align-center flex-wrap ga-4">
-        <v-btn-toggle
-          v-model="envFilter"
-          data-test="env-filter"
-          mandatory
-          density="comfortable"
-          variant="outlined"
-          divided
-        >
-          <v-btn value="all">
-            すべて
-          </v-btn>
-          <v-btn value="verification">
-            検証環境
-          </v-btn>
-          <v-btn value="production">
-            本番
-          </v-btn>
-        </v-btn-toggle>
         <div
           data-test="next-auto-run"
           class="text-body-2"
         >
           <span class="text-medium-emphasis me-2">次回自動実行予定</span>
           <span class="font-weight-medium">{{ nextAutoRunLabel }}</span>
+        </div>
+        <div
+          data-test="last-updated"
+          class="text-body-2"
+        >
+          <span class="text-medium-emphasis me-2">最終更新</span>
+          <span class="font-weight-medium">{{ formatDateTime(lastUpdated) }}</span>
+          <span
+            v-if="activeRuns.length"
+            class="text-caption text-medium-emphasis ms-2"
+          >実行中のため 10 秒ごとに自動更新します</span>
         </div>
       </v-card-text>
     </v-card>
@@ -196,45 +213,52 @@ onMounted(async () => {
         indeterminate
         color="primary"
       />
-      <v-table
-        density="comfortable"
-        class="text-no-wrap"
-      >
+      <v-table density="comfortable">
         <thead>
           <tr>
-            <th>集計対象環境</th>
-            <th>月</th>
+            <th class="text-no-wrap d-none d-lg-table-cell">
+              集計対象環境
+            </th>
+            <th class="text-no-wrap">
+              月
+            </th>
             <th>状態</th>
-            <th>実行日時</th>
-            <th class="text-end">
-              試行回数
+            <th class="text-no-wrap">
+              実行日時
             </th>
-            <th class="text-end">
-              テナント数
-            </th>
-            <th class="text-end">
-              地点数
-            </th>
-            <th class="text-end">
-              通信なし
-            </th>
-            <th class="text-end">
-              除外
-            </th>
-            <th class="text-end">
-              要確認
-            </th>
-            <th class="text-end">
-              取得失敗
-            </th>
-            <th class="text-end">
-              消えた地点
-            </th>
-            <th class="text-end">
+            <th class="text-end text-no-wrap">
               合計金額
             </th>
-            <th>配布状況</th>
-            <th>ダウンロード</th>
+            <th class="text-no-wrap">
+              配布状況
+            </th>
+            <th class="text-no-wrap">
+              ダウンロード
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              試行回数
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              テナント数
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              地点数
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              通信なし
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              除外
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              要確認
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              取得失敗
+            </th>
+            <th class="text-end text-no-wrap d-none d-xl-table-cell">
+              消えた地点
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -250,10 +274,10 @@ onMounted(async () => {
             v-for="run in store.runs"
             :key="`${run.target_env}-${run.month}`"
           >
-            <td>
+            <td class="text-no-wrap d-none d-lg-table-cell">
               <EnvBadge :target-env="run.target_env" />
             </td>
-            <td>
+            <td class="text-no-wrap">
               <router-link
                 :to="{
                   name: 'saas-a-billing.run-detail',
@@ -267,44 +291,28 @@ onMounted(async () => {
               <StatusChip :status="run.status" />
               <div
                 v-if="run.error"
-                class="text-caption text-error"
+                class="text-caption text-error run-error"
               >
                 {{ run.error }}
               </div>
             </td>
-            <td>{{ formatDateTime(run.started_at) }}</td>
-            <td class="text-end">
-              {{ run.attempt }}
+            <td class="text-no-wrap">
+              {{ formatDateTime(run.started_at) }}
             </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.tenant_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.device_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.no_data_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.excluded_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.review_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.failed_tenant_count) }}
-            </td>
-            <td class="text-end">
-              {{ formatCount(run.summary?.missing_count) }}
-            </td>
-            <td class="text-end">
+            <td
+              data-test="run-total-amount"
+              class="text-end text-no-wrap font-weight-bold"
+            >
               {{ formatYen(run.summary?.total_amount) }}
             </td>
-            <td>{{ distributionLabel(run) }}</td>
+            <td class="text-no-wrap">
+              {{ distributionLabel(run) }}
+            </td>
             <td>
               <v-btn
                 :data-test="`download-${run.target_env}-${run.month}`"
                 :disabled="!canDownload(run)"
+                :loading="store.downloading === downloadKey(run)"
                 size="small"
                 variant="text"
                 prepend-icon="mdi-file-excel-outline"
@@ -312,10 +320,47 @@ onMounted(async () => {
               >
                 Excel
               </v-btn>
+              <div
+                v-if="!canDownload(run)"
+                :data-test="`download-reason-${run.target_env}-${run.month}`"
+                class="text-caption text-medium-emphasis download-reason"
+              >
+                {{ DOWNLOAD_BLOCKED_REASON }}
+              </div>
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ run.attempt }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.tenant_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.device_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.no_data_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.excluded_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.review_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.failed_tenant_count) }}
+            </td>
+            <td class="text-end d-none d-xl-table-cell">
+              {{ formatCount(run.summary?.missing_count) }}
             </td>
           </tr>
         </tbody>
       </v-table>
+      <div
+        data-test="table-scroll-hint"
+        class="text-caption text-medium-emphasis px-4 py-2"
+      >
+        画面が狭いときは集計対象環境と内訳カウント（試行回数〜消えた地点）を隠しています。表は横にスクロールできます。
+      </div>
     </v-card>
 
     <RunDialog
@@ -324,3 +369,16 @@ onMounted(async () => {
     />
   </div>
 </template>
+
+<style scoped>
+/* 任意長のエラー文で表全体が横に伸びるのを防ぐ（UI-03） */
+.run-error {
+  max-width: 8rem;
+  white-space: normal;
+}
+
+.download-reason {
+  max-width: 6rem;
+  white-space: normal;
+}
+</style>

@@ -8,19 +8,48 @@ const POLL_INTERVAL_MS = 5_000
 const POLL_TIMEOUT_MS = 10 * 60 * 1_000
 const TERMINAL_STATUSES: readonly RunStatus[] = ['succeeded', 'distributed', 'failed']
 
+/** 409 の本文はコード名がそのまま入るため、画面向けの文言に置き換える（設計 8 章）。 */
+const CONFLICT_MESSAGES: Record<string, string> = {
+  ALREADY_SUCCEEDED:
+    'この月は既に集計済みです。結果を作り直すには「強制再実行」にチェックを入れてください。',
+  ALREADY_RUNNING: 'この月は実行中です。終わるまで待ってから実行してください。',
+}
+
 function messageOf(error: unknown, fallback: string): string {
-  return extractApiError(error)?.message ?? fallback
+  const api = extractApiError(error)
+  if (!api) {
+    return fallback
+  }
+  return CONFLICT_MESSAGES[api.code] ?? api.message
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+export function runKey(month: string, targetEnv: TargetEnv): string {
+  return `${targetEnv}#${month}`
+}
+
+/**
+ * fetch/XHR を使わず遷移でダウンロードする（設計 R4）。
+ * `await` を挟んだ `window.open` はポップアップブロックに当たる（UI-15）。
+ */
+function openDownload(url: string): void {
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.rel = 'noopener'
+  anchor.download = ''
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+}
+
 export const useRunsStore = defineStore('saas-a-billing/runs', () => {
   const runs = ref<RunSummary[]>([])
   const loading = ref(false)
   const error = ref<string | null>(null)
-  const targetEnvFilter = ref<TargetEnv | null>(null)
+  const downloading = ref<string | null>(null)
   const polling = new Set<string>()
 
   function isSame(a: RunSummary, month: string, targetEnv: TargetEnv): boolean {
@@ -34,13 +63,15 @@ export const useRunsStore = defineStore('saas-a-billing/runs', () => {
       : [run, ...runs.value]
   }
 
-  /** stale な queued/running はサーバが `failed` に読み替えて返すため、ここでは再判定しない（設計 8 章）。 */
-  async function fetchRuns(targetEnv?: TargetEnv): Promise<void> {
-    targetEnvFilter.value = targetEnv ?? null
+  /**
+   * stale な queued/running はサーバが `failed` に読み替えて返すため、ここでは再判定しない（設計 8 章）。
+   * 集計対象環境はサイト固定なので絞り込みは掛けない（設計 R1）。
+   */
+  async function fetchRuns(): Promise<void> {
     loading.value = true
     error.value = null
     try {
-      runs.value = (await billingApi.listRuns({ targetEnv })) ?? []
+      runs.value = (await billingApi.listRuns()) ?? []
     } catch (e: unknown) {
       error.value = messageOf(e, '実行履歴の取得に失敗しました')
     } finally {
@@ -51,13 +82,16 @@ export const useRunsStore = defineStore('saas-a-billing/runs', () => {
   /** 署名付き URL は 300 秒で切れるため、取得したその場で開く（設計 8 章）。 */
   async function download(month: string, targetEnv: TargetEnv): Promise<void> {
     error.value = null
+    downloading.value = runKey(month, targetEnv)
     try {
       const link = await billingApi.getDownloadUrl(month, targetEnv)
       if (link) {
-        window.open(link.url, '_blank', 'noopener,noreferrer')
+        openDownload(link.url)
       }
     } catch (e: unknown) {
       error.value = messageOf(e, 'ダウンロードに失敗しました')
+    } finally {
+      downloading.value = null
     }
   }
 
@@ -66,7 +100,7 @@ export const useRunsStore = defineStore('saas-a-billing/runs', () => {
     error.value = null
     try {
       const accepted = await billingApi.createRun(payload)
-      await fetchRuns(targetEnvFilter.value ?? undefined)
+      await fetchRuns()
       if (accepted) {
         void pollRun(accepted.month, accepted.target_env)
       }
@@ -84,7 +118,7 @@ export const useRunsStore = defineStore('saas-a-billing/runs', () => {
    * 同じ月を画面から何度も開いても監視は 1 本に保つ。
    */
   async function pollRun(month: string, targetEnv: TargetEnv): Promise<void> {
-    const key = `${targetEnv}#${month}`
+    const key = runKey(month, targetEnv)
     if (polling.has(key)) {
       return
     }
@@ -112,5 +146,5 @@ export const useRunsStore = defineStore('saas-a-billing/runs', () => {
     }
   }
 
-  return { runs, loading, error, targetEnvFilter, fetchRuns, download, createRun, pollRun }
+  return { runs, loading, error, downloading, fetchRuns, download, createRun, pollRun }
 })

@@ -52,6 +52,7 @@ UNTAGGABLE_TYPES = frozenset(
     {
         # Tags プロパティ自体を持たない型（cfn-lint 1.55.1 のプロバイダスキーマで確認）
         "AWS::CloudFront::OriginAccessControl",
+        "AWS::CloudFront::ResponseHeadersPolicy",
         "AWS::Route53::RecordSet",
         "AWS::Route53::RecordSetGroup",
         "AWS::S3::BucketPolicy",

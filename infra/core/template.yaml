@@ -45,9 +45,20 @@ Parameters:
     Type: String
     Default: devA@example.co.jp
     Description: DLQ アラームと SES のバウンス・苦情を受け取る基盤担当のメールアドレス
+  CognitoEmailSendingAccount:
+    Type: String
+    AllowedValues:
+      - COGNITO_DEFAULT
+      - DEVELOPER
+    Default: COGNITO_DEFAULT
+    Description: >-
+      Cognito のメール送信元（設計 6.1）。DEVELOPER は SES Identity が検証済みでないと
+      デプロイに失敗するため、新規スタックは COGNITO_DEFAULT で立ち上げ、DNS 検証後に
+      samconfig を DEVELOPER にして再デプロイする
 
 Conditions:
   IsProd: !Equals [!Ref Env, prod]
+  UseSesForCognitoEmail: !Equals [!Ref CognitoEmailSendingAccount, DEVELOPER]
 
 Globals:
   Function:
@@ -65,6 +76,8 @@ Resources:
   UserPool:
     Type: AWS::Cognito::UserPool
     UpdateReplacePolicy: Retain
+    # DEVELOPER でのメール送信は SES Identity を参照するため、Identity より後に作る。
+    DependsOn: EmailIdentity
     Metadata:
       cfn-lint:
         config:
@@ -91,9 +104,18 @@ Resources:
           RequireLowercase: true
           RequireNumbers: true
           RequireSymbols: false
-      MfaConfiguration: OPTIONAL
+      MfaConfiguration: "ON"
       EnabledMfas:
         - SOFTWARE_TOKEN_MFA
+      # COGNITO_DEFAULT で独自 From を使うには SES の送信認可ポリシーが別途要るため、
+      # 切替前は既定の no-reply@verificationemail.com のままにする（設計 6.1）。
+      EmailConfiguration: !If
+        - UseSesForCognitoEmail
+        - EmailSendingAccount: DEVELOPER
+          From: !Sub noreply@${MailDomain}
+          SourceArn: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}
+          ConfigurationSet: !Ref SesConfigurationSet
+        - EmailSendingAccount: COGNITO_DEFAULT
       AccountRecoverySetting:
         RecoveryMechanisms:
           - Name: verified_email
@@ -268,6 +290,14 @@ Resources:
               StringEquals:
                 AWS:SourceAccount: !Ref AWS::AccountId
 
+  OpsTopicArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/ops/topic-arn
+      Type: String
+      Value: !Ref OpsTopic
+      Description: 運用通知トピックの ARN。アプリのアラームが AlarmActions の宛先として読む（設計 4.2）
+
   NotifyDlqAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -332,6 +362,9 @@ Resources:
       OwnershipControls:
         Rules:
           - ObjectOwnership: BucketOwnerEnforced
+      # 再実行は同じキーへ上書きするため、誤操作・侵害からの復元手段としてバージョンを残す。
+      VersioningConfiguration:
+        Status: Enabled
       LifecycleConfiguration:
         Rules:
           # S3 のライフサイクルはプレフィックスの除外を表現できず、規則が重なると最短の期限が
@@ -343,6 +376,21 @@ Resources:
             TagFilters:
               - Key: lifecycle
                 Value: expire
+          # 中間ファイル（parts/ と tenants.json）は照合履歴として残す対象ではない。
+          # キーが {app}/{target_env}/{YYYY}/{MM}/... で月が途中に入りプレフィックスでは
+          # 選べないため、書き手が lifecycle=expire-90 タグを付ける（設計 6.7）。
+          - Id: ExpireIntermediateArtifacts
+            Status: Enabled
+            ExpirationInDays: 90
+            TagFilters:
+              - Key: lifecycle
+                Value: expire-90
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+            # 現行バージョンを消した後に残る delete marker も掃除する
+            ExpiredObjectDeleteMarker: true
           - Id: AbortIncompleteMultipartUploads
             Status: Enabled
             AbortIncompleteMultipartUpload:
@@ -451,6 +499,8 @@ Resources:
           IDEMPOTENCY_TABLE: !Ref IdempotencyTable
           DLQ_URL: !Ref NotifyDlq
           SSM_PREFIX: !Sub /${ProjectName}/${Env}
+          # 宛先の許可ドメイン（カンマ区切り）。課金明細の社外配布を送信直前で止める（SEC-07）
+          ALLOWED_MAIL_DOMAINS: example.co.jp
       Events:
         NotifyQueue:
           Type: SQS

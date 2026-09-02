@@ -260,6 +260,40 @@ def test_build_message_rejects_non_ascii_attachment_filename(aws):
         )
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "x.xlsx\r\nBcc: evil@example.com",
+        "x\nreport.xlsx",
+        "x\rreport.xlsx",
+        'x".xlsx',
+    ],
+)
+def test_build_message_rejects_crlf_or_quote_in_attachment_filename(aws, filename):
+    """ヘッダ差し込みを避けるため CR / LF / `"` を含むファイル名は受け付けない（SEC-07）。"""
+    with pytest.raises(NotifyValidationError):
+        notify.build_message(
+            app=APP,
+            channels=["email"],
+            email=an_email(),
+            attachments=[Attachment(key=f"{APP}/2026/10/x.xlsx", filename=filename)],
+        )
+
+
+@pytest.mark.parametrize("filename", ["x.xlsx\r\nBcc: evil@example.com", 'x".xlsx'])
+def test_attachment_key_rejects_crlf_or_quote_in_filename(filename):
+    with pytest.raises(NotifyValidationError):
+        notify.attachment_key(APP, filename, None, datetime(2026, 10, 21, tzinfo=UTC))
+
+
+def test_filename_error_message_does_not_echo_control_characters():
+    """例外メッセージに生の CRLF を載せない（ログ差し込みを二次被害にしない）。"""
+    with pytest.raises(NotifyValidationError) as error:
+        notify.attachment_key(APP, "x.xlsx\r\nBcc: evil@example.com", None, datetime(2026, 10, 21, tzinfo=UTC))
+    assert "\r" not in str(error.value)
+    assert "\n" not in str(error.value)
+
+
 def test_build_message_rejects_attachment_without_key(aws):
     with pytest.raises(NotifyValidationError):
         notify.build_message(

@@ -2,12 +2,17 @@
 # Slack 通知の秘密（Bot token / Incoming Webhook URL）を SSM に登録する（設計 13.4 の手順 2）。
 #
 # 使い方:
-#   scripts/register-slack.sh dev bot        Bot token を登録し mode を bot にする
-#   scripts/register-slack.sh dev webhook    Webhook URL を登録する（mode は変更しない）
+#   scripts/register-slack.sh dev bot        Bot token を登録する
+#   scripts/register-slack.sh dev webhook    Webhook URL を登録する
 #   DRY_RUN=1 scripts/register-slack.sh dev bot
 #
 # 値は引数では受け取らない（シェル履歴に秘密を残さないため）。必ず標準入力から
 # 非エコーで読み取り、標準出力にもログにも出さない。
+#
+# 投稿方式（/shared/slack/mode）はこのスクリプトでは書かない。CloudFormation が
+# shared/template.yaml の SlackModeParameter として管理しており、先に put-parameter で
+# 作ってしまうと shared スタックの作成が AlreadyExists で失敗する。方式を変えるときは
+# shared/samconfig.toml の SlackMode を直して shared を再デプロイする。
 set -euo pipefail
 set +x
 
@@ -22,6 +27,7 @@ usage() {
 usage: scripts/register-slack.sh {dev|prod} {bot|webhook}
 
 Bot token / Webhook URL は引数では渡せない。実行後にプロンプトから入力する。
+投稿方式（/shared/slack/mode）は shared の samconfig（SlackMode）で決まる。
 
 環境変数:
   DRY_RUN=1  AWS を呼ばずに実行内容だけ表示する（入力プロンプトも出さない）
@@ -50,21 +56,17 @@ case "${KIND}" in
     PARAM_NAME="/${PROJECT}/${ENV_NAME}/shared/slack/bot-token"
     PARAM_DESC="Slack Bot token（chat:write / chat:write.public）"
     PROMPT="Slack bot token (xoxb-...): "
-    MODE="bot"
     ;;
   webhook)
     PARAM_NAME="/${PROJECT}/${ENV_NAME}/shared/slack/webhook-url"
     PARAM_DESC="Slack Incoming Webhook URL"
     PROMPT="Slack incoming webhook URL: "
-    MODE="webhook"
     ;;
   *)
     usage
     exit 1
     ;;
 esac
-
-MODE_PARAM_NAME="/${PROJECT}/${ENV_NAME}/shared/slack/mode"
 
 TMP_JSON=""
 cleanup() {
@@ -117,19 +119,13 @@ echo "=== Slack 通知の秘密を登録 ==="
 echo "  Env       : ${ENV_NAME}"
 echo "  Kind      : ${KIND}"
 echo "  Parameter : ${PARAM_NAME}"
-if [ "${KIND}" = "bot" ]; then
-  echo "  Mode      : ${MODE_PARAM_NAME} = ${MODE}"
-else
-  echo "  Mode      : 変更しない"
-fi
+echo "  Mode      : 変更しない（shared の samconfig の SlackMode が決める）"
 echo "  Region    : ${REGION}"
 echo "  Profile   : ${AWS_PROFILE:-(未設定。既定プロファイルを使う)}"
 
 if [ "${DRY_RUN}" = "1" ]; then
   echo "[DRY RUN] 上記パラメータを SecureString で登録します"
-  if [ "${KIND}" = "bot" ]; then
-    echo "[DRY RUN] mode を bot に更新します"
-  fi
+  echo "[DRY RUN] /shared/slack/mode は書きません（CloudFormation の管理下）"
   echo "[DRY RUN] AWS は呼び出しませんでした"
   exit 0
 fi
@@ -152,16 +148,10 @@ fi
 put_parameter "${VALUE}" "${PARAM_NAME}" SecureString true "${PARAM_DESC}"
 VALUE=""
 
-if [ "${KIND}" = "bot" ]; then
-  put_parameter "${MODE}" "${MODE_PARAM_NAME}" String true "notifier の Slack 投稿方式 (bot / webhook)"
-
-  echo ""
-  echo "次の手順:"
-  echo "  1. shared/samconfig.toml の parameter_overrides の SlackMode を ${MODE} に直す"
-  echo "     （直さないと次の shared デプロイで SSM の mode が samconfig の値に戻る）"
-  echo "  2. cd shared && sam build --use-container && sam deploy --config-env $([ "${ENV_NAME}" = "prod" ] && echo production || echo default)"
-else
-  echo ""
-  echo "mode は変更していません（webhook URL のみ更新）。投稿方式を webhook に切り替える場合は"
-  echo "shared/samconfig.toml の SlackMode を webhook にして shared を再デプロイする。"
-fi
+echo ""
+echo "投稿方式（/shared/slack/mode）は変更していません。これは shared スタックが"
+echo "shared/samconfig.toml の SlackMode から作る CloudFormation 管理のパラメータで、"
+echo "このスクリプトからは書かない（先に作ると shared の作成が AlreadyExists で失敗する）。"
+echo "方式を切り替えるときは samconfig の SlackMode を直して shared を再デプロイする:"
+echo "  cd shared && sam build --use-container && sam deploy --config-env $([ "${ENV_NAME}" = "prod" ] && echo production || echo default)"
+echo "秘密の登録は shared のデプロイの前後どちらでもよい（notifier は実行時に読む）。"

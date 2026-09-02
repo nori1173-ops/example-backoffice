@@ -4,9 +4,13 @@
 設計どおりであることを静的に確かめる。
 """
 
+import pathlib
+import tomllib
+
 import pytest
 
 TEMPLATE_PATH = "shared/template.yaml"
+SAMCONFIG_PATH = pathlib.Path(__file__).resolve().parents[2] / "shared" / "samconfig.toml"
 
 LAYER_ARN_KEY = "/${ProjectName}/${Env}/shared/layer-arn"
 SLACK_MODE_KEY = "/${ProjectName}/${Env}/shared/slack/mode"
@@ -93,3 +97,18 @@ def test_env_parameter_is_constrained(load_template):
     template = _load_or_skip(load_template)
     env = _stack_parameter(template, "Env")
     assert env.get("AllowedValues") == ["dev", "prod"]
+
+
+def test_samconfig_uses_bot_mode_in_both_environments():
+    """dev / prod とも Bot token 運用（計画 R5 / SP-03）。
+
+    notifier は bot-token の有無で実挙動を決めるため、samconfig が `webhook` のままだと
+    `register-slack.sh prod bot` の直後に shared を流した時点で `/shared/slack/mode` が
+    巻き戻り、設定画面が誤った方式を表示する。
+    """
+    if not SAMCONFIG_PATH.is_file():
+        pytest.skip(f"{SAMCONFIG_PATH} は未作成")
+    samconfig = tomllib.loads(SAMCONFIG_PATH.read_text(encoding="utf-8"))
+    for config_env in ("default", "production"):
+        overrides = samconfig[config_env]["deploy"]["parameters"]["parameter_overrides"]
+        assert "SlackMode=bot" in overrides, config_env

@@ -43,7 +43,8 @@ export type SettingsUpdate = Partial<EditableSettings> & { version: number }
 /** `GET /settings` の応答。SSM 由来の 3 項目は DynamoDB に保存されない（設計 8 章） */
 export interface SettingsView extends Settings {
   saasa_host: string | null
-  targets: Record<TargetEnv, boolean>
+  /** SSM に接続情報がある環境。集計対象環境はサイト固定なので固定環境のキーだけ届く（設計 R1） */
+  targets: Partial<Record<TargetEnv, boolean>>
   slack_mode: SlackMode | null
 }
 
@@ -234,6 +235,7 @@ export interface RunDetail {
 
 export interface RunRequest {
   month: string
+  /** サイトごとに固定される（設計 R1）。省略すると API 側の固定値で実行される */
   targetEnv?: TargetEnv
   distribute: boolean
   force: boolean

@@ -318,3 +318,99 @@ def test_malformed_json_goes_to_dlq(aws, senders):
     assert len(dlq) == 1
     assert dlq[0]["Body"] == '{"schema": '
     assert senders.email.calls == []
+
+
+def dlq_reason(aws) -> str:
+    dlq = receive_dlq(aws)
+    assert len(dlq) == 1
+    return dlq[0]["MessageAttributes"]["reason"]["StringValue"]
+
+
+@pytest.mark.parametrize("field", ["to", "cc", "reply_to"])
+def test_external_recipient_goes_to_dlq(aws, senders, field):
+    """社外ドメインの宛先は恒久エラーで送信しない（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["email"][field] = ["leak@example.com"]
+
+    result = app.handler(sqs_event(message), FakeContext())
+
+    assert result == {"batchItemFailures": []}
+    assert senders.email.calls == []
+    assert f"email.{field}" in dlq_reason(aws)
+
+
+def test_subdomain_recipient_goes_to_dlq(aws, senders):
+    """`example.co.jp` の部分一致を許さない（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["email"]["to"] = ["leak@evil-example.co.jp"]
+
+    app.handler(sqs_event(message), FakeContext())
+
+    assert senders.email.calls == []
+    assert len(receive_dlq(aws)) == 1
+
+
+def test_uppercase_internal_recipient_is_sent(aws, senders):
+    """大文字のドメインは許可する（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["email"]["to"] = ["DevA@EXAMPLE.CO.JP"]
+
+    result = app.handler(sqs_event(message), FakeContext())
+
+    assert result == {"batchItemFailures": []}
+    assert len(senders.email.calls) == 1
+
+
+def test_attachment_of_other_app_goes_to_dlq(aws, senders):
+    """他アプリのプレフィックスの添付は読み出さない（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["attachments"] = [
+        {"bucket": ATTACHMENTS_BUCKET, "key": "other-app/2026/10/secret.xlsx", "filename": "secret.xlsx"}
+    ]
+
+    result = app.handler(sqs_event(message), FakeContext())
+
+    assert result == {"batchItemFailures": []}
+    assert senders.email.calls == []
+    assert "attachments" in dlq_reason(aws)
+
+
+def test_attachment_with_parent_traversal_goes_to_dlq(aws, senders):
+    """`..` を含むキーは拒否する（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["attachments"] = [
+        {"bucket": ATTACHMENTS_BUCKET, "key": f"{APP_ID}/../other-app/secret.xlsx", "filename": "secret.xlsx"}
+    ]
+
+    app.handler(sqs_event(message), FakeContext())
+
+    assert senders.email.calls == []
+    assert len(receive_dlq(aws)) == 1
+
+
+def test_attachment_of_own_app_is_sent(aws, senders):
+    """自アプリのプレフィックス配下は従来どおり送る（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["attachments"] = [
+        {
+            "bucket": ATTACHMENTS_BUCKET,
+            "key": f"{APP_ID}/2026/10/saas_a_billing_2026-10.xlsx",
+            "filename": "saas_a_billing_2026-10.xlsx",
+        }
+    ]
+
+    result = app.handler(sqs_event(message), FakeContext())
+
+    assert result == {"batchItemFailures": []}
+    assert len(senders.email.calls) == 1
+
+
+def test_app_id_with_path_separator_goes_to_dlq(aws, senders):
+    """`app` にパス区切りを混ぜたプレフィックス偽装を拒否する（SEC-07）。"""
+    message = make_message(channels=("email",))
+    message["app"] = "../other-app"
+
+    app.handler(sqs_event(message), FakeContext())
+
+    assert senders.email.calls == []
+    assert len(receive_dlq(aws)) == 1

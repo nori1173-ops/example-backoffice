@@ -143,6 +143,30 @@ describe('settings ストア', () => {
     expect(store.loading).toBe(false)
   })
 
+  // A1 以降 `targets` は固定環境のキーだけを返す（設計 R1）
+  it('固定環境のキーだけの targets をそのまま持つ', async () => {
+    vi.mocked(billingApi.getSettings).mockResolvedValue(
+      makeSettings({ targets: { verification: true } }),
+    )
+    const store = useSettingsStore()
+
+    await store.fetch()
+
+    expect(store.targets).toEqual({ verification: true })
+  })
+
+  it('TARGET_ENV_FIXED でメッセージを出す', async () => {
+    vi.mocked(billingApi.updateSettings).mockRejectedValue(rejectWith(400, 'TARGET_ENV_FIXED'))
+    const store = useSettingsStore()
+    await store.fetch()
+
+    const saved = await store.save({ cutoff_day: 25 })
+
+    expect(saved).toBe(false)
+    expect(store.error).toContain('集計対象環境')
+    expect(store.loading).toBe(false)
+  })
+
   it('addPrice が effective_from と bands を送る', async () => {
     const store = useSettingsStore()
     const price = makePriceTable({ effective_from: '2026-05-01' })

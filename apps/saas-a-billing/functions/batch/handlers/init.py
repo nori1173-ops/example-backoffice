@@ -4,8 +4,8 @@
 単価表を解決してから SaaS_A にログインし、テナント一覧を後続の Map へ渡す。単価表は
 `PriceTable` に変換して、版の形が壊れていれば収集を始める前に落とす。
 
-集計対象環境は実行入力を優先し、無ければ設定値を使う。RUN のキーが
-`RUN#{target_env}` であるため、この確定だけは状態遷移より先に行う。
+集計対象環境は環境変数 `TARGET_ENV` を正とする（計画 R1 / SP-01）。実行入力にも設定にも
+従わない。RUN のキーが `RUN#{target_env}` であるため、この確定だけは状態遷移より先に行う。
 
 トークンはステートマシンの入出力・実行履歴に載せず、RUN の属性経由で
 `CollectTenant` へ渡す（設計 6.3 / 12.3）。ログにも出さない。例外は捕まえず素通し
@@ -54,7 +54,7 @@ def handler(event: dict, context) -> dict:
     month = event["month"]
     attempt = event["attempt"]
     settings = repo.get_settings()
-    target_env = event.get("target_env") or settings["target_env"]
+    target_env = repo.target_env()
     repo.start_run(target_env, month, attempt, event["run_token"])
     repo.set_execution_arn(target_env, month, attempt, event["execution_arn"])
     credentials = SaasACredentials.from_ssm(os.environ["SSM_PREFIX"], target_env)

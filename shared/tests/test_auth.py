@@ -90,3 +90,16 @@ def test_require_group_raises_forbidden_for_non_member():
 def test_is_admin():
     assert is_admin(make_claims(["admin"])) is True
     assert is_admin(make_claims(["dev"])) is False
+
+
+def test_get_claims_rejects_access_token():
+    """access トークンには email が無く監査が欠けるため拒否する（SEC-12）。"""
+    with pytest.raises(UnauthorizedError):
+        get_claims(make_event({"sub": "s-1", "token_use": "access"}))
+
+
+def test_get_claims_accepts_id_token():
+    claims = get_claims(make_event({"sub": "s-1", "email": "devA@example.co.jp", "token_use": "id"}))
+
+    assert claims.sub == "s-1"
+    assert claims.email == "devA@example.co.jp"

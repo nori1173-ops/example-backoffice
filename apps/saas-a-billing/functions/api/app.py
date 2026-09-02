@@ -29,7 +29,7 @@ from botocore.exceptions import ClientError
 from saas_a_billing import execution, messages, period, repo, storage
 from saas_a_billing.pricing import PriceTableNotFoundError
 
-from example_backoffice import auth, origin_verify, response
+from example_backoffice import auth, mail, origin_verify, response
 from example_backoffice.logging import LambdaLogger, get_logger
 
 API_PREFIX = "/api/saas-a-billing"
@@ -43,6 +43,8 @@ PARAMETER_NOT_FOUND = "ParameterNotFound"
 
 VALIDATION_ERROR = "VALIDATION_ERROR"
 TARGET_ENV_NOT_CONFIGURED = "TARGET_ENV_NOT_CONFIGURED"
+TARGET_ENV_FIXED = "TARGET_ENV_FIXED"
+MAIL_DOMAIN_NOT_ALLOWED = "MAIL_DOMAIN_NOT_ALLOWED"
 VERSION_CONFLICT = "VERSION_CONFLICT"
 ALREADY_EXISTS = "ALREADY_EXISTS"
 MONTH_NOT_STARTED = "MONTH_NOT_STARTED"
@@ -68,6 +70,7 @@ EDITABLE_SETTINGS = (
     "camera_format_names",
 )
 REDACTED_RUN_ATTRIBUTES = (*repo.TOKEN_ATTRIBUTES, "run_token", "retry_alert_sent")
+LIST_REDACTED_RUN_ATTRIBUTES = (*REDACTED_RUN_ATTRIBUTES, repo.REQUEST_HISTORY)
 STRING_LIST_SETTINGS = ("exclude_keywords", "camera_format_names")
 TEXT_SETTINGS = ("slack_channel_label", "slack_mention")
 BOOL_SETTINGS = ("auto_run_enabled", "mail_enabled", "slack_enabled")
@@ -217,7 +220,18 @@ def _query_target_env() -> str | None:
 
 
 def _target_env_or_default() -> str:
-    return _query_target_env() or repo.get_settings()["target_env"]
+    return _query_target_env() or repo.target_env()
+
+
+def _require_fixed_target_env(value) -> None:
+    """集計対象環境はサイト固定（計画 R1 / SP-01）。固定値以外は受け付けない。"""
+    fixed = repo.target_env()
+    _require(value == fixed, f"集計対象環境は {fixed} に固定されています", TARGET_ENV_FIXED)
+    _require(
+        _is_target_configured(fixed),
+        f"{fixed} の接続情報が SSM に登録されていません",
+        TARGET_ENV_NOT_CONFIGURED,
+    )
 
 
 def _query_limit(default: int) -> int:
@@ -235,13 +249,14 @@ def _query_detail() -> bool:
     return bool(value) and value.lower() not in ("false", "0")
 
 
-def _run_view(run: dict, now: datetime) -> dict:
+def _run_view(run: dict, now: datetime, redacted: tuple[str, ...] = REDACTED_RUN_ATTRIBUTES) -> dict:
     """応答用の RUN。機微・内部の属性を落とし、stale な queued / running は失敗として見せる。
 
     実行中の RUN が持つ `api_token` は生きた SaaS_A の Bearer トークンなので、
-    認証済みユーザーにも渡さない（設計 12.1）。
+    認証済みユーザーにも渡さない（設計 12.1）。一覧では `request_history` も落とす
+    （画面で使わず、最大 20 件 × 実行者で応答が膨らむだけ。詳細では返す）。
     """
-    view = {name: value for name, value in run.items() if name not in REDACTED_RUN_ATTRIBUTES}
+    view = {name: value for name, value in run.items() if name not in redacted}
     if not repo.is_stale(run, now):
         return view
     return {**view, "status": repo.FAILED, "error": TIMEOUT_ERROR}
@@ -261,12 +276,19 @@ def _validate_string_list(values, name: str) -> None:
 
 
 def _validate_emails(values, name: str, *, required: bool) -> None:
+    """宛先の形式と許可ドメインを検証する。ドメイン判定は notifier と同じ規則（SEC-07）。"""
     _require(isinstance(values, list), f"{name} は配列で指定してください")
     _require(not required or bool(values), f"{name} は 1 件以上指定してください")
     for address in values:
         _require(
             isinstance(address, str) and bool(_EMAIL_PATTERN.match(address)),
             f"{name} にメール形式でない宛先があります",
+        )
+        _require(
+            mail.is_allowed_address(address),
+            f"{name} の {address} は社外ドメインのため指定できません"
+            f"（宛先は {mail.allowed_mail_domains_label()} のみ）",
+            MAIL_DOMAIN_NOT_ALLOWED,
         )
 
 
@@ -296,13 +318,7 @@ def _validate_mail_to(values: dict) -> None:
 
 def _validate_settings(values: dict) -> None:
     """設計 8 章の `PUT /settings` の検証。更新後の設定全体に対して行う。"""
-    target_env = values.get("target_env")
-    _require(target_env in repo.TARGET_ENVS, f"target_env は {TARGET_ENV_LABEL} のいずれかで指定してください")
-    _require(
-        _is_target_configured(target_env),
-        f"{target_env} の接続情報が SSM に登録されていません",
-        TARGET_ENV_NOT_CONFIGURED,
-    )
+    _require_fixed_target_env(values.get("target_env"))
     cutoff_day = values.get("cutoff_day")
     _require(
         _is_int(cutoff_day) and CUTOFF_DAY_MIN <= cutoff_day <= CUTOFF_DAY_MAX,
@@ -372,11 +388,12 @@ def health() -> dict:
 def get_settings() -> dict:
     _claims()
     settings = repo.get_settings()
+    target_env = settings["target_env"]
     return response.ok(
         {
             **settings,
-            "saasa_host": _saasa_host(settings["target_env"]),
-            "targets": {target_env: _is_target_configured(target_env) for target_env in repo.TARGET_ENVS},
+            "saasa_host": _saasa_host(target_env),
+            "targets": {target_env: _is_target_configured(target_env)},
             "slack_mode": _slack_mode(),
         }
     )
@@ -417,9 +434,9 @@ def post_prices() -> dict | Response:
 @app.get("/runs")
 def get_runs() -> dict:
     _claims()
-    runs = repo.list_runs(_query_target_env(), _query_limit(repo.RUN_LIST_LIMIT))
+    runs = repo.list_runs(_target_env_or_default(), _query_limit(repo.RUN_LIST_LIMIT))
     now = _now()
-    return response.ok([_run_view(run, now) for run in runs])
+    return response.ok([_run_view(run, now, LIST_REDACTED_RUN_ATTRIBUTES) for run in runs])
 
 
 @app.get("/runs/<month>")
@@ -454,18 +471,13 @@ def post_runs() -> Response:
     settings = repo.get_settings()
     month = payload.get("month")
     _require(_is_month(month), "month は YYYY-MM 形式で指定してください")
-    target_env = payload.get("target_env") or settings["target_env"]
-    _require(target_env in repo.TARGET_ENVS, f"target_env は {TARGET_ENV_LABEL} のいずれかで指定してください")
-    _require(
-        _is_target_configured(target_env),
-        f"{target_env} の接続情報が SSM に登録されていません",
-        TARGET_ENV_NOT_CONFIGURED,
-    )
+    target_env = payload.get("target_env") or repo.target_env()
+    _require_fixed_target_env(target_env)
     now = _now()
     closing = period.closing_period(month, settings["cutoff_day"], settings["cutoff_time"])
     _require(closing.start <= now, f"{month} の課金対象期間はまだ始まっていません", MONTH_NOT_STARTED)
 
-    distribute = _bool_field(payload, "distribute", True)
+    distribute = _bool_field(payload, "distribute", False)
     force = _bool_field(payload, "force", False)
     run_token = str(uuid.uuid4())
     try:

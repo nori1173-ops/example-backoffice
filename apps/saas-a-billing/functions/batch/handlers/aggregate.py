@@ -122,7 +122,7 @@ def _tenant_result(part: dict, tenant: dict, settings: dict, table: PriceTable, 
 
 def _collect_tenants(event: dict, settings: dict, table: PriceTable, closing: ClosingPeriod) -> list[dict]:
     """Map 出力の `tenant_cd` から parts を読み、`tenant_cd` 昇順で判定結果を並べる（設計 6.5）。"""
-    target_env, month = event["target_env"], event["month"]
+    target_env, month = repo.target_env(), event["month"]
     attributes = {tenant["tenant_cd"]: tenant for tenant in storage.get_tenants(target_env, month)}
     if event["collected"] and not attributes:
         logger.warning(
@@ -146,7 +146,7 @@ def _run_snapshot(run: dict, event: dict, finished_at: datetime) -> dict:
         "finished_at": finished_at.isoformat(),
         "requested_by": run.get("requested_by"),
         "env": os.environ["ENV"],
-        "target_env": event["target_env"],
+        "target_env": repo.target_env(),
         "saasa_host": run.get("saasa_host", ""),
         "execution_arn": run.get("execution_arn", ""),
     }
@@ -244,7 +244,7 @@ def _send_report(settings: dict, result: dict, closing: ClosingPeriod, xlsx_key:
 
 def _distribute(event: dict, settings: dict, result: dict, closing: ClosingPeriod, xlsx_key: str) -> bool:
     """通知を投函して RUN を `distributed` にする。投函の失敗は `succeeded` のまま記録する（設計 11.1）。"""
-    target_env, month, attempt = event["target_env"], event["month"], event["attempt"]
+    target_env, month, attempt = repo.target_env(), event["month"], event["attempt"]
     channels = distribution.channels(settings)
     if not channels:
         logger.info(NO_DISTRIBUTION_TARGET, {"target_env": target_env, "month": month})
@@ -279,7 +279,7 @@ def _emit_metrics(summary: dict, duration_sec: float) -> None:
 @metrics.log_metrics
 @LambdaLogger.contextualize
 def handler(event: dict, context) -> dict:
-    target_env = event["target_env"]
+    target_env = repo.target_env()
     month = event["month"]
     attempt = event["attempt"]
     run = repo.get_run(target_env, month) or {}

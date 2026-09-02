@@ -11,13 +11,14 @@ s3_prefix = "example-backoffice-app-saas-a-billing-dev"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = false
 tags = "Project=example-backoffice App=saas-a-billing Env=dev"
-parameter_overrides = "ProjectName=example-backoffice Env=dev LogLevel=DEBUG PortalUrl=https://backoffice-dev.example-cloud.com/saas-a-billing ExamplePowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86 PowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:37 UserPoolIssuer=/example-backoffice/dev/cognito/issuer UserPoolClientId=/example-backoffice/dev/cognito/client-id NotifyQueueUrl=/example-backoffice/dev/notify/queue-url NotifyQueueArn=/example-backoffice/dev/notify/queue-arn AttachmentsBucket=/example-backoffice/dev/attachments/bucket SharedLayerArn=/example-backoffice/dev/shared/layer-arn"
+parameter_overrides = "ProjectName=example-backoffice Env=dev TargetEnv=verification LogLevel=DEBUG PortalUrl=https://backoffice-dev.example-cloud.com/saas-a-billing ExamplePowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86 PowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:37 UserPoolIssuer=/example-backoffice/dev/cognito/issuer UserPoolClientId=/example-backoffice/dev/cognito/client-id NotifyQueueUrl=/example-backoffice/dev/notify/queue-url NotifyQueueArn=/example-backoffice/dev/notify/queue-arn AttachmentsBucket=/example-backoffice/dev/attachments/bucket SharedLayerArn=/example-backoffice/dev/shared/layer-arn OpsTopicArn=/example-backoffice/dev/ops/topic-arn"
 
 [production.build.parameters]
 use_container = true
 
 # prod で上書きするのは SSM の「キー名」であり、値ではない（プラットフォーム設計 4.4 / 13.2）。
-# 6 本のうち 1 本でも dev のまま残ると prod スタックが dev のリソースを掴む。
+# 1 本でも dev のまま残ると prod スタックが dev のリソース（Cognito / キュー / バケット /
+# 通知トピック）を掴む。
 [production.deploy.parameters]
 stack_name = "example-backoffice-app-saas-a-billing-prod"
 region = "ap-northeast-1"
@@ -26,4 +27,4 @@ s3_prefix = "example-backoffice-app-saas-a-billing-prod"
 capabilities = "CAPABILITY_IAM"
 confirm_changeset = true
 tags = "Project=example-backoffice App=saas-a-billing Env=prod"
-parameter_overrides = "ProjectName=example-backoffice Env=prod LogLevel=INFO PortalUrl=https://backoffice.example-cloud.com/saas-a-billing ExamplePowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86 PowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:37 UserPoolIssuer=/example-backoffice/prod/cognito/issuer UserPoolClientId=/example-backoffice/prod/cognito/client-id NotifyQueueUrl=/example-backoffice/prod/notify/queue-url NotifyQueueArn=/example-backoffice/prod/notify/queue-arn AttachmentsBucket=/example-backoffice/prod/attachments/bucket SharedLayerArn=/example-backoffice/prod/shared/layer-arn"
+parameter_overrides = "ProjectName=example-backoffice Env=prod TargetEnv=production LogLevel=INFO PortalUrl=https://backoffice.example-cloud.com/saas-a-billing ExamplePowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86 PowertoolsLayerArn=arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:37 UserPoolIssuer=/example-backoffice/prod/cognito/issuer UserPoolClientId=/example-backoffice/prod/cognito/client-id NotifyQueueUrl=/example-backoffice/prod/notify/queue-url NotifyQueueArn=/example-backoffice/prod/notify/queue-arn AttachmentsBucket=/example-backoffice/prod/attachments/bucket SharedLayerArn=/example-backoffice/prod/shared/layer-arn OpsTopicArn=/example-backoffice/prod/ops/topic-arn"

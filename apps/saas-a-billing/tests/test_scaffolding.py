@@ -13,6 +13,7 @@ from tests.conftest import FIXTURES_DIR, make_api_event, make_device, make_price
 def test_lambda_environment_is_set_without_resource_vars():
     assert os.environ["AWS_DEFAULT_REGION"] == "ap-northeast-1"
     assert os.environ["ENV"] == "dev"
+    assert os.environ["TARGET_ENV"] == "verification"
     assert os.environ["APP_NAME"] == "saas-a-billing"
     assert os.environ["S3_PREFIX"] == "saas-a-billing"
     assert os.environ["SSM_PREFIX"] == "/example-backoffice/dev/apps/saas-a-billing"

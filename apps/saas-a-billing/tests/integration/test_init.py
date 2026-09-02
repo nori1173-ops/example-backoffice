@@ -232,14 +232,16 @@ def test_token_is_not_logged(aws, caplog):
 
 
 @responses.activate
-def test_execution_input_target_env_overrides_settings(aws):
+def test_environment_target_env_overrides_execution_input(aws, monkeypatch):
+    """実行入力や設定に何が入っていても `TARGET_ENV` を正とする（計画 R1 / SP-01）。"""
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
     put_settings(aws, target_env=VERIFICATION)
     put_price(aws)
     put_credentials(aws, PRODUCTION, PRODUCTION_URL)
     acquire(PRODUCTION)
     register_saasa(make_tenants(1), base_url=PRODUCTION_URL)
 
-    result = init.handler(make_event(target_env=PRODUCTION), None)
+    result = init.handler(make_event(target_env=VERIFICATION), None)
 
     assert result["target_env"] == PRODUCTION
     assert result["run_id"] == f"{PRODUCTION}-{MONTH}-1"
@@ -249,7 +251,7 @@ def test_execution_input_target_env_overrides_settings(aws):
 
 
 @responses.activate
-def test_uses_settings_target_env_when_input_absent(aws):
+def test_uses_environment_target_env_when_input_absent(aws):
     prepare(aws)
     event = make_event()
     del event["target_env"]
@@ -261,7 +263,8 @@ def test_uses_settings_target_env_when_input_absent(aws):
     assert repo.get_run(VERIFICATION, MONTH)["saasa_host"] == "saasa-verification.example.com"
 
 
-def test_missing_ssm_raises_target_env_not_configured(aws):
+def test_missing_ssm_raises_target_env_not_configured(aws, monkeypatch):
+    monkeypatch.setenv("TARGET_ENV", PRODUCTION)
     put_settings(aws)
     put_price(aws)
     put_credentials(aws, PRODUCTION, PRODUCTION_URL, leaves=("base-url", "user-id"))

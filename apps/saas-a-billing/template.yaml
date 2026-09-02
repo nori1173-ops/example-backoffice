@@ -16,6 +16,13 @@ Parameters:
       - dev
       - prod
     Default: dev
+  TargetEnv:
+    Type: String
+    AllowedValues:
+      - verification
+      - production
+    Default: verification
+    Description: 集計対象の SaaS_A 環境。サイトごとに固定し、画面や実行入力では変えられない（設計 3.3）
   LogLevel:
     Type: String
     AllowedValues:
@@ -59,6 +66,10 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<String>
     Default: /example-backoffice/dev/shared/layer-arn
     Description: 共通レイヤ example_backoffice のバージョン付き ARN
+  OpsTopicArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/ops/topic-arn
+    Description: core が公開する運用通知トピックの ARN。4 本のアラームの通知先（設計 4.2 / 14.2）
 
 Conditions:
   IsProd: !Equals [!Ref Env, prod]
@@ -76,6 +87,7 @@ Globals:
     Environment:
       Variables:
         ENV: !Ref Env
+        TARGET_ENV: !Ref TargetEnv
         APP_NAME: saas-a-billing
         TABLE_NAME: !Ref DataTable
         ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
@@ -107,6 +119,11 @@ Resources:
               audience:
                 - !Ref UserPoolClientId
         DefaultAuthorizer: CognitoJwt
+      # POST /runs は admin を要求しないため、誤操作・奪取時の増幅をここで止める（設計 12.1）。
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+        DetailedMetricsEnabled: true
       AccessLogSettings:
         DestinationArn: !GetAtt ApiAccessLogGroup.Arn
         Format: '{"requestId":"$context.requestId","path":"$context.path","status":"$context.status","sub":"$context.authorizer.claims.sub","latency":"$context.responseLatency"}'
@@ -171,6 +188,7 @@ Resources:
               Effect: Allow
               Action: states:StartExecution
               Resource: !Ref StateMachine
+            # get_parameters_by_path はパスそのものの ARN にも権限が要るため、パスと配下の 2 本を並べる
             - Sid: ReadOwnOriginVerifyAndSlackMode
               Effect: Allow
               Action:
@@ -178,7 +196,8 @@ Resources:
                 - ssm:GetParameters
                 - ssm:GetParametersByPath
               Resource:
-                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}/*
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/mode
             - Sid: DecryptSecureStringParameters
@@ -218,6 +237,10 @@ Resources:
         Schedule:
           Type: ScheduleV2
           Properties:
+            # Name を省くと論理 ID がそのままスケジュール名になり、口座 + リージョンで
+            # 一意な Scheduler の名前が dev / prod で衝突する（prod 作成時に実際に失敗）。
+            Name: !Sub ${ProjectName}-saas-a-billing-trigger-${Env}
+            Description: !Sub ${ProjectName} saas-a-billing の月次集計トリガー (${Env})
             ScheduleExpression: cron(0 6 * * ? *)
             ScheduleExpressionTimezone: Asia/Tokyo
             FlexibleTimeWindow:
@@ -296,13 +319,16 @@ Resources:
               Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            # 固定した集計対象環境の 3 本だけ。get_parameters_by_path はパスの ARN にも権限が要る
             - Sid: ReadTargetCredentials
               Effect: Allow
               Action:
                 - ssm:GetParameter
                 - ssm:GetParameters
                 - ssm:GetParametersByPath
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/*
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}/*
             - Sid: DecryptSecureStringParameters
               Effect: Allow
               Action: kms:Decrypt
@@ -357,13 +383,16 @@ Resources:
               Effect: Allow
               Action: s3:ListBucket
               Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            # 固定した集計対象環境の 3 本だけ。get_parameters_by_path はパスの ARN にも権限が要る
             - Sid: ReadTargetCredentials
               Effect: Allow
               Action:
                 - ssm:GetParameter
                 - ssm:GetParameters
                 - ssm:GetParametersByPath
-              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/*
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}/*
             - Sid: DecryptSecureStringParameters
               Effect: Allow
               Action: kms:Decrypt
@@ -617,7 +646,7 @@ Resources:
               Dimensions:
                 - Name: StateMachineArn
                   Value: !Ref StateMachine
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: timedout
           ReturnData: false
@@ -628,7 +657,7 @@ Resources:
               Dimensions:
                 - Name: StateMachineArn
                   Value: !Ref StateMachine
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: abnormal
           Expression: failed + timedout
@@ -638,6 +667,8 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopicArn
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -660,7 +691,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref ApiFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: trigger
           ReturnData: false
@@ -671,7 +702,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref TriggerFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: init
           ReturnData: false
@@ -682,7 +713,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref InitFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: collect
           ReturnData: false
@@ -693,7 +724,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref CollectTenantFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: aggregate
           ReturnData: false
@@ -704,7 +735,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref AggregateFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: markfailed
           ReturnData: false
@@ -715,7 +746,7 @@ Resources:
               Dimensions:
                 - Name: FunctionName
                   Value: !Ref MarkFailedFunction
-            Period: 86400
+            Period: 300
             Stat: Sum
         - Id: errors
           Expression: api + trigger + init + collect + aggregate + markfailed
@@ -725,6 +756,8 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopicArn
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -747,6 +780,8 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopicArn
       Tags:
         - Key: Project
           Value: !Ref ProjectName
@@ -769,6 +804,8 @@ Resources:
       Threshold: 1
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopicArn
       Tags:
         - Key: Project
           Value: !Ref ProjectName

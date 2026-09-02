@@ -24,6 +24,7 @@ import boto3
 from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
 from botocore.exceptions import ClientError
 
+from example_backoffice.logging import get_logger
 from saas_a_billing.messages import DEFAULT_SLACK_TEMPLATE
 from saas_a_billing.period import JST
 from saas_a_billing.pricing import PriceTableNotFoundError, default_price_table_item
@@ -37,9 +38,12 @@ RUN_PK_PREFIX = "RUN#"
 KEY_ATTRIBUTES = ("PK", "SK")
 
 TARGET_ENVS = ("verification", "production")
+DEFAULT_TARGET_ENV = TARGET_ENVS[0]
 DEFAULT_PRICE_EFFECTIVE_FROM = "2025-09-01"
 RUN_LIST_LIMIT = 24
 AUDIT_LIST_LIMIT = 50
+REQUEST_HISTORY_LIMIT = 20
+REQUEST_HISTORY = "request_history"
 SYSTEM_ACTOR = "system"
 
 QUEUED = "queued"
@@ -219,10 +223,26 @@ def _audit_item(target: str, actor: str, actor_email: str, before: dict, after: 
     return {**_item(values), "PK": {"S": AUDIT_PK}, "SK": {"S": f"{at}#{uuid.uuid4()}"}}
 
 
+def target_env() -> str:
+    """集計対象環境。サイトごとに環境変数 `TARGET_ENV` で固定する（計画 R1 / SP-01）。
+
+    設定にも実行入力にも従わない。検証環境の URL を「本番環境」ラベルで配布しないための
+    唯一の拠り所なので、未設定・想定外の値のときは本番ではなく検証環境として扱う。
+    """
+    value = os.environ.get("TARGET_ENV")
+    if value in TARGET_ENVS:
+        return value
+    get_logger().warning(
+        "TARGET_ENV が未設定か不正な値のため検証環境として扱います",
+        {"target_env": value or "", "fallback": DEFAULT_TARGET_ENV},
+    )
+    return DEFAULT_TARGET_ENV
+
+
 def _default_settings(actor: str, now: datetime) -> dict:
     """設計 3.3 の既定値。`slack_channel_id` は空、`auto_run_enabled` と配布トグルは False。"""
     return {
-        "target_env": "verification",
+        "target_env": target_env(),
         "cutoff_day": 20,
         "cutoff_time": "24:00",
         "auto_retry_days": 5,
@@ -245,17 +265,17 @@ def _default_settings(actor: str, now: datetime) -> dict:
     }
 
 
-def _with_distribution_toggles(settings: dict) -> dict:
-    """配布トグルを持たない保存済みの設定でも、両キーが必ず含まれるよう False で補う。"""
-    return {**dict.fromkeys(DISTRIBUTION_TOGGLES, False), **settings}
+def _normalized(settings: dict) -> dict:
+    """読み出し時の正規化。配布トグルを False で補い、集計対象環境を固定値に上書きする。"""
+    return {**dict.fromkeys(DISTRIBUTION_TOGGLES, False), **settings, "target_env": target_env()}
 
 
 def get_settings() -> dict:
     """`SETTINGS#current` を返す。未作成なら既定値を `version = 0` で seed する。"""
     item = _client().get_item(TableName=_table_name(), Key=_settings_key()).get("Item")
     if item is not None:
-        return _with_distribution_toggles(_values(item))
-    return _with_distribution_toggles(_seed_settings(SYSTEM_ACTOR))
+        return _normalized(_values(item))
+    return _normalized(_seed_settings(SYSTEM_ACTOR))
 
 
 def _seed_settings(actor: str) -> dict:
@@ -282,6 +302,7 @@ def put_settings(new: dict, expected_version: int, actor: str, actor_email: str)
     changes = {name: value for name, value in _without_keys(new).items() if name not in managed}
     updates = {
         **changes,
+        "target_env": target_env(),
         "version": expected_version + 1,
         "updated_at": _iso(now),
         "updated_by": actor,
@@ -448,7 +469,8 @@ def acquire_run(
     """設計 6.9 の 3 パターンで RUN を `queued` として取得する。取得不可は `RunAcquisitionError`。
 
     再取得では前回 attempt の残留属性（`PREVIOUS_ATTEMPT_ATTRIBUTES`）を REMOVE する。
-    特に `api_token` を新しい attempt へ持ち越さない。
+    特に `api_token` を新しい attempt へ持ち越さない。`REQUEST_HISTORY` は上書きせず
+    追記し、直近 `REQUEST_HISTORY_LIMIT` 件を残す（SEC-10 / 計画 R8）。
     """
     scheduled = trigger == "scheduled"
     values = {
@@ -463,7 +485,12 @@ def acquire_run(
         "started_at": _iso(_now()),
         "retry_alert_sent": False,
     }
-    created = {**values, "attempt": 1, "auto_attempts": 1 if scheduled else 0}
+    created = {
+        **values,
+        "attempt": 1,
+        "auto_attempts": 1 if scheduled else 0,
+        REQUEST_HISTORY: [_request_entry(values)],
+    }
     try:
         _client().put_item(
             TableName=_table_name(),
@@ -478,6 +505,43 @@ def acquire_run(
     return _reacquire_run(target_env, month, values, scheduled=scheduled, force=force, stale_before=stale_before)
 
 
+def _request_entry(values: dict) -> dict:
+    """RUN の実行者履歴 1 件（SEC-10 / 計画 R8）。誰がいつ配布付きで発火したかを追記で残す。"""
+    return {
+        "requested_by": values.get("requested_by") or values.get("requested_by_email") or SYSTEM_ACTOR,
+        "requested_by_email": values.get("requested_by_email") or "",
+        "requested_at": values["started_at"],
+        "trigger": values["trigger"],
+        "distribute": values["distribute"],
+        "force": values["force"],
+    }
+
+
+def _trim_request_history(target_env: str, month: str, run: dict) -> dict:
+    """履歴が上限を超えたら直近 `REQUEST_HISTORY_LIMIT` 件に切り詰める（SEC-10）。"""
+    history = run.get(REQUEST_HISTORY) or []
+    if len(history) <= REQUEST_HISTORY_LIMIT:
+        return run
+    trimmed = history[-REQUEST_HISTORY_LIMIT:]
+    condition, names, values = _attempt_condition(run["attempt"])
+    names.update(_names(REQUEST_HISTORY))
+    values[f":{REQUEST_HISTORY}"] = to_dynamo(trimmed)
+    try:
+        _client().update_item(
+            TableName=_table_name(),
+            Key=_run_key(target_env, month),
+            UpdateExpression=f"SET #{REQUEST_HISTORY} = :{REQUEST_HISTORY}",
+            ConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+        )
+    except ClientError as error:
+        if _code(error) != CONDITION_FAILED:
+            raise
+        return run
+    return {**run, REQUEST_HISTORY: trimmed}
+
+
 def _reacquire_run(
     target_env: str,
     month: str,
@@ -489,9 +553,14 @@ def _reacquire_run(
 ) -> dict:
     expression, names, attribute_values = _set_expression(values)
     counters = ["#attempt = if_not_exists(#attempt, :cond_zero) + :cond_one"]
-    names.update(_names("attempt"))
+    names.update(_names("attempt", REQUEST_HISTORY))
     attribute_values[":cond_zero"] = to_dynamo(0)
     attribute_values[":cond_one"] = to_dynamo(1)
+    attribute_values[":cond_empty_list"] = to_dynamo([])
+    attribute_values[f":{REQUEST_HISTORY}"] = to_dynamo([_request_entry(values)])
+    counters.append(
+        f"#{REQUEST_HISTORY} = list_append(if_not_exists(#{REQUEST_HISTORY}, :cond_empty_list), :{REQUEST_HISTORY})"
+    )
     if scheduled:
         counters.append("#auto_attempts = if_not_exists(#auto_attempts, :cond_zero) + :cond_one")
         names.update(_names("auto_attempts"))
@@ -520,7 +589,7 @@ def _reacquire_run(
         if _code(error) != CONDITION_FAILED:
             raise
         raise RunAcquisitionError(_acquisition_reason(target_env, month)) from error
-    return _values(response["Attributes"], month=month)
+    return _trim_request_history(target_env, month, _values(response["Attributes"], month=month))
 
 
 def _acquisition_reason(target_env: str, month: str) -> str:

@@ -3,13 +3,13 @@
 | 項目 | 内容 |
 | --- | --- |
 | ドキュメント名 | COST-ESTIMATE.md（料金見積） |
-| バージョン | v0.3 |
+| バージョン | v0.4 |
 | 作成日 | 2026-08-28 |
-| 改訂日 | 2026-08-28 |
+| 改訂日 | 2026-09-02 |
 | 作成者 | 弊社 開発部 |
 | 対象読者 | 社内プロマネ・開発部・運用担当 |
 | 上位設計書 | [`DESIGN.md`](DESIGN.md)（プラットフォーム） / [`apps/saas-a-billing/DESIGN.md`](apps/saas-a-billing/DESIGN.md)（第一弾アプリ） |
-| Excel 版 | `files/料金見積.xlsx`（匿名化版では除外） |
+| Excel 版 | [`files/料金見積.xlsx`](files/料金見積.xlsx) |
 
 > 社内保守管理サイト `example-backoffice`（基盤 + 第一弾アプリ `saas-a-billing`）の月額コスト見積。**単価は AWS Pricing MCP（Price List API）から取得**（取得日 2026-08-28、税別・USD）。dev / prod は同一 AWS アカウント（210000000001）・同一リージョン（ap-northeast-1）にスタック名の接尾辞で共存するため、**環境ごとに試算し合計も示す**。
 >
@@ -35,11 +35,11 @@
 | 認証 | Cognito User Pool `UserPoolTier: LITE`、MAU 10 人程度（常時無料枠 10,000 MAU 内） |
 | 通知 | SQS 標準キュー → notifier Lambda → SES v2（添付 1 MB 程度のメール、prod 月 5 通）+ Slack Bot token（Slack 側は無料） |
 | 課金バッチ | EventBridge Scheduler（毎日 06:00 起動、月 30 回）→ trigger Lambda → Step Functions Standard（Init → Map(CollectTenant, MaxConcurrency 2) → Aggregate） |
-| バッチ規模（当面） | 数十テナント・数百地点。CollectTenant 50 回 × 約 30 秒 × 1 GB、Aggregate 60 秒 × 1 GB、**月 1 実行（再実行込みで月 2 実行として計上）** |
-| バッチ規模（将来） | 数千地点・100 テナント程度。CollectTenant 100 回 × 約 120 秒 × 1 GB |
+| バッチ規模（当面） | 50 テナント・500 地点。CollectTenant 50 回 × 約 30 秒 × 1 GB、Aggregate 60 秒 × 1 GB、**月 1 実行（再実行込みで月 2 実行として計上）** |
+| バッチ規模（将来） | 3,000 地点・100 テナント。CollectTenant 100 回 × 約 120 秒 × 1 GB |
 | データ | DynamoDB オンデマンド（RUN / SETTINGS / PRICE、数百アイテム、1 GB 未満）、S3（SPA 配信用 + 添付バケット。Excel / result.json / parts で月 10 MB 増、削除しない） |
 | ログ | CloudWatch Logs 月 200 MB 取込・**保持 365 日**（DESIGN §12.4）。定常状態のストレージは 200 MB × 12 か月 = **2.4 GB / 環境** |
-| 監視 | CloudWatch アラーム 3 個 / 環境 |
+| 監視 | CloudWatch アラーム 5 個 / 環境（core の notify DLQ 1 本 + saas-a-billing 4 本） |
 | 暗号化・秘密情報 | KMS カスタマーキーは使わない（SSE-S3 / DynamoDB AWS owned key）。Secrets Manager は使わない。SSM Parameter Store は Standard パラメータ（無料） |
 
 ---
@@ -66,8 +66,8 @@
 | R16 | SQS（notify-queue + notify-dlq） | 標準キュー。notifier Lambda のイベントソース | DESIGN §8.1 |
 | R17 | DynamoDB | オンデマンド（PAY_PER_REQUEST）。アプリ 1 テーブル + notifier 冪等性テーブル | DESIGN §11.1 |
 | R18 | SES v2 | EmailIdentity（Easy DKIM）、`Simple + Attachments` で Excel 添付 | DESIGN §8.4 |
-| R19 | SNS | DLQ アラームの通知先（基盤担当メール） | DESIGN §8.1 |
-| R20 | CloudWatch Logs / アラーム | Lambda / HTTP API アクセスログ（**保持 365 日**）、アラーム 3 個 | DESIGN §12.4 |
+| R19 | SNS | Ops トピック `example-backoffice-ops-{env}`。全アラームの通知先（基盤担当メール） | DESIGN §8.1 |
+| R20 | CloudWatch Logs / アラーム | Lambda / HTTP API アクセスログ（**保持 365 日**）、アラーム 5 個 | DESIGN §12.4 |
 | R21 | SSM Parameter Store | 契約レジストリ + SecureString（Standard パラメータ） | DESIGN §4 |
 
 - **AWS WAF（WebACL / IPSet）は構成に含まない**（v0.3 の設計変更）。IP 制限は R2 の CloudFront Function が担う。us-east-1 に残るのは ACM 証明書のみ。
@@ -120,14 +120,15 @@
 
 | リソース | 単価 | 数量 | 月額（USD） | 月額（JPY） |
 | --- | ---: | ---: | ---: | ---: |
-| CloudWatch アラーム | $0.10/月 | 3 | $0.30 | ¥47 |
+| CloudWatch アラーム | $0.10/月 | 5 | $0.50 | ¥78 |
 | ACM 証明書（既存を参照） | — | 1 | $0.00 | ¥0 |
 | Route 53 ホストゾーン（既存共有） | — | — | $0.00 | ¥0 |
 | SSM Parameter Store（Standard） | — | 約 15 | $0.00 | ¥0 |
-| **固定費 合計（1 環境あたり、無料枠適用前）** | | | **$0.30** | **¥47** |
+| **固定費 合計（1 環境あたり、無料枠適用前）** | | | **$0.50** | **¥78** |
 
 - **v0.3 で WAF（WebACL $5.00 + ルール $1.00 = $6.00/環境）が固定費から消えた**。IP 制限は CloudFront Function（実行従量、200 万実行まで無料）に置き換わったため、本システムには**実質的な月額固定費が無い**。
-- CloudWatch アラームはアカウント全体で 10 個まで常時無料。dev 3 + prod 3 = 6 個のため**無料枠適用後の固定費は $0.00**。
+- CloudWatch アラームはアカウント全体で 10 個まで常時無料。dev 5 + prod 5 = **ちょうど 10 個**のため無料枠適用後の固定費は $0.00 だが、**余裕はゼロ**である。アラームを 1 本足すか、同一アカウントの他システムがアラームを持つと 1 個あたり $0.10/月が発生する。
+- **API Gateway HTTP API の詳細メトリクス**（`apps/saas-a-billing/template.yaml` の `DefaultRouteSettings.DetailedMetricsEnabled: true`）はルート単位のメトリクスを CloudWatch **カスタムメトリクス**として発行し、$0.30/メトリクス・月（最初の 10,000 個・ap-northeast-1）で課金される（無料枠なし）。ルートは `ANY /api/saas-a-billing/{proxy+}` の 1 本・1 ルートあたり 5 メトリクス（Count / 4xx / 5xx / Latency / IntegrationLatency）で **約 $1.50/月・環境**。本見積の表には未計上で、アプリ（＝ HTTP API）を増やすとその数に比例して増える。
 
 ---
 
@@ -135,7 +136,7 @@
 
 ### 5.1 シナリオ別の前提数量
 
-| 項目 | dev | prod（当面: 数十テナント・数百地点） | 将来（数千地点・100 テナント程度） |
+| 項目 | dev | prod（当面: 50 テナント・500 地点） | 将来（3,000 地点・100 テナント） |
 | --- | ---: | ---: | ---: |
 | API リクエスト / 月 | 5,000 | 20,000 | 40,000 |
 | Lambda 呼出回数 / 月 | 5,068 | 20,139 | 40,239 |
@@ -187,10 +188,10 @@
 | Cognito（Lite） | 10 MAU × $0.0055 | $0.02 | $0.06 | $0.11 |
 | CloudWatch Logs 取込 | 0.2 GB × $0.76 | $0.15 | $0.15 | $0.38 |
 | CloudWatch Logs ストレージ | 2.4 GB × $0.033（保持 365 日） | $0.08 | $0.08 | $0.20 |
-| CloudWatch アラーム | 3 × $0.10 | $0.30 | $0.30 | $0.30 |
+| CloudWatch アラーム | 5 × $0.10 | $0.50 | $0.50 | $0.50 |
 | Route 53（Alias クエリ） | Alias は無料 | $0.00 | $0.00 | $0.00 |
 | ACM / SSM（Standard） | 無料 | $0.00 | $0.00 | $0.00 |
-| **合計（無料枠適用前）** | | **$0.92** | **$1.24** | **$2.34** |
+| **合計（無料枠適用前）** | | **$1.12** | **$1.44** | **$2.54** |
 
 > 各行はセント単位に丸めて表示しているため、表示値を足し上げた額と合計欄が最大 $0.01 ずれることがある。合計欄は丸め前の値で計算している。
 >
@@ -209,7 +210,7 @@
   → 実費 $0.00
   ※ 旧方式（AWS WAF）は WebACL $5.00 + ルール $1.00 + リクエスト課金で 1 環境あたり約 $6/月だった
 
-[Lambda 実行時間 — prod（当面: 数十テナント・数百地点）]
+[Lambda 実行時間 — prod（当面: 50 テナント・500 地点）]
   api            : 20,000 回 × 0.2 秒 × 0.5 GB =   2,000 GB-秒
   trigger        :     30 回 × 5   秒 × 0.25 GB =     38 GB-秒
   Init           :      2 回 × 30  秒 × 1 GB   =     60 GB-秒
@@ -219,7 +220,7 @@
   ------------------------------------------------------------
   合計 5,225 GB-秒 × $0.0000166667 = $0.087  → 常時無料枠 400,000 GB-秒 内のため実費 $0.00
 
-[Lambda 実行時間 — 将来（数千地点・100 テナント程度）]
+[Lambda 実行時間 — 将来（3,000 地点・100 テナント）]
   CollectTenant  :      2 回 × 100 テナント × 120 秒 × 1 GB = 24,000 GB-秒
   Init / Aggregate / api / trigger / notifier          =  4,525 GB-秒
   ------------------------------------------------------------
@@ -267,7 +268,7 @@
 | CloudWatch Logs | 5 GB/月（取込 + アーカイブ保存 + Insights スキャン） | 5.2 GB（将来 9.1 GB） | **超過 0.2 GB** → $0.01（将来は 4.1 GB → $0.14） | Web 取得（aws.amazon.com/cloudwatch/pricing/） |
 | Cognito（Lite） | 10,000 MAU/月（無期限） | 13 | 枠内 → $0 | Web 取得（aws.amazon.com/cognito/pricing/） |
 | Step Functions（Standard） | 4,000 状態遷移/月（無期限） | 180 | 枠内 → $0 | Web 取得（aws.amazon.com/step-functions/pricing/） |
-| CloudWatch アラーム | 10 アラームメトリクス/月 | 6 | 枠内 → $0 | Web 取得（aws.amazon.com/cloudwatch/pricing/） |
+| CloudWatch アラーム | 10 アラームメトリクス/月 | 10（dev 5 + prod 5） | **枠ちょうど** → $0（余裕なし） | Web 取得（aws.amazon.com/cloudwatch/pricing/） |
 | EventBridge Scheduler | 1,400 万起動/月 | 60 | 枠内 → $0 | MCP（sku 29C3758CBCYNXH8B の $0 レンジ） |
 | DynamoDB ストレージ | 25 GB-月 | 0.7 GB | 枠内 → $0 | MCP（sku 2HPSAWPXJ2JJJ6XY の $0 レンジ） |
 | SNS | 100 万リクエスト + 1,000 メール通知/月 | 4 通 | 枠内 → $0 | MCP（sku U7N84S2RCJJJKURJ / RFRANPTXHKXT5NFV の $0 レンジ） |
@@ -300,17 +301,17 @@
 
 | 区分 | dev | prod | dev + prod |
 | --- | ---: | ---: | ---: |
-| 無料枠適用前（USD） | $0.92 | $1.24 | **$2.15** |
-| 無料枠適用前（JPY） | ¥142 | ¥192 | **¥334** |
+| 無料枠適用前（USD） | $1.12 | $1.44 | **$2.55** |
+| 無料枠適用前（JPY） | ¥174 | ¥223 | **¥395** |
 | **無料枠適用後（USD）** | **$0.08** | **$0.41** | **$0.49** |
 | **無料枠適用後（JPY）** | **¥12** | **¥64** | **¥76** |
 | 年額換算（JPY、無料枠適用後） | ¥148 | ¥766 | **¥914** |
 
-### 将来（数千地点・100 テナント程度）に拡大した場合
+### 将来（3,000 地点・100 テナント）に拡大した場合
 
 | 区分 | dev | prod（将来） | dev + prod |
 | --- | ---: | ---: | ---: |
-| 無料枠適用前（USD） | $0.92 | $2.34 | **$3.26** |
+| 無料枠適用前（USD） | $1.12 | $2.54 | **$3.66** |
 | **無料枠適用後（USD）** | **$0.08** | **$0.84** | **$0.92** |
 | **無料枠適用後（JPY）** | **¥12** | **¥130** | **¥143** |
 | 年額換算（JPY、無料枠適用後） | ¥148 | ¥1,564 | **¥1,712** |
@@ -366,7 +367,7 @@
 
 ### 8.3 その他
 
-- 無料利用枠は **AWS アカウント全体で共有**される。アカウント 210000000001 で他システムが Lambda / CloudWatch Logs / SQS / CloudFront Functions を利用している場合、本見積の「無料枠適用後」金額は成立せず「無料枠適用前」に近づく。**最大でも dev + prod で月 $2.15（¥334）**を上限として見ればよい。
+- 無料利用枠は **AWS アカウント全体で共有**される。アカウント 210000000001 で他システムが Lambda / CloudWatch Logs / SQS / CloudFront Functions を利用している場合、本見積の「無料枠適用後」金額は成立せず「無料枠適用前」に近づく。**最大でも dev + prod で月 $2.55（¥395）**を上限として見ればよい。
 - CloudWatch Logs のストレージは運用開始から 12 か月かけて積み上がる。1 年目の平均は本見積の約半分になる。
 - 本見積はリクエスト処理のコストのみで、開発時の試行錯誤（CloudFormation デプロイ、E2E テスト実行）による一時的な増分は含まない。
 - SES は東京リージョンでサンドボックス解除が未申請（DESIGN §8.4）。解除前は検証済みドメイン宛のみ・200 通/日に制限されるが、料金体系は同じである。
@@ -381,7 +382,7 @@
 | 上位設計書（基盤） | [`DESIGN.md`](DESIGN.md) | リソース構成・スタック分割・**入口の IP 制限（§7 CloudFront Function による IP 判定）**・通知基盤・ログ保持（§12.4）・コスト方針（§16 CloudFront 従量課金） |
 | 上位設計書（アプリ） | [`apps/saas-a-billing/DESIGN.md`](apps/saas-a-billing/DESIGN.md) | バッチ経路・Lambda のメモリ / タイムアウト・実測値 |
 | 技術調査 | [`research/research_R5.md`](research/research_R5.md) | 採用技術の裏取り |
-| Excel 版 | `files/料金見積.xlsx`（匿名化版では除外） | 同内容を Excel 表形式で（社内配布用） |
+| Excel 版 | [`files/料金見積.xlsx`](files/料金見積.xlsx) | 同内容を Excel 表形式で（社内配布用） |
 
 ---
 
@@ -447,6 +448,7 @@ AWS Pricing MCP は**単価**を返すが、常時無料枠の枠量を返さな
 
 | バージョン | 日付 | 改訂内容 | 改訂者 |
 | --- | --- | --- | --- |
+| v0.4 | 2026-09-02 | **CloudWatch アラームの個数を実装に合わせて 3 個 → 5 個 / 環境に是正**（core の notify DLQ 1 本 + saas-a-billing 4 本。DESIGN §8.1 / アプリ設計 §14.2）。固定費は $0.30 → **$0.50**/環境、無料枠適用前の月額合計は dev $0.92 → **$1.12**、prod $1.24 → **$1.44**、dev + prod $2.15 → **$2.55**（将来 prod $2.34 → $2.54）。常時無料枠は 10 アラームメトリクスで、dev 5 + prod 5 = **ちょうど 10 個**のため無料枠適用後は引き続き $0.00 だが余裕はゼロである旨を §4 と §6 に明記した。**無料枠適用後の月額（dev $0.08 / prod $0.41 / 合計 $0.49）は変わらない**。新規単価取得なし。Excel 版は未再生成。 | 開発部 |
 | v0.3 | 2026-08-28 | **設計変更（ユーザー決定）を反映: AWS WAF を廃止し、社内 IP 制限を CloudFront Function（viewer-request）に置き換え**（DESIGN §7）。§2 から WAF WebACL / IPSet を削除しリソース ID を R1〜R21 に振り直し、§3 単価一覧と §5.2 従量費から WAF の 3 行（WebACL / ルール / リクエスト）を削除。CloudFront Functions の行を明示し、実行回数を**ディストリビューションの総リクエスト数と同数**（dev 20,000 / prod 100,000 / 将来 200,000）として計上、常時無料枠 200 万実行/月（MCP sku `QAZUUEJG8GARJCET` の $0 レンジ）内で **$0.00** とした。固定費は $6.30 → **$0.30**/環境（無料枠適用後 $0.00）。月額合計（無料枠適用後）は dev $6.09 → **$0.08**、prod $6.47 → **$0.41**、dev + prod $12.56 → **$0.49**（-96%、年 ¥23,364 → ¥914）、将来 dev + prod $13.05 → **$0.92**。§8.2 の「WAF を CloudFront Function に置換」は「採用済み」に書き換え、「WAF を後から付ける場合の追加費用（1 環境 約 $6.06/月）」として残した。WAF の sku は §10 に参考として保持。§9 の設計書参照を DESIGN §7（CloudFront Function による IP 制限）に更新。Excel 版も同日再生成。新規単価取得なし。 | 開発部 |
 | v0.2 | 2026-08-28 | 設計書を正として 2 点を是正。(1) **WAF ルールを 2 本 → 1 本**（`DefaultAction: Block` は課金対象ルールではない）。固定費 $7.30 → $6.30/環境。(2) **CloudWatch Logs の保持期間を 90 日 → 365 日**（DESIGN §12.4）。ストレージ前提を 0.6 GB → 2.4 GB/環境（将来 1.5 GB → 6.0 GB）に更新した結果、dev + prod で常時無料枠 5 GB を 0.2 GB 超過（将来は 4.1 GB 超過）し、超過分を保存料金で計上。月額合計（無料枠適用後）は dev $6.09 / prod $6.47 / 合計 $12.56。あわせて CloudFront 定額プランの参照先を DESIGN §17 #1（旧・要確認事項）から §16 へ、SES サンドボックスの参照先を §17 #3 から §8.4 へ差し替えた。 | 開発部 |
 | v0.1 | 2026-08-28 | 初版作成。AWS Pricing MCP（Price List API）で ap-northeast-1 / us-east-1（WAF）/ Global（CloudFront・Route 53）の単価をすべて取得。`aws-cost-estimate` スキル準拠フォーマット。dev / prod / 将来（3,000 地点）の 3 シナリオで試算。Excel 版併設（`files/料金見積.xlsx`）。 | 開発部 |

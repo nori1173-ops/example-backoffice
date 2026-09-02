@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onUnmounted, ref, watch } from 'vue'
 import QRCode from 'qrcode'
 import type { SubmitEventPromise } from 'vuetify'
 
@@ -18,6 +18,8 @@ const emit = defineEmits<{
 
 const qrImage = ref('')
 const code = ref('')
+const copied = ref(false)
+let copiedTimer: ReturnType<typeof setTimeout> | null = null
 
 const codeRules = [
   (value: string) => !!value || '認証コードを入力してください',
@@ -36,6 +38,31 @@ watch(
   },
   { immediate: true },
 )
+
+/** 手入力は誤りやすいので、キーはコピーできるようにする */
+async function copySecret(): Promise<void> {
+  if (!navigator.clipboard) {
+    return
+  }
+  try {
+    await navigator.clipboard.writeText(props.sharedSecret)
+  } catch {
+    return
+  }
+  copied.value = true
+  if (copiedTimer !== null) {
+    clearTimeout(copiedTimer)
+  }
+  copiedTimer = setTimeout(() => {
+    copied.value = false
+  }, 2000)
+}
+
+onUnmounted(() => {
+  if (copiedTimer !== null) {
+    clearTimeout(copiedTimer)
+  }
+})
 
 async function onSubmit(event: SubmitEventPromise): Promise<void> {
   const { valid } = await event
@@ -65,8 +92,18 @@ async function onSubmit(event: SubmitEventPromise): Promise<void> {
     <div class="text-caption text-medium-emphasis text-center">
       QR コードを読み取れない場合は次のキーを手入力してください
     </div>
-    <div class="text-body-2 text-center font-weight-medium mb-4">
-      {{ sharedSecret }}
+    <div class="d-flex align-center justify-center mb-4">
+      <span class="text-body-2 font-weight-medium">{{ sharedSecret }}</span>
+      <v-btn
+        :icon="copied ? 'mdi-check' : 'mdi-content-copy'"
+        :title="copied ? 'コピーしました' : 'キーをコピー'"
+        variant="text"
+        size="small"
+        density="comfortable"
+        class="ml-1"
+        data-test="copy-secret"
+        @click="copySecret"
+      />
     </div>
 
     <v-form @submit.prevent="onSubmit">

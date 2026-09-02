@@ -66,10 +66,11 @@ export const billingApi = {
     return response.data.data
   },
 
+  /** `target_env` はサイトごとに固定（設計 R1）。指定されたときだけ載せる。 */
   async createRun(request: RunRequest): Promise<RunAccepted | null> {
     const response = await api.post<ApiEnvelope<RunAccepted>>('/runs', {
       month: request.month,
-      target_env: request.targetEnv,
+      ...(request.targetEnv ? { target_env: request.targetEnv } : {}),
       distribute: request.distribute,
       force: request.force,
     })

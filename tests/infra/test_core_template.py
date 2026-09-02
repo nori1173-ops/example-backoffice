@@ -17,6 +17,7 @@ ISSUER_VALUE = "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
 NOTIFY_QUEUE_URL_KEY = "/${ProjectName}/${Env}/notify/queue-url"
 NOTIFY_QUEUE_ARN_KEY = "/${ProjectName}/${Env}/notify/queue-arn"
 ATTACHMENTS_BUCKET_KEY = "/${ProjectName}/${Env}/attachments/bucket"
+OPS_TOPIC_ARN_KEY = "/${ProjectName}/${Env}/ops/topic-arn"
 
 PASSWORD_REQUIREMENTS = ("RequireUppercase", "RequireLowercase", "RequireNumbers")
 
@@ -25,6 +26,8 @@ NOTIFY_QUEUE_RETENTION_SECONDS = 4 * 24 * 60 * 60
 DLQ_RETENTION_SECONDS = 14 * 24 * 60 * 60
 MAX_RECEIVE_COUNT = 3
 ATTACHMENT_EXPIRATION_DAYS = 400
+INTERMEDIATE_EXPIRATION_DAYS = 90
+NONCURRENT_VERSION_EXPIRATION_DAYS = 30
 PUBLIC_ACCESS_BLOCK_KEYS = ("BlockPublicAcls", "BlockPublicPolicy", "IgnorePublicAcls", "RestrictPublicBuckets")
 
 TOKYO_MX_RECORD = "10 feedback-smtp.ap-northeast-1.amazonses.com"
@@ -160,14 +163,53 @@ def test_user_pool_tier_is_lite(load_template):
     assert _user_pool_properties(template).get("UserPoolTier") == "LITE"
 
 
-def test_user_pool_mfa_is_optional_totp_only(load_template):
-    """MFA は TOTP のみ。SMS は一度有効化すると無効化できないため構成しない（設計 6.1 / 6.4）。"""
+def test_user_pool_mfa_is_required_totp_only(load_template):
+    """MFA は TOTP のみ・必須（計画 R2 / SEC-02）。SMS は一度有効化すると無効化できない。
+
+    パスワード 1 要素では `cognito-idp` エンドポイントが社外から到達できるため、
+    dev / prod とも `ON` にする（prod は新規 User Pool なので既存ユーザーの締め出しも無い）。
+    """
     template = _load_or_skip(load_template)
     properties = _user_pool_properties(template)
-    assert properties.get("MfaConfiguration") == "OPTIONAL"
+    assert properties.get("MfaConfiguration") == "ON"
     assert properties.get("EnabledMfas") == ["SOFTWARE_TOKEN_MFA"]
     assert "SmsConfiguration" not in properties
     assert "SmsAuthenticationMessage" not in properties
+
+
+def test_user_pool_email_is_switchable_to_ses(load_template):
+    """Cognito のメールは SES（DEVELOPER）へ切り替えられる（計画 R3 / SP-05）。
+
+    `COGNITO_DEFAULT` は 1 日 50 通で、送信元も社内ドメインではない。ただし SES Identity が
+    未検証の間は `DEVELOPER` での作成に失敗するため、新規 prod スタックは
+    `COGNITO_DEFAULT` で立ち上げて検証後に切り替えられるようパラメータで選ぶ。
+    """
+    template = _load_or_skip(load_template)
+    parameter = (template.get("Parameters") or {}).get("CognitoEmailSendingAccount") or {}
+    assert parameter.get("AllowedValues") == ["COGNITO_DEFAULT", "DEVELOPER"]
+    assert parameter.get("Default") == "COGNITO_DEFAULT"
+
+    email = _user_pool_properties(template).get("EmailConfiguration") or {}
+    developer, cognito_default = email["Fn::If"][1], email["Fn::If"][2]
+    assert email["Fn::If"][0] == "UseSesForCognitoEmail"
+    assert developer == {
+        "EmailSendingAccount": "DEVELOPER",
+        "From": {"Fn::Sub": "noreply@${MailDomain}"},
+        "SourceArn": {"Fn::Sub": "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}"},
+        "ConfigurationSet": {"Ref": "SesConfigurationSet"},
+    }
+    # 独自 From を COGNITO_DEFAULT で使うには SES の送信認可ポリシーが要る。切替前は既定の
+    # no-reply@verificationemail.com を使い、ポリシーを別途作らなくても立ち上がるようにする。
+    assert cognito_default == {"EmailSendingAccount": "COGNITO_DEFAULT"}
+
+
+def test_user_pool_waits_for_the_ses_identity(load_template):
+    """SES Identity より先に User Pool を作ると DEVELOPER 切替が失敗する（計画 R3）。"""
+    template = _load_or_skip(load_template)
+    identity_id, _ = next(iter(_resources_by_type(template, "AWS::SES::EmailIdentity").items()))
+    user_pool_id, _ = next(iter(_resources_by_type(template, "AWS::Cognito::UserPool").items()))
+    depends_on = (template["Resources"][user_pool_id]).get("DependsOn")
+    assert identity_id in (depends_on if isinstance(depends_on, list) else [depends_on])
 
 
 def test_password_policy_requires_8_chars_without_symbols(load_template):
@@ -322,6 +364,25 @@ def test_dlq_alarm_exists_and_targets_ops_topic(load_template):
     assert properties.get("Dimensions") == [{"Name": "QueueName", "Value": {"Fn::GetAtt": f"{dlq_id}.QueueName"}}]
 
 
+def test_writes_ops_topic_arn_parameter(load_template):
+    """アラームの通知先をアプリが読めるように SSM 契約へ公開する（SP-02）。
+
+    これが無いとアプリ側は SNS トピック ARN を samconfig に手で書くことになる。
+    """
+    template = _load_or_skip(load_template)
+    topic_id, _ = next(iter(_resources_by_type(template, "AWS::SNS::Topic").items()))
+    parameters = {
+        name: resource
+        for resource in _resources_by_type(template, "AWS::SSM::Parameter").values()
+        if (name := _ssm_parameter_name(resource)) == OPS_TOPIC_ARN_KEY
+    }
+    assert len(parameters) == 1, f"{OPS_TOPIC_ARN_KEY} を書く SSM パラメータは 1 つであること"
+
+    properties = _properties(next(iter(parameters.values())))
+    assert properties.get("Type") == "String"
+    assert properties.get("Value") == {"Ref": topic_id}
+
+
 def test_notifier_uses_batch_size_1_and_report_batch_item_failures(load_template):
     """1 件ずつ処理し、一時エラーのレコードだけを再配信させる（設計 8.1 / 8.6）。"""
     template = _load_or_skip(load_template)
@@ -341,6 +402,7 @@ def test_notifier_timeout_60_memory_512(load_template):
 
     variables = (properties.get("Environment") or {}).get("Variables") or {}
     assert sorted(variables) == [
+        "ALLOWED_MAIL_DOMAINS",
         "DLQ_URL",
         "ENV",
         "IDEMPOTENCY_TABLE",
@@ -351,6 +413,14 @@ def test_notifier_timeout_60_memory_512(load_template):
     ]
     assert variables["SES_FROM_ADDRESS"] == {"Fn::Sub": "noreply@${MailDomain}"}
     assert variables["SSM_PREFIX"] == {"Fn::Sub": "/${ProjectName}/${Env}"}
+
+
+def test_notifier_declares_allowed_mail_domains(load_template):
+    """宛先ドメインの許可リストをコード既定値任せにせずテンプレートで明示する（SEC-07）。"""
+    template = _load_or_skip(load_template)
+    _, properties = _notifier(template)
+    variables = (properties.get("Environment") or {}).get("Variables") or {}
+    assert variables.get("ALLOWED_MAIL_DOMAINS") == "example.co.jp"
 
 
 def test_idempotency_table_has_ttl(load_template):
@@ -389,23 +459,43 @@ def test_attachments_bucket_is_retained(load_template):
     assert bucket.get("UpdateReplacePolicy") == "Retain"
 
 
-def test_attachments_lifecycle_expires_at_400_days(load_template):
-    """`lifecycle=expire` タグの付いた添付だけを 400 日で削除する（設計 11.2）。
+def test_attachments_lifecycle_expires_by_tag_only(load_template):
+    """期限付きの削除は `lifecycle` タグでだけ行う（設計 11.2 / SP-13）。
 
-    S3 のライフサイクルはプレフィックスの除外を表現できず、規則が重なると最短の期限が
-    適用される。そのため「保持するプレフィックスを除外する」ではなく「削除してよい
-    オブジェクトにタグを付ける」向きにする。タグの無いオブジェクトは永久保持。
+    S3 のライフサイクルはプレフィックスの除外もワイルドカードも表現できず、規則が重なると
+    最短の期限が適用される。成果物のキーは `{app}/{target_env}/{YYYY}/{MM}/...` で月が
+    途中に入るため `parts/` を literal prefix では選べない。そのため「保持するプレフィックスを
+    除外する」ではなく「削除してよいオブジェクトにタグを付ける」向きに統一する。
     """
     template = _load_or_skip(load_template)
     rules = (_attachments_bucket(template).get("LifecycleConfiguration") or {}).get("Rules") or []
-    expiring = [r for r in rules if "ExpirationInDays" in r]
-    assert len(expiring) == 1, f"期限付きの規則は 1 つであること: {rules}"
+    expiring = {r.get("ExpirationInDays"): r for r in rules if "ExpirationInDays" in r}
+    assert sorted(expiring) == [INTERMEDIATE_EXPIRATION_DAYS, ATTACHMENT_EXPIRATION_DAYS], rules
 
-    rule = expiring[0]
-    assert rule.get("ExpirationInDays") == ATTACHMENT_EXPIRATION_DAYS
-    assert rule.get("Status") == "Enabled"
-    assert rule.get("TagFilters") == [{"Key": "lifecycle", "Value": "expire"}]
-    assert "Prefix" not in rule, "プレフィックスでは絞らない（除外を表現できないため）"
+    for days, tag_value in ((ATTACHMENT_EXPIRATION_DAYS, "expire"), (INTERMEDIATE_EXPIRATION_DAYS, "expire-90")):
+        rule = expiring[days]
+        assert rule.get("Status") == "Enabled", days
+        assert rule.get("TagFilters") == [{"Key": "lifecycle", "Value": tag_value}], days
+        assert "Prefix" not in rule, "プレフィックスでは絞らない（除外を表現できないため）"
+
+
+def test_attachments_bucket_is_versioned(load_template):
+    """成果物の上書き・誤削除から復元できるようにする（SEC-09）。
+
+    再実行は同一キーへ上書きする設計なので、バージョニングが無いと復元手段が無い。
+    非現行バージョンは 30 日で消してコストを抑える。
+    """
+    template = _load_or_skip(load_template)
+    properties = _attachments_bucket(template)
+    assert properties.get("VersioningConfiguration") == {"Status": "Enabled"}
+
+    rules = (properties.get("LifecycleConfiguration") or {}).get("Rules") or []
+    noncurrent = [r for r in rules if "NoncurrentVersionExpiration" in r]
+    assert len(noncurrent) == 1, f"非現行バージョンの規則は 1 つであること: {rules}"
+    assert noncurrent[0]["NoncurrentVersionExpiration"] == {"NoncurrentDays": NONCURRENT_VERSION_EXPIRATION_DAYS}
+    assert noncurrent[0].get("Status") == "Enabled"
+    # 現行バージョンを消すと delete marker が残り続けるので同じ規則で掃除する
+    assert noncurrent[0].get("ExpiredObjectDeleteMarker") is True
 
 
 def test_ses_identity_has_mail_from_and_dkim_records(load_template):

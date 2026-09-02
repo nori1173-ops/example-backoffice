@@ -6,8 +6,9 @@
 `attempt` で区別する。
 
 JSON は `ensure_ascii=False` の UTF-8 で書き、テナント名・地点名を読める形で
-残す。`lifecycle=expire` タグは付けない（core の 400 日削除の対象にしない。
-設計 6.7 / 11.2）。
+残す。`result.json` と Excel には `lifecycle` タグを付けない（core の 400 日削除の
+対象にしない）。中間ファイル（`parts/` と `tenants.json`）だけ `lifecycle=expire-90`
+を付け、core の 90 日ルールで消す（設計 6.7 / 11.2）。
 """
 
 import json
@@ -29,6 +30,7 @@ TENANTS_FILENAME = "tenants.json"
 JSON_CONTENT_TYPE = "application/json"
 XLSX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PRESIGN_EXPIRES_SECONDS = 300
+INTERMEDIATE_TAGGING = "lifecycle=expire-90"
 
 NO_SUCH_KEY = "NoSuchKey"
 
@@ -97,9 +99,10 @@ def tenants_key(target_env: str, month: str) -> str:
     return f"{prefix(target_env, month)}/{TENANTS_FILENAME}"
 
 
-def _put_json(key: str, data: dict) -> str:
+def _put_json(key: str, data: dict, tagging: str | None = None) -> str:
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    _client().put_object(Bucket=_bucket(), Key=key, Body=body, ContentType=JSON_CONTENT_TYPE)
+    extra = {"Tagging": tagging} if tagging else {}
+    _client().put_object(Bucket=_bucket(), Key=key, Body=body, ContentType=JSON_CONTENT_TYPE, **extra)
     return key
 
 
@@ -114,8 +117,8 @@ def _get_json(key: str) -> dict | None:
 
 
 def put_part(target_env: str, month: str, tenant_cd: str, data: dict) -> str:
-    """テナント別中間結果を置き、キーを返す。"""
-    return _put_json(part_key(target_env, month, tenant_cd), data)
+    """テナント別中間結果を置き、キーを返す（90 日で消えるようタグを付ける）。"""
+    return _put_json(part_key(target_env, month, tenant_cd), data, INTERMEDIATE_TAGGING)
 
 
 def get_part(target_env: str, month: str, tenant_cd: str) -> dict:
@@ -133,7 +136,7 @@ def put_tenants(target_env: str, month: str, tenants: list[dict]) -> str:
     ステートマシンの入出力と parts には `tenant_id` / `tenant_cd` しか載らないため、
     `Aggregate` がテナント名・説明欄・保存期間を解決できるよう `Init` がここに残す。
     """
-    return _put_json(tenants_key(target_env, month), {"tenants": tenants})
+    return _put_json(tenants_key(target_env, month), {"tenants": tenants}, INTERMEDIATE_TAGGING)
 
 
 def get_tenants(target_env: str, month: str) -> list[dict]:

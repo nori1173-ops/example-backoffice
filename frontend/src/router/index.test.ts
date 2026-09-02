@@ -30,4 +30,12 @@ describe('router', () => {
     expect(router.resolve('/signup').meta.requiresAuth).toBe(false)
     expect(router.resolve('/').meta.requiresAuth).toBeUndefined()
   })
+
+  it('/forgot-password は未認証で開ける auth レイアウトのルート', () => {
+    const resolved = router.resolve('/forgot-password')
+
+    expect(resolved.name).toBe('forgot-password')
+    expect(resolved.meta.requiresAuth).toBe(false)
+    expect(resolved.meta.layout).toBe('auth')
+  })
 })

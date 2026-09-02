@@ -15,13 +15,78 @@ example-backoffice の秘密登録・デプロイ・運用スクリプト。す�
 export AWS_PROFILE=default
 
 # 1. origin-verify の共有秘密を登録する（設計 13.4 の手順 1）
-scripts/init-secrets.sh dev
+scripts/init-secrets.sh prod
 
-# 2. Slack の秘密を登録する（設計 13.4 の手順 2。Bot token が無ければ webhook で先に進める）
-scripts/register-slack.sh dev webhook
+# 2. Slack の Bot token を登録する（設計 13.4 の手順 2。shared デプロイの前後どちらでも可）
+#    投稿方式は shared/samconfig.toml の SlackMode が決める（dev / prod とも bot）。
+#    webhook で始めるなら SlackMode を webhook に直して shared をデプロイする
+scripts/register-slack.sh prod bot
 
-# 3. 全スタックを依存順にデプロイする
-scripts/deploy-all.sh dev
+# 3. アプリ固有の秘密を登録する（saas-a-billing は固定環境の 3 本だけ）
+for LEAF in base-url user-id password; do
+  aws ssm put-parameter --type SecureString --overwrite \
+    --name "/example-backoffice/prod/apps/saas-a-billing/targets/production/$LEAF" --value "<値>"
+done
+
+# 4. 全スタックを依存順にデプロイする（shared → core → apps/* → edge → frontend）
+scripts/deploy-all.sh prod
+
+# 5. Ops トピックのメール購読を作る（core デプロイ直後。下記「アラーム通知の購読」参照）
+
+# 6. 最初の管理者を付ける（本人のサインアップ後。admin が居ないと設定画面が読み取り専用）
+scripts/add-admin.sh prod devA@example.co.jp
+```
+
+**アラーム通知の購読（必須・手動）**: core の `OpsTopic` は CloudFormation の
+インライン `Subscription` を持つが、**確認メールを 3 日以内に承認しないと購読は破棄され、
+以後どれだけ再デプロイしても復活しない**（dev で購読 0 件を実測）。core をデプロイしたら
+必ず手で購読を作り、届いた確認メールのリンクを踏んで `Confirmed` を確かめる。購読が無いと
+アラーム 5 本（core 1 + saas-a-billing 4）は鳴っても誰にも届かない。
+
+```bash
+TOPIC=$(aws ssm get-parameter --name /example-backoffice/prod/ops/topic-arn \
+  --query Parameter.Value --output text)
+aws sns subscribe --topic-arn "$TOPIC" --protocol email --notification-endpoint devA@example.co.jp
+# 確認メールのリンクを踏んでから（SubscriptionArn が PendingConfirmation でなくなる）
+aws sns list-subscriptions-by-topic --topic-arn "$TOPIC" \
+  --query 'Subscriptions[].[Endpoint,SubscriptionArn]' --output text
+```
+
+dev では続けてアラームのスモークテストを行い、実際にメールが届くことを確認する
+（状態は次の評価で自動復帰する）。
+
+```bash
+aws cloudwatch set-alarm-state --alarm-name example-backoffice-saas-a-billing-lambda-errors-dev \
+  --state-value ALARM --state-reason smoke
+aws cloudwatch describe-alarms \
+  --query 'MetricAlarms[?ends_with(AlarmName,`-dev`)].[AlarmName,length(AlarmActions)]' --output text
+```
+
+**投稿方式の管理者は samconfig（SP-03）**: `/shared/slack/mode` は shared スタックが
+`SlackMode` パラメータから作る CloudFormation 管理のパラメータで、スクリプトからは書かない
+（先に `put-parameter` で作ると shared の作成が `AlreadyExists` で失敗する）。方式を変えるときは
+`shared/samconfig.toml` の `SlackMode` を直して shared を再デプロイする（現在は dev / prod とも
+`bot`）。Bot token / Webhook URL の登録は shared のデプロイの前後どちらでもよい。
+
+**prod の追加手順（Cognito のメール送信）**: `infra/core/samconfig.toml` の
+`CognitoEmailSendingAccount` は dev / prod とも `DEVELOPER`。ただし SES Identity
+（`backoffice.example-cloud.com`）が未検証のうちは `DEVELOPER` で作成できないため、
+**prod の初回デプロイだけ `--parameter-overrides` で `COGNITO_DEFAULT` に上書きして立てる**。
+DKIM の DNS が入って Identity が `Success` になったら、上書きを外して（= samconfig どおり
+`DEVELOPER` で）再デプロイする。送信元が `noreply@backoffice.example-cloud.com` になり、
+1 日 50 通の上限も外れる。samconfig を編集しないのでテストの期待値も動かない。
+
+```bash
+# 初回だけ COGNITO_DEFAULT で立てる（--parameter-overrides は samconfig の同名キーだけを置換する）
+cd infra/core && sam build --use-container
+sam deploy --config-env production --parameter-overrides CognitoEmailSendingAccount=COGNITO_DEFAULT
+
+# Identity の検証を待つ
+aws ses get-identity-verification-attributes --identities backoffice.example-cloud.com \
+  --region ap-northeast-1
+
+# VerificationStatus が Success になったら上書きなしで再デプロイ（samconfig の DEVELOPER が効く）
+sam deploy --config-env production
 ```
 
 ## 一覧
@@ -29,10 +94,11 @@ scripts/deploy-all.sh dev
 | スクリプト | 引数 | 用途 |
 | --- | --- | --- |
 | `init-secrets.sh` | `{env}` | `/example-backoffice/{env}/edge/origin-verify-secret` を SecureString で登録する |
-| `register-slack.sh` | `{env} {bot\|webhook}` | Slack の Bot token / Webhook URL を登録する（`bot` のときのみ `/shared/slack/mode` も更新） |
+| `register-slack.sh` | `{env} {bot\|webhook}` | Slack の Bot token / Webhook URL を登録する（`/shared/slack/mode` は書かない） |
 | `deploy-edge.sh` | `{env}` | SSM から秘密を取り出して edge スタックをデプロイする |
 | `deploy-frontend.sh` | `{env}` | frontend をビルドして S3 へ同期し CloudFront を無効化する |
 | `deploy-all.sh` | `{env}` | shared → core → apps/\* → edge → frontend の順に一括デプロイする |
+| `add-admin.sh` | `{env} {email}` | サインアップ済みユーザーを `admin` グループに追加する |
 | `list-mfa-status.sh` | `{env}` | Cognito ユーザーの MFA 設定状況を一覧する |
 | `get_id_token.py` | `{env} {email} [--totp-code CODE]` | Cognito の ID トークンを標準出力へ出す |
 | `validate-templates.sh` | なし | 全テンプレートに `sam validate` と `cfn-lint` をかける |
@@ -53,8 +119,8 @@ DRY_RUN=1 scripts/init-secrets.sh dev  # AWS を呼ばずに実行内容だけ�
 ## register-slack.sh
 
 ```bash
-scripts/register-slack.sh dev bot      # Bot token を登録し mode を bot にする
-scripts/register-slack.sh dev webhook  # Webhook URL を登録する（mode は変更しない）
+scripts/register-slack.sh dev bot      # Bot token を登録する
+scripts/register-slack.sh dev webhook  # Webhook URL を登録する
 ```
 
 値は**引数では渡せない**（シェル履歴に秘密を残さないため）。実行後のプロンプトから
@@ -67,14 +133,15 @@ scripts/register-slack.sh dev webhook  # Webhook URL を登録する（mode は�
 | --- | --- | --- |
 | `bot` | `/example-backoffice/{env}/shared/slack/bot-token` | SecureString |
 | `webhook` | `/example-backoffice/{env}/shared/slack/webhook-url` | SecureString |
-| `bot` のみ | `/example-backoffice/{env}/shared/slack/mode` | String（`bot`） |
 
-`webhook` は URL の登録・ローテートだけを行い、投稿方式（`mode`）は変えない
-（bot 運用中にフォールバック用 URL を更新しても方式が切り替わらないように）。
-
-**`bot` を登録したら `shared/samconfig.toml` の `SlackMode` も `bot` に直して shared を再デプロイする。**
-直さないと次の shared デプロイで `mode` が samconfig の値（既定 `webhook`）に戻る。
+どちらも秘密の登録・ローテートだけを行い、投稿方式（`/shared/slack/mode`）は書かない。
+このパラメータは shared スタックが `SlackMode` から作る CloudFormation 管理のリソースで、
+スクリプトが先に作ると shared の作成が `AlreadyExists` で失敗する（prod 初回で実際に失敗した）。
+方式を切り替えるときは `shared/samconfig.toml` の `SlackMode` を直して shared を再デプロイする。
 samconfig はスクリプトからは編集しない。
+
+notifier の実挙動は bot-token の有無で決まるため、`mode` は「人が読むための表示値」に過ぎない。
+`SlackMode=bot` にしたまま bot-token を消すと、画面は bot と表示しつつ実際は webhook で投稿される。
 
 ## deploy-edge.sh
 
@@ -87,7 +154,9 @@ scripts/deploy-edge.sh dev
 2. `/example-backoffice/{env}/apps/saas-a-billing/api-domain` があれば
    `SaasABillingApiDomain` に足す。無ければ足さない（API 経路なしで edge が立つ）。
 3. `infra/edge/samconfig.toml` の `parameter_overrides` を `tomllib` で読み、上の値を
-   連結して `sam deploy --parameter-overrides` に渡す。
+   連結してパーミッション 600 の一時 samconfig（`/tmp`）へ書き、`sam deploy --config-file`
+   で渡す。一時ファイルは `trap` で必ず消す。
+4. `sam deploy` の出力は秘密を `***` に置換してから表示する。
 
 `sam deploy --parameter-overrides` は **samconfig の同名キーを丸ごと置き換える**
 （追記ではない）ため、`SiteDomain` / `HostedZoneId` / `AcmCertificateArn` /
@@ -96,10 +165,11 @@ edge テンプレートは Lambda コードを持たない（CloudFront Function
 `sam build` は行わない。
 
 > **注意（秘密の露出範囲）**: `sam deploy` は `Deploying with following values` の banner に
-> `parameter_overrides` をそのまま印字するため、`OriginVerifySecret` の値がデプロイ実行時の
-> 端末に表示される（`sam deploy` 側の挙動で抑止オプションが無い。CloudFormation コンソール上は
-> `NoEcho` でマスクされる）。同じ理由で値は `sam` プロセスのコマンドライン引数にも載る。
-> **デプロイログをそのまま保存・共有しないこと。** 漏れた疑いがあるときは
+> `parameter_overrides` をそのまま印字する（`sam deploy` 側の挙動で抑止オプションが無い。
+> CloudFormation コンソール上は `NoEcho` でマスクされる）。このスクリプトは
+> (1) 秘密をコマンドライン引数ではなく 600 の一時 samconfig 経由で渡し、
+> (2) `sam` の出力から秘密を `***` に置換することで、`ps` と端末・ログの両方から隠している。
+> それでも **prod のデプロイログを不用意に保存・共有しないこと。** 漏れた疑いがあるときは
 > `ROTATE=1 scripts/init-secrets.sh {env}` でローテーションしてから `deploy-edge.sh` を流し直す。
 
 ## deploy-frontend.sh
@@ -113,13 +183,16 @@ SSM から `/cognito/user-pool-id` と `/cognito/client-id`、edge スタック�
 
 ```
 npm ci
-VITE_COGNITO_USER_POOL_ID=... VITE_COGNITO_CLIENT_ID=... npm run build
+VITE_COGNITO_USER_POOL_ID=... VITE_COGNITO_CLIENT_ID=... VITE_SITE_ENV={env} npm run build
 aws s3 sync dist/ s3://{bucket}/ --delete
 aws s3 cp dist/index.html s3://{bucket}/index.html --cache-control no-cache --content-type text/html
 aws cloudfront create-invalidation --paths "/*"
 ```
 
 `prod` は `--delete` 付き同期の前に確認プロンプトを出す。
+
+`VITE_SITE_ENV`（`dev` / `prod`）はアプリバーのサイト環境チップと `document.title` の
+`[検証]` 前置を決める。渡し忘れたビルドは `dev`（検証環境）として表示される。
 
 ## deploy-all.sh
 
@@ -142,6 +215,39 @@ SPA 用 App Client（`ALLOW_USER_SRP_AUTH`・シークレット無し）を `pyc
 そのまま使うため、E2E 専用の App Client は作らない。パスワードは引数では渡せない
 （環境変数 `COGNITO_PASSWORD` か対話入力）。標準出力へ出るのは ID トークンだけで、
 アクセストークン・リフレッシュトークンは出さない。
+
+## add-admin.sh
+
+```bash
+scripts/add-admin.sh prod devA@example.co.jp
+```
+
+`/example-backoffice/{env}/cognito/user-pool-id` から User Pool ID を引き、
+`admin-add-user-to-group --group-name admin` を実行する。ユーザーが存在しないときは
+`admin-get-user` の失敗を検出して終了コード 1。prod は付与前に確認プロンプトを出す。
+反映は次回サインイン（ID トークン再取得）から。
+
+ユーザー管理のその他の操作（設計 6.3 の runbook）:
+
+```bash
+POOL=$(aws ssm get-parameter --name /example-backoffice/prod/cognito/user-pool-id \
+  --query Parameter.Value --output text)
+aws cognito-idp admin-remove-user-from-group --user-pool-id "$POOL" --username x@example.co.jp --group-name admin
+aws cognito-idp admin-disable-user --user-pool-id "$POOL" --username x@example.co.jp
+aws cognito-idp admin-delete-user  --user-pool-id "$POOL" --username x@example.co.jp
+```
+
+削除しても実行履歴の `requested_by`（Cognito の `sub`）は残る。
+
+**認証アプリ（TOTP）を失った場合**: このプールは `MfaConfiguration: "ON"`（MFA 必須）
+なので、`admin-set-user-mfa-preference` による TOTP の解除は AWS 仕様上できない。
+復旧はユーザーの作り直しで行う（プールを一時的に `OPTIONAL` へ落とす方式は採らない）。
+
+```bash
+aws cognito-idp admin-delete-user --user-pool-id "$POOL" --username x@example.co.jp
+# → 本人が同じメールで再サインアップ（確認コード → 初回サインインで TOTP を再登録）
+scripts/add-admin.sh prod x@example.co.jp   # admin だった人には付け直す
+```
 
 ## list-mfa-status.sh
 
