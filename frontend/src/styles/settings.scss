@@ -1,0 +1,4 @@
+@use 'vuetify/settings' with (
+  $body-font-family: ('Yu Gothic UI', 'Meiryo', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', 'Segoe UI', sans-serif),
+  $heading-font-family: ('Yu Gothic UI', 'Meiryo', 'Hiragino Kaku Gothic ProN', 'Noto Sans JP', sans-serif)
+);

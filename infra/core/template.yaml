@@ -1,0 +1,551 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice core - Cognito / SES / 通知キュー / notifier / 添付バケットと cognito・notify・attachments の SSM 契約パラメータ
+
+# 前提: shared スタックが先にデプロイ済みであること（SSM /example-backoffice/{env}/shared/layer-arn を読む）
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  LogLevel:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Default: INFO
+  ExamplePowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86
+    Description: 社内レイヤ ExamplePowertoolsPython の ARN。notifier が LambdaLogger のために参照する
+  PowertoolsLayerArn:
+    Type: String
+    Description: AWS 提供の Powertools for AWS Lambda (Python) レイヤ ARN。samconfig で環境ごとに指定する
+  SharedLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/shared/layer-arn
+    Description: shared スタックが書く共通レイヤ ARN の契約キー（設計 4.2）。prod は samconfig でキー名を上書きする
+  HostedZoneId:
+    Type: String
+    Default: Z0EXAMPLEZONE0
+    Description: example-cloud.com の Route53 ホストゾーン ID。SES の DNS 検証レコードを追加する
+  MailDomain:
+    Type: String
+    Default: backoffice-dev.example-cloud.com
+    Description: 通知メールの送信ドメイン (dev backoffice-dev.example-cloud.com / prod backoffice.example-cloud.com)
+  OpsEmail:
+    Type: String
+    Default: devA@example.co.jp
+    Description: DLQ アラームと SES のバウンス・苦情を受け取る基盤担当のメールアドレス
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    MemorySize: 256
+    Timeout: 30
+    PropagateTags: true
+    Tags:
+      Project: !Ref ProjectName
+      Name: Function
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn-lint:
+        config:
+          # 置換を伴う更新からだけ守る。スタック削除時は dev の後片付けのため消す
+          # （prod は DeletionProtection: ACTIVE が削除そのものを止める。設計 6.1）
+          ignore_checks:
+            - W3011
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-${Env}
+      UserPoolTier: LITE
+      DeletionProtection: !If [IsProd, ACTIVE, INACTIVE]
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      MfaConfiguration: OPTIONAL
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpFunction.Arn
+      UserPoolTags:
+        Project: !Ref ProjectName
+        Name: UserPool
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-spa-${Env}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 8
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: hours
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref UserPool
+      Description: ユーザー管理とアプリ設定の編集を許可する管理者グループ
+      Precedence: 1
+
+  PreSignUpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-core-pre-signup-${Env}
+      Description: サインアップを @example.co.jp のメールアドレスだけに制限する
+      CodeUri: src/pre_signup/
+      Handler: app.handler
+
+  PreSignUpLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PreSignUpFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  PreSignUpPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt PreSignUpFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  UserPoolIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/cognito/user-pool-id
+      Type: String
+      Value: !Ref UserPool
+      Description: User Pool ID。frontend のビルドと運用スクリプトが読む
+
+  UserPoolClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/cognito/client-id
+      Type: String
+      Value: !Ref UserPoolClient
+      Description: SPA 用 App Client ID。app の JWT audience と frontend のビルドが読む
+
+  UserPoolIssuerParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/cognito/issuer
+      Type: String
+      Value: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+      Description: app の JWT authorizer が検証する issuer
+
+  NotifyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-notify-queue-${Env}
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotifyDlq.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Queue
+
+  NotifyDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-notify-dlq-${Env}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Queue
+
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-ops-${Env}
+      DisplayName: example-backoffice ops
+      Subscription:
+        - Endpoint: !Ref OpsEmail
+          Protocol: email
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Topic
+
+  OpsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OpsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountOwner
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - sns:GetTopicAttributes
+              - sns:SetTopicAttributes
+              - sns:AddPermission
+              - sns:RemovePermission
+              - sns:DeleteTopic
+              - sns:Subscribe
+              - sns:ListSubscriptionsByTopic
+              - sns:Publish
+            Resource: !Ref OpsTopic
+          - Sid: AllowSesPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OpsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: AllowCloudWatchAlarmPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OpsTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  NotifyDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-notify-dlq-${Env}
+      AlarmDescription: notify-dlq にメッセージが入った。原因を解消してから DLQ 再駆動で元キューへ戻す
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt NotifyDlq.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref OpsTopic
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Alarm
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-core-idempotency-${Env}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiration
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Table
+
+  AttachmentsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${ProjectName}-attachments-${Env}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          # S3 のライフサイクルはプレフィックスの除外を表現できず、規則が重なると最短の期限が
+          # 適用される。そのため保持対象を除外するのではなく、削除してよいオブジェクトだけに
+          # notify.put_attachment() が lifecycle=expire タグを付ける（設計 11.2）。
+          - Id: ExpireTaggedAttachments
+            Status: Enabled
+            ExpirationInDays: 400
+            TagFilters:
+              - Key: lifecycle
+                Value: expire
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Bucket
+
+  SesConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub ${ProjectName}-${Env}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: ConfigurationSet
+
+  SesEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn: OpsTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref SesConfigurationSet
+      EventDestination:
+        Name: ops-bounce-complaint
+        Enabled: true
+        MatchingEventTypes:
+          - bounce
+          - complaint
+        SnsDestination:
+          TopicARN: !Ref OpsTopic
+
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref MailDomain
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref SesConfigurationSet
+      DkimAttributes:
+        SigningEnabled: true
+      MailFromAttributes:
+        MailFromDomain: !Sub bounce.${MailDomain}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: EmailIdentity
+
+  SesRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !GetAtt EmailIdentity.DkimDNSTokenName1
+          Type: CNAME
+          TTL: "1800"
+          ResourceRecords:
+            - !GetAtt EmailIdentity.DkimDNSTokenValue1
+        - Name: !GetAtt EmailIdentity.DkimDNSTokenName2
+          Type: CNAME
+          TTL: "1800"
+          ResourceRecords:
+            - !GetAtt EmailIdentity.DkimDNSTokenValue2
+        - Name: !GetAtt EmailIdentity.DkimDNSTokenName3
+          Type: CNAME
+          TTL: "1800"
+          ResourceRecords:
+            - !GetAtt EmailIdentity.DkimDNSTokenValue3
+        - Name: !Sub bounce.${MailDomain}
+          Type: MX
+          TTL: "1800"
+          ResourceRecords:
+            - 10 feedback-smtp.ap-northeast-1.amazonses.com
+        - Name: !Sub bounce.${MailDomain}
+          Type: TXT
+          TTL: "300"
+          ResourceRecords:
+            - '"v=spf1 include:amazonses.com ~all"'
+        - Name: !Sub _dmarc.${MailDomain}
+          Type: TXT
+          TTL: "300"
+          ResourceRecords:
+            - '"v=DMARC1; p=quarantine;"'
+
+  NotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-core-notifier-${Env}
+      Description: notify-queue のメッセージを SES と Slack へ送る
+      CodeUri: src/notifier/
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 60
+      Layers:
+        - !Ref ExamplePowertoolsLayerArn
+        - !Ref PowertoolsLayerArn
+        - !Ref SharedLayerArn
+      Environment:
+        Variables:
+          ENV: !Ref Env
+          LOG_LEVEL: !Ref LogLevel
+          POWERTOOLS_SERVICE_NAME: notifier
+          SES_FROM_ADDRESS: !Sub noreply@${MailDomain}
+          IDEMPOTENCY_TABLE: !Ref IdempotencyTable
+          DLQ_URL: !Ref NotifyDlq
+          SSM_PREFIX: !Sub /${ProjectName}/${Env}
+      Events:
+        NotifyQueue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt NotifyQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: SendEmailAsNoreply
+              Effect: Allow
+              Action: ses:SendEmail
+              Resource:
+                - !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${MailDomain}
+                - !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/${SesConfigurationSet}
+              Condition:
+                StringEquals:
+                  ses:FromAddress: !Sub noreply@${MailDomain}
+            - Sid: ReadAttachments
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/*
+            # ListBucket が無いと存在しないキーの GetObject が 404 でなく AccessDenied になり、
+            # 添付欠落を恒久エラー（DLQ 直行、設計 8.6）と判定できない
+            - Sid: LocateAttachments
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            - Sid: ReadSlackSecrets
+              Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/*
+            - Sid: DecryptSlackSecrets
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+            - Sid: IdempotencyRecords
+              Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+              Resource: !GetAtt IdempotencyTable.Arn
+            - Sid: ParkPermanentFailures
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !GetAtt NotifyDlq.Arn
+
+  NotifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${NotifierFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  NotifyQueueUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/notify/queue-url
+      Type: String
+      Value: !Ref NotifyQueue
+      Description: 通知キュー URL。app の Lambda 環境変数と shared notify.py が読む
+
+  NotifyQueueArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/notify/queue-arn
+      Type: String
+      Value: !GetAtt NotifyQueue.Arn
+      Description: 通知キュー ARN。app の IAM sqs:SendMessage の Resource が読む
+
+  AttachmentsBucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/attachments/bucket
+      Type: String
+      Value: !Ref AttachmentsBucket
+      Description: 添付バケット名。app が添付を置く先と IAM の Resource が読む
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: SPA 用 App Client ID
+    Value: !Ref UserPoolClient

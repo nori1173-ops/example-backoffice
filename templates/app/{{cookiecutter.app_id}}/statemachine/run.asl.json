@@ -1,0 +1,26 @@
+{
+  "Comment": "{{cookiecutter.app_title}} の実行フロー。15 分を超える処理や分割並列が必要な場合に使う（設計 10.3）",
+  "StartAt": "Run",
+  "States": {
+    "Run": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${BatchFunctionArn}",
+        "Payload": {
+          "trigger.$": "$.trigger"
+        }
+      },
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "OutputPath": "$.Payload",
+      "End": true
+    }
+  }
+}

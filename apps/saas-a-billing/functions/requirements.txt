@@ -1,0 +1,2 @@
+XlsxWriter==3.2.9
+requests==2.34.2

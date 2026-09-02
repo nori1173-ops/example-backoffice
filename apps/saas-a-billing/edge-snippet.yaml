@@ -1,0 +1,66 @@
+# infra/edge/template.yaml に転記する断片（ADD-APP-GUIDE 2 章ステップ 6 / 設計 5.3）。
+# saas-a-billing は転記済みなので、下は edge テンプレートに入っている実物の写し。ずれていないことは
+# tests/infra/test_saas_a_billing_template.py::test_edge_snippet_matches_edge_template が見る。
+#
+# 転記後は scripts/deploy-edge.sh へアプリの SSM 解決を足し、scripts/deploy-edge.sh {env} で
+# デプロイする（saas-a-billing は API_DOMAIN_PARAM の定義と OVERRIDES への連結の 2 行。
+# scripts/deploy-edge.sh:53 / :99 付近）。
+#
+# samconfig.toml に SSM のキーパスを書くのは誤り。下のパラメータは Type: String なので、
+# キーパスの文字列がそのまま origin の DomainName になり、API 経路が壊れる
+#（SSM から解決されるのは Type: AWS::SSM::Parameter::Value<String> のパラメータだけ）。
+#
+# 【2 アプリ目を足すときの注意】CacheBehaviors は今「リスト全体を !If」の形。その形のまま
+# 2 本目の behavior を足すと HasSaasABillingApi に巻き込まれ、saas-a-billing 未デプロイのときに
+# 2 本目ごと消える。先に origin と同じ「- !If」（要素ごとの条件）へ書き換えてから追記する。
+
+# --- Parameters に追加 -------------------------------------------------------
+Parameters:
+  SaasABillingApiDomain:
+    Type: String
+    Default: ""
+    Description: saas-a-billing の HTTP API ドメイン（設計 4.2 の /apps/saas-a-billing/api-domain）。空なら API 経路を作らない
+
+# --- Conditions に追加 -------------------------------------------------------
+Conditions:
+  HasSaasABillingApi: !Not [!Equals [!Ref SaasABillingApiDomain, ""]]
+
+# --- Distribution の Origins に追加 -----------------------------------------
+          - !If
+            - HasSaasABillingApi
+            - Id: api-saas-a-billing
+              DomainName: !Ref SaasABillingApiDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: x-origin-verify
+                  HeaderValue: !Ref OriginVerifySecret
+            - !Ref AWS::NoValue
+
+# --- Distribution の CacheBehaviors に追加 ----------------------------------
+# FunctionAssociations（viewer-request → EdgeGuardFunction）を必ず付ける。
+# 付け忘れるとこのアプリの API だけ社内 IP 制限を素通りする（プラットフォーム設計 7.1）。
+# AllowedMethods は 7 メソッドを明示する（省略すると GET / HEAD だけになり POST が 403）。
+# CachePolicyId は CachingDisabled、OriginRequestPolicyId は AllViewerExceptHostHeader。
+        CacheBehaviors: !If
+          - HasSaasABillingApi
+          - - PathPattern: /api/saas-a-billing/*
+              TargetOriginId: api-saas-a-billing
+              ViewerProtocolPolicy: https-only
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - PATCH
+                - POST
+                - DELETE
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              Compress: true
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+          - !Ref AWS::NoValue

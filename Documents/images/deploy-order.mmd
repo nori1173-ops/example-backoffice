@@ -1,0 +1,7 @@
+flowchart LR
+    shared["① shared<br>共通レイヤ公開<br>/shared/layer-arn を書く"]
+    core["② core<br>/shared/layer-arn を読む<br>/cognito/*・/notify/*<br>/attachments/bucket を書く"]
+    app["③ app-{app}<br>core のキーと layer-arn を読む<br>/apps/{app}/api-domain を書く"]
+    edge["④ edge<br>api-domain を読む<br>origin-verify を注入"]
+    frontend["⑤ frontend<br>cognito のキーで<br>ビルド・S3 配布"]
+    shared --> core --> app --> edge --> frontend

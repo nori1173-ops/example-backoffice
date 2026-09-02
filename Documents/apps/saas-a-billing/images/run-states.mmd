@@ -1,0 +1,11 @@
+stateDiagram-v2
+    direction LR
+    [*] --> queued: 取得（POST /runs 手動 / trigger 自動）
+    queued --> running: Init（run_token・attempt 一致）
+    running --> succeeded: Aggregate 成功
+    succeeded --> distributed: notify 投函（配布有効時のみ）
+    running --> failed: 全体 Catch → MarkFailed
+    failed --> queued: 再実行（attempt+1）
+    running --> queued: stale 奪取（前日以前の残骸を翌日 trigger が取得）
+    succeeded --> queued: force=true の手動実行（条件式なし）
+    distributed --> queued: force=true の手動実行（条件式なし）

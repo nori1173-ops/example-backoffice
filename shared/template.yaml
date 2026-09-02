@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice shared - 共通 Lambda Layer と shared の SSM 契約パラメータ
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  SlackMode:
+    Type: String
+    AllowedValues:
+      - bot
+      - webhook
+    Default: webhook
+    Description: notifier の Slack 投稿方式。Bot token 登録後に bot へ切り替える
+
+Resources:
+  SharedLayer:
+    Type: AWS::Serverless::LayerVersion
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      BuildMethod: python3.13
+    Properties:
+      LayerName: !Sub ${ProjectName}-shared-${Env}
+      Description: !Sub ${ProjectName} 共通パッケージ example_backoffice (${Env})
+      ContentUri: layers/
+      CompatibleRuntimes:
+        - python3.13
+      CompatibleArchitectures:
+        - x86_64
+      RetentionPolicy: Retain
+
+  SharedLayerArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/shared/layer-arn
+      Type: String
+      Value: !Ref SharedLayer
+      Description: 共通レイヤのバージョン付き ARN。app スタックが Layers で参照する
+
+  SlackModeParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/shared/slack/mode
+      Type: String
+      Value: !Ref SlackMode
+      Description: notifier の Slack 投稿方式 (bot / webhook)
+
+Outputs:
+  SharedLayerArn:
+    Description: 共通レイヤのバージョン付き ARN
+    Value: !Ref SharedLayer
+  SlackModeParameterName:
+    Description: Slack 投稿方式を公開する SSM パラメータ名
+    Value: !Ref SlackModeParameter

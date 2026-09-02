@@ -1,0 +1,326 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice app {{cookiecutter.app_id}} - HTTP API / api Lambda / DynamoDB と apps/{{cookiecutter.app_id}} の SSM 契約パラメータ
+
+# 前提: shared → core の順にデプロイ済みであること（設計 3.3）。
+# SSM 型パラメータの Default は dev のキー名。prod は samconfig の [production.deploy.parameters] で
+# キー名（値ではない）を上書きする（設計 4.4）。
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  LogLevel:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Default: INFO
+  ExamplePowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86
+    Description: 社内レイヤ ExamplePowertoolsPython の ARN。LambdaLogger のために参照する
+  PowertoolsLayerArn:
+    Type: String
+    Description: AWS 提供の Powertools for AWS Lambda (Python) レイヤ ARN。samconfig で環境ごとに指定する
+  UserPoolIssuer:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/issuer
+    Description: JWT authorizer が検証する issuer（設計 4.2）
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/client-id
+    Description: JWT authorizer の audience（設計 4.2）
+  NotifyQueueUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-url
+    Description: 通知キュー URL。shared notify.py が環境変数 NOTIFY_QUEUE_URL から読む
+  NotifyQueueArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-arn
+    Description: 通知キュー ARN。sqs:SendMessage の Resource に使う
+  AttachmentsBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/attachments/bucket
+    Description: 添付バケット名。notify.put_attachment() の置き場
+  SharedLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/shared/layer-arn
+    Description: 共通レイヤ example_backoffice のバージョン付き ARN
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    MemorySize: 256
+    Timeout: 30
+    PropagateTags: true
+    Environment:
+      Variables:
+        ENV: !Ref Env
+        LOG_LEVEL: !Ref LogLevel
+        TABLE_NAME: !Ref DataTable
+        NOTIFY_QUEUE_URL: !Ref NotifyQueueUrl
+        ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+        SSM_PREFIX: !Sub /${ProjectName}/${Env}
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref UserPoolIssuer
+              audience:
+                - !Ref UserPoolClientId
+        DefaultAuthorizer: CognitoJwtAuthorizer
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","sub":"$context.authorizer.claims.sub","latency":"$context.responseLatency"}'
+      Tags:
+        Project: !Ref ProjectName
+        Name: Api
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${ProjectName}-{{cookiecutter.app_id}}-${Env}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-{{cookiecutter.app_id}}-api-${Env}
+      Description: {{cookiecutter.app_title}}の HTTP API ハンドラ
+      CodeUri: functions/
+      Handler: api.app.handler
+      Layers:
+        - !Ref SharedLayerArn
+        - !Ref ExamplePowertoolsLayerArn
+        - !Ref PowertoolsLayerArn
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: {{cookiecutter.app_id}}-api
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/{{cookiecutter.app_id}}/{proxy+}
+            Method: ANY
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: EnqueueNotifications
+              Effect: Allow
+              Action:
+                - sqs:SendMessage
+              Resource: !Ref NotifyQueueArn
+            - Sid: PutOwnAttachments
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/{{cookiecutter.app_id}}/*
+            - Sid: ReadOwnAndOriginVerifyParameters
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/{{cookiecutter.app_id}}/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret
+            - Sid: DecryptSecureStringParameters
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+              Resource: !GetAtt DataTable.Arn
+      Tags:
+        Project: !Ref ProjectName
+        Name: Function
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-{{cookiecutter.app_id}}-data-${Env}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If [IsProd, true, false]
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Table
+
+  ApiDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/apps/{{cookiecutter.app_id}}/api-domain
+      Type: String
+      Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+      Description: HTTP API のドメイン。edge が origin の DomainName として読む（設計 4.2）
+
+  # ---------------------------------------------------------------------------
+  # バッチ（必要になったら次のブロックのコメントを外す。ADD-APP-GUIDE 2 章ステップ 4-5）
+  #
+  # BatchFunction:
+  #   Type: AWS::Serverless::Function
+  #   Properties:
+  #     FunctionName: !Sub ${ProjectName}-{{cookiecutter.app_id}}-batch-${Env}
+  #     Description: {{cookiecutter.app_title}}の定期バッチ
+  #     CodeUri: functions/
+  #     Handler: batch.handlers.scheduled.handler
+  #     Timeout: 900
+  #     MemorySize: 1024
+  #     Layers:
+  #       - !Ref SharedLayerArn
+  #       - !Ref ExamplePowertoolsLayerArn
+  #       - !Ref PowertoolsLayerArn
+  #     Environment:
+  #       Variables:
+  #         POWERTOOLS_SERVICE_NAME: {{cookiecutter.app_id}}-batch
+  #     EventInvokeConfig:
+  #       MaximumRetryAttempts: 0
+  #       DestinationConfig:
+  #         OnFailure:
+  #           Type: SQS
+  #           Destination: !GetAtt BatchDlq.Arn
+  #     Events:
+  #       Monthly:
+  #         Type: ScheduleV2
+  #         Properties:
+  #           ScheduleExpression: cron(0 1 20 * ? *)
+  #           ScheduleExpressionTimezone: Asia/Tokyo
+  #           Input: '{"trigger": "scheduled"}'
+  #           DeadLetterConfig:
+  #             Arn: !GetAtt BatchDlq.Arn
+  #     Policies:
+  #       - Version: "2012-10-17"
+  #         Statement:
+  #           - Sid: ParkFailedInvocations
+  #             Effect: Allow
+  #             Action: sqs:SendMessage
+  #             Resource: !GetAtt BatchDlq.Arn
+  #     Tags:
+  #       Project: !Ref ProjectName
+  #       Name: Function
+  #
+  # BatchLogGroup:
+  #   Type: AWS::Logs::LogGroup
+  #   Properties:
+  #     LogGroupName: !Sub /aws/lambda/${BatchFunction}
+  #     RetentionInDays: 365
+  #     Tags:
+  #       - Key: Project
+  #         Value: !Ref ProjectName
+  #       - Key: Name
+  #         Value: LogGroup
+  #
+  # BatchDlq:
+  #   Type: AWS::SQS::Queue
+  #   Properties:
+  #     QueueName: !Sub ${ProjectName}-{{cookiecutter.app_id}}-batch-dlq-${Env}
+  #     MessageRetentionPeriod: 1209600
+  #     SqsManagedSseEnabled: true
+  #     Tags:
+  #       - Key: Project
+  #         Value: !Ref ProjectName
+  #       - Key: Name
+  #         Value: Queue
+  #
+  # ---------------------------------------------------------------------------
+  # 15 分を超える処理・分割並列が要る場合のステートマシン（設計 10.3 / ADD-APP-GUIDE 2 章ステップ 4-5）
+  # 有効化したら ExecutionsFailed / ExecutionsTimedOut のアラームも足す（ADD-APP-GUIDE 4 章）。
+  #
+  # StateMachine:
+  #   Type: AWS::Serverless::StateMachine
+  #   Properties:
+  #     Name: !Sub ${ProjectName}-{{cookiecutter.app_id}}-run-${Env}
+  #     DefinitionUri: statemachine/run.asl.json
+  #     DefinitionSubstitutions:
+  #       BatchFunctionArn: !GetAtt BatchFunction.Arn
+  #     Policies:
+  #       - Version: "2012-10-17"
+  #         Statement:
+  #           - Sid: InvokeBatchFunction
+  #             Effect: Allow
+  #             Action: lambda:InvokeFunction
+  #             Resource: !GetAtt BatchFunction.Arn
+  #     Tags:
+  #       Project: !Ref ProjectName
+  #       Name: StateMachine
+  #
+  # 実行を開始する関数の Policies に次の文を足す（自アプリのステートマシン ARN に限定する）:
+  #   - Sid: StartOwnStateMachine
+  #     Effect: Allow
+  #     Action: states:StartExecution
+  #     Resource: !Ref StateMachine
+
+Outputs:
+  ApiDomain:
+    Description: HTTP API のドメイン（edge の origin DomainName）
+    Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  DataTableName:
+    Description: アプリの単一テーブル名
+    Value: !Ref DataTable

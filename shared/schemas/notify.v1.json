@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example-cloud.com/schemas/example-backoffice/notify.v1.json",
+  "title": "example-backoffice.notify.v1",
+  "description": "notify-queue に投函する通知メッセージ（設計 8.2）。送信側 notify.py と受信側 notifier の共通契約。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "message_id", "app", "channels"],
+  "properties": {
+    "schema": {
+      "description": "スキーマ識別子の固定値。",
+      "const": "example-backoffice.notify.v1"
+    },
+    "message_id": {
+      "description": "冪等性キー。notify.py が UUID で生成する。",
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "app": {
+      "description": "送信元アプリ id（kebab-case）。添付キーのプレフィックスにも使う。",
+      "type": "string",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "minLength": 3,
+      "maxLength": 30
+    },
+    "channels": {
+      "description": "送信先チャンネル。email を含むなら email、slack を含むなら slack を必須にする。",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["email", "slack"]
+      }
+    },
+    "email": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["to", "subject", "text"],
+      "properties": {
+        "to": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "format": "email",
+            "minLength": 1
+          }
+        },
+        "cc": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "email",
+            "minLength": 1
+          }
+        },
+        "reply_to": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "email",
+            "minLength": 1
+          }
+        },
+        "subject": {
+          "description": "件名（UTF-8）。",
+          "type": "string",
+          "minLength": 1
+        },
+        "text": {
+          "description": "text/plain 本文。",
+          "type": "string"
+        },
+        "html": {
+          "description": "text/html 本文。",
+          "type": "string"
+        }
+      }
+    },
+    "attachments": {
+      "description": "添付の S3 参照。notifier が GetObject して SES v2 の Attachments に渡す。",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["bucket", "key", "filename"],
+        "properties": {
+          "bucket": {
+            "description": "添付バケット（SSM /attachments/bucket の値）。",
+            "type": "string",
+            "minLength": 1
+          },
+          "key": {
+            "description": "オブジェクトキー。{app}/ 配下に限る。",
+            "type": "string",
+            "minLength": 1
+          },
+          "filename": {
+            "description": "メールに表示するファイル名。ASCII 推奨。",
+            "type": "string",
+            "minLength": 1
+          },
+          "content_type": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "slack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text"],
+      "properties": {
+        "channel": {
+          "description": "投稿先のチャンネル ID（例 C0123ABCD）。#name 形式や小文字は許可しない。Webhook フォールバック時は無視される。",
+          "type": "string",
+          "pattern": "^[CGD][A-Z0-9]{8,}$"
+        },
+        "mention": {
+          "description": "本文の先頭に付ける文字列（<!here> / <@U0123> / <!subteam^S0123>）。空可。",
+          "type": "string"
+        },
+        "text": {
+          "description": "本文（mrkdwn）。",
+          "type": "string",
+          "minLength": 1
+        },
+        "blocks": {
+          "description": "Block Kit。",
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "meta": {
+      "description": "追跡用（run_id、target_month など）。notifier はログに出すだけ。",
+      "type": "object"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["channels"],
+        "properties": {
+          "channels": {
+            "contains": {
+              "const": "email"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["email"]
+      }
+    },
+    {
+      "if": {
+        "required": ["channels"],
+        "properties": {
+          "channels": {
+            "contains": {
+              "const": "slack"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["slack"]
+      }
+    }
+  ]
+}

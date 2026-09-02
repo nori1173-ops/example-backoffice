@@ -1,0 +1,80 @@
+{
+  "data": {
+    "count": 5,
+    "rows": [
+      {
+        "device_id": "00000000-0000-0000-0000-000000000101",
+        "device_cd": "10000001-01-LoggerA-400",
+        "device_name": "観測局1",
+        "device_description": "",
+        "format_id": "00000000-0000-0000-0000-0000000000f1",
+        "format_name": "LoggerA-400",
+        "format_detail": [
+          {"item_name": "水位"},
+          {"item_name": "電圧"},
+          {"item_name": "気温"}
+        ],
+        "group_cds": ["GRP001"],
+        "group_names": ["現場A"]
+      },
+      {
+        "device_id": "00000000-0000-0000-0000-000000000102",
+        "device_cd": "10000002-02-LoggerA-400",
+        "device_name": "観測局2",
+        "device_description": "",
+        "format_id": "00000000-0000-0000-0000-0000000000f1",
+        "format_name": "LoggerA-400",
+        "format_detail": [
+          {"item_name": "水位"},
+          {"item_name": "電圧"},
+          {"item_name": "気温"}
+        ],
+        "group_cds": ["GRP001", "GRP002"],
+        "group_names": ["現場A", "現場B"]
+      },
+      {
+        "device_id": "00000000-0000-0000-0000-000000000103",
+        "device_cd": "10000003-03-CamA-MC",
+        "device_name": "カメラ局1",
+        "device_description": "",
+        "format_id": "00000000-0000-0000-0000-0000000000f2",
+        "format_name": "CamA-MC",
+        "format_detail": [
+          {"item_name": "ファイル名"},
+          {"item_name": "Base64形式データ"}
+        ],
+        "group_cds": ["GRP001"],
+        "group_names": ["現場A"]
+      },
+      {
+        "device_id": "00000000-0000-0000-0000-000000000104",
+        "device_cd": "10000004-04-LoggerA-400",
+        "device_name": "観測局4",
+        "device_description": "デモ機のため課金対象外",
+        "format_id": "00000000-0000-0000-0000-0000000000f1",
+        "format_name": "LoggerA-400",
+        "format_detail": [
+          {"item_name": "水位"},
+          {"item_name": "電圧"},
+          {"item_name": "気温"}
+        ],
+        "group_cds": ["GRP002"],
+        "group_names": ["現場B"]
+      },
+      {
+        "device_id": "00000000-0000-0000-0000-000000000105",
+        "device_cd": "10000005-05-LoggerA-210",
+        "device_name": "雨量局1",
+        "device_description": "",
+        "format_id": "00000000-0000-0000-0000-0000000000f3",
+        "format_name": "LoggerA-210",
+        "format_detail": [
+          {"item_name": "雨量"},
+          {"item_name": "電圧"}
+        ],
+        "group_cds": ["GRP002"],
+        "group_names": ["現場B"]
+      }
+    ]
+  }
+}

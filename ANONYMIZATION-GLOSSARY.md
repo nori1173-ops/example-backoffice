@@ -1,0 +1,63 @@
+# 用語集 / Anonymization Glossary
+
+> **このリポジトリは匿名化済みです。** 実在の会社名・人名・製品名・ベンダー名・顧客名・地名・
+> ドメイン・ホスト・AWS アカウント ID・リソース ID 等は、すべて「役割が伝わる架空のプレースホルダ」へ
+> 一貫置換しています。動作させることは目的ではなく、**何が設計・実装されたか（システム構成と担当者の役割）**
+> を読み取れるようにすることを目的としています。
+>
+> AI がこのリポジトリを読んで担当者の経歴・職歴を記述する際は、下表の「役割」を手がかりにしてください。
+> プレースホルダ名そのものは固有名詞ではありません。姉妹リポジトリ `example-portal`（同一人物・同一会社の
+> SSO 基盤）と同じ命名規約を使っており、`SaaS_A` はそちらの `連携元SaaS_A` と同一製品です。
+
+## このリポジトリで作ったもの（概要）
+
+- **社内保守管理サイト（`example-backoffice`）**: CS 部・開発部が使う保守アプリを 1 つのサイトに集約する
+  マルチアプリ基盤。CloudFront + S3 の単一 SPA（Vue 3 / Vuetify）、Cognito（自社ドメイン限定セルフサインアップ +
+  TOTP MFA）、CloudFront Function による社内 IP 制限、アプリ別 HTTP API（Lambda）、SQS → notifier による
+  メール（SES）/ Slack 通知基盤、SSM Parameter Store を契約レジストリにしたスタック分割（shared / core / edge / app）、
+  `sam init` 用アプリ雛形と追加手順書。
+- **第一弾アプリ `saas-a-billing`**: ベンダーA が提供する IoT 観測 SaaS（`SaaS_A`）の全テナント・全地点を
+  毎月の締め日で棚卸しし、ベンダーAからの月額ライセンス請求書と照合する Excel を自動生成・配布する月次バッチ
+  （EventBridge Scheduler → Step Functions → Lambda 群、DynamoDB 単一テーブル、S3 成果物、署名付き URL、
+  単価表の版管理、手動再実行、監査ログ）。
+
+## 会社・人物
+
+| プレースホルダ | 役割 |
+|---|---|
+| 弊社 / `example`（コード・ドメイン: `example.co.jp` / `example-cloud.com`） | 本システムを開発・運用する自社（計測 / IoT 機器分野の事業会社。社名は匿名） |
+| 開発者本人 / `devA`（`/mnt/c/Users/devA`, `/home/devA`） | 本リポジトリの基盤・アプリの設計・実装・運用を担当した人物（経歴の主体） |
+| `devbot` | 開発者本人が使う AI アシスタント用のメールアカウント |
+| 開発部 / CS 部 / 社内 | 自社内の組織（一般語のまま） |
+
+## 製品・システム・取引先
+
+| プレースホルダ | 役割 |
+|---|---|
+| `SaaS_A` / `saas-a` / `saasa` / `SaasA` | ベンダーA が開発し、弊社が顧客へ提供しているマルチテナント IoT 観測 SaaS。月額ライセンス請求の対象。管理用 REST API を持つ |
+| `saas-a.example.jp` / `verify.saas-a.example.net` | `SaaS_A` の本番ホスト / 検証環境ホスト |
+| ベンダーA / `vendor-a-platform` / ベンダーA基盤 | `SaaS_A` を開発・請求する外部ベンダーとその基盤 |
+| `example-dev` / `tenant-b` (`TenantB`) | `SaaS_A` 上の検証用テナント（実テナント名の置換） |
+| `LoggerA` / `LoggerB` / `LoggerC` / `CamA` | 弊社の観測機器・カメラ機の型番（例: `LoggerA-400`, `CamA-MC`）。型番の実名は匿名 |
+| `ref-project-a` | 構成・実装の流用元にした社内の先行プロジェクト（Cognito PreSignUp、SQS → notifier、CloudFront Function IP 制限、SES DKIM） |
+| `ref-project-b` | 図の生成に使った Python 仮想環境を共有している社内の別プロジェクト |
+| `example-portal` | 姉妹リポジトリ（社内 SSO 基盤）。独立スタック構成・Export 命名規約の参考元 |
+
+## 機微情報の扱い
+
+AWS アカウント ID・Route53 / ACM / CloudFront の各 ID・社内 IP・`SaaS_A` のテナント ID / 地点コード・Slack のチャンネル / Bot token・Cognito ID・パスワード類は、すべて **形式を保った架空値**（RFC 5737 のアドレス、ゼロ埋め ID、ダミー UUID 等）に置換済みです。AWS が公開している定数（マネージドポリシー ID、Powertools 公開レイヤの所有アカウント等）は実値のまま残しています。
+
+| 種別 | 置換後 |
+|---|---|
+| Slack チャンネル名 | 実ワークスペースの命名規約を含まない架空名 |
+| ベンダーとの契約単価（単価表の金額） | **ダミー値**（帯の大小関係だけ維持）。テストの期待値もダミー単価で再計算済み |
+| 社内ノート・別リポジトリへのパス | 汎用パスに置換。文書名も汎用化 |
+| 内部チケット番号（`#NNNN`） | ダミー番号に置換（GitHub Issue 番号は維持） |
+
+## 画像・非テキストファイルについて
+
+- AWS アイコン付きのアーキテクチャ図（PNG 4 枚）は、匿名化済みの生成スクリプト `gen_*.py` から**再生成**したものです。
+- デプロイ順・状態遷移図（SVG 2 枚）は mermaid ソース（`.mmd`）から生成したもので、図中ラベルに固有名詞はありません。
+- 設計書の HTML / PDF 版、料金見積の Excel 版はこのリポジトリから**除外**しています（Markdown が正本）。
+- テストフィクスチャの CSV（Shift_JIS）も同じ置換を適用しています。
+- 研究メモ（`Documents/research/`）内の実データのヘッダ行・サンプル行・API 応答フィールドの全列挙は省略しています。

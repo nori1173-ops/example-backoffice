@@ -1,0 +1,23 @@
+{
+  "data": {
+    "count": 2,
+    "rows": [
+      {
+        "tenant_id": "00000000-0000-0000-0000-000000000011",
+        "tenant_cd": "TNT001",
+        "tenant_name": "サンプル建設",
+        "tenant_description": "",
+        "retention_period": 3,
+        "device_count": 5
+      },
+      {
+        "tenant_id": "00000000-0000-0000-0000-000000000012",
+        "tenant_cd": "TNT002",
+        "tenant_name": "サンプル商事",
+        "tenant_description": "デモ環境用テナント",
+        "retention_period": 1,
+        "device_count": 0
+      }
+    ]
+  }
+}

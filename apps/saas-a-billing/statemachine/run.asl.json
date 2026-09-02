@@ -1,0 +1,144 @@
+{
+  "Comment": "saas-a-billing の月次課金集計（設計 6.3）",
+  "StartAt": "Init",
+  "TimeoutSeconds": 7200,
+  "States": {
+    "Init": {
+      "Type": "Task",
+      "Resource": "${InitFunctionArn}",
+      "Parameters": {
+        "trigger.$": "$.trigger",
+        "target_env.$": "$.target_env",
+        "month.$": "$.month",
+        "attempt.$": "$.attempt",
+        "run_token.$": "$.run_token",
+        "distribute.$": "$.distribute",
+        "force.$": "$.force",
+        "execution_arn.$": "$$.Execution.Id"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "CollectTenants"
+    },
+    "CollectTenants": {
+      "Type": "Map",
+      "ItemsPath": "$.tenants",
+      "MaxConcurrency": 2,
+      "ItemSelector": {
+        "run_id.$": "$.run_id",
+        "target_env.$": "$.target_env",
+        "month.$": "$.month",
+        "attempt.$": "$.attempt",
+        "closing_period.$": "$.closing_period",
+        "tenant_id.$": "$$.Map.Item.Value.tenant_id",
+        "tenant_cd.$": "$$.Map.Item.Value.tenant_cd"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "CollectTenant",
+        "States": {
+          "CollectTenant": {
+            "Type": "Task",
+            "Resource": "${CollectTenantFunctionArn}",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "MaxAttempts": 2,
+                "IntervalSeconds": 5,
+                "BackoffRate": 2.0
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.error",
+                "Next": "MarkTenantFailed"
+              }
+            ],
+            "End": true
+          },
+          "MarkTenantFailed": {
+            "Type": "Pass",
+            "Parameters": {
+              "tenant_cd.$": "$.tenant_cd",
+              "failed": true
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.collected",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "Aggregate"
+    },
+    "Aggregate": {
+      "Type": "Task",
+      "Resource": "${AggregateFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "MarkFailed"
+        }
+      ],
+      "End": true
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "${MarkFailedFunctionArn}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0
+        }
+      ],
+      "End": true
+    }
+  }
+}

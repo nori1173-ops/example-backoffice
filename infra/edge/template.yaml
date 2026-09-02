@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice edge - SPA バケット / OAC / CloudFront / Route53 / 標準ログ。IP 制限は WAF ではなく CloudFront Function edge-guard で行う
+
+# 前提: OriginVerifySecret は scripts/init-secrets.sh が SSM に登録した値を
+# scripts/deploy-edge.sh が復号取得して --parameter-overrides で渡す（設計 5.5）。
+# SaasABillingApiDomain も同スクリプトが SSM /example-backoffice/{env}/apps/saas-a-billing/api-domain
+# から読んで渡す。未指定なら API origin / behavior を作らないので app 未デプロイでも edge は立つ。
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  SiteDomain:
+    Type: String
+    Default: backoffice-dev.example-cloud.com
+    Description: サイトの FQDN（設計 5.1）。prod は samconfig で上書きする
+  HostedZoneId:
+    Type: String
+    Default: Z0EXAMPLEZONE0
+    Description: example-cloud.com の既存共有ホストゾーン ID。レコードの新規追加のみ行う
+  AcmCertificateArn:
+    Type: String
+    Default: arn:aws:acm:us-east-1:210000000001:certificate/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+    Description: 既存の共有 ACM 証明書（*.example-cloud.com、us-east-1）。新規発行はしない
+  AllowedIpAddresses:
+    Type: CommaDelimitedList
+    Default: 203.0.113.10/32
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$'
+    Description: edge-guard が許可する IPv4 CIDR。各要素にパターンが効くので不正値はデプロイ時に落ちる（設計 7.1）
+  OriginVerifySecret:
+    Type: String
+    NoEcho: true
+    Description: CloudFront から API origin へ渡す共有秘密（設計 5.5）。deploy-edge.sh が SSM から渡す
+  SaasABillingApiDomain:
+    Type: String
+    Default: ""
+    Description: saas-a-billing の HTTP API ドメイン（設計 4.2 の /apps/saas-a-billing/api-domain）。空なら API 経路を作らない
+
+Conditions:
+  HasSaasABillingApi: !Not [!Equals [!Ref SaasABillingApiDomain, ""]]
+
+Resources:
+  SpaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-spa-${Env}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Bucket
+
+  SpaBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SpaBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SpaBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  CloudFrontLogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-cf-logs-${Env}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # レガシー標準ログの配信は配信先バケットへの ACL 書き込みを要求するため、
+      # 設計 11.2 の BucketOwnerEnforced に対する唯一の例外としてここだけ ACL を有効にする。
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireCloudFrontLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Bucket
+
+  Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac-${Env}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  EdgeGuardFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${ProjectName}-edge-guard-${Env}'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: IP allowlist and SPA fallback for example-backoffice
+        Runtime: cloudfront-js-2.0
+      # 正本は infra/edge/functions/edge-guard.js。tests/infra/test_edge_template.py が
+      # 一致を検査するので、直すときは .js 側を直してここへ貼り直す。
+      FunctionCode: !Sub
+        - |
+          // infra/edge/functions/edge-guard.js（正本。テンプレートの FunctionCode に !Sub でインライン展開する）
+          // 下の ALLOWED の文字列リテラルはプレースホルダ。テンプレート側ではこの 1 語だけを !Sub の変数参照
+          // （ドル記号 + 波括弧 + AllowedIps）に置き換え、第 2 要素の AllowedIps: !Join [',', !Ref AllowedIpAddresses]
+          // が値を埋める。このファイル自体に !Sub の変数参照記法を書いてはいけない（!Sub が解釈してしまう）。
+          var ALLOWED = '${AllowedIpsJoined}'.split(',').map(function (s) { return s.trim(); });
+
+          function ipToLong(ip) {
+            var p = ip.split('.');
+            if (p.length !== 4) { return -1; }
+            var n = 0;
+            for (var i = 0; i < 4; i++) {
+              if (!/^[0-9]{1,3}$/.test(p[i])) { return -1; }
+              var o = Number(p[i]);
+              if (o > 255) { return -1; }
+              n = n * 256 + o;
+            }
+            return n;
+          }
+
+          function isAllowed(ip) {
+            var addr = ipToLong(ip);
+            if (addr < 0) { return false; }
+            for (var i = 0; i < ALLOWED.length; i++) {
+              var parts = ALLOWED[i].split('/');
+              var base = ipToLong(parts[0]);
+              if (base < 0) { continue; }
+              var bits = 32;
+              if (parts.length > 1) {
+                if (!/^[0-9]{1,2}$/.test(parts[1])) { continue; }
+                bits = Number(parts[1]);
+                if (bits > 32) { continue; }
+              }
+              var block = Math.pow(2, 32 - bits);
+              if (Math.floor(addr / block) === Math.floor(base / block)) { return true; }
+            }
+            return false;
+          }
+
+          function handler(event) {
+            var ip = event.viewer ? event.viewer.ip : null;
+            if (typeof ip !== 'string' || !isAllowed(ip)) {
+              return {
+                statusCode: 403,
+                statusDescription: 'Forbidden',
+                headers: {
+                  'content-type': { value: 'application/json' },
+                  'cache-control': { value: 'no-store' }
+                },
+                body: { encoding: 'text', data: '{"ok":false,"error":{"code":"IP_FORBIDDEN"}}' }
+              };
+            }
+            var req = event.request;
+            if (!req.uri.startsWith('/api/') && !req.uri.includes('.')) {
+              req.uri = '/index.html';
+            }
+            return req;
+          }
+        - AllowedIpsJoined: !Join [',', !Ref AllowedIpAddresses]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: EdgeFunction
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName}-${Env}'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        IPV6Enabled: false
+        Aliases:
+          - !Ref SiteDomain
+        ViewerCertificate:
+          AcmCertificateArn: !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Logging:
+          Bucket: !Sub '${CloudFrontLogBucket}.s3.amazonaws.com'
+          IncludeCookies: false
+          Prefix: cloudfront/
+        Origins:
+          - Id: spa
+            DomainName: !GetAtt SpaBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt Oac.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - !If
+            - HasSaasABillingApi
+            - Id: api-saas-a-billing
+              DomainName: !Ref SaasABillingApiDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: x-origin-verify
+                  HeaderValue: !Ref OriginVerifySecret
+            - !Ref AWS::NoValue
+        DefaultCacheBehavior:
+          TargetOriginId: spa
+          ViewerProtocolPolicy: https-only
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03
+          Compress: true
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+        # アプリを足すときはここへ behavior を 1 本追加する。
+        # viewer-request の FunctionAssociations を必ず付ける（付け忘れるとその API だけ IP 制限を素通りする）。
+        CacheBehaviors: !If
+          - HasSaasABillingApi
+          - - PathPattern: /api/saas-a-billing/*
+              TargetOriginId: api-saas-a-billing
+              ViewerProtocolPolicy: https-only
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - PATCH
+                - POST
+                - DELETE
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              Compress: true
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Distribution
+
+  DnsRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      RecordSets:
+        - Name: !Ref SiteDomain
+          Type: A
+          AliasTarget:
+            HostedZoneId: Z2FDTNDATAQYW2
+            DNSName: !GetAtt Distribution.DomainName
+
+Outputs:
+  DistributionId:
+    Description: CloudFront ディストリビューション ID（キャッシュ無効化に使う）
+    Value: !Ref Distribution
+  DistributionDomainName:
+    Description: CloudFront のドメイン名
+    Value: !GetAtt Distribution.DomainName
+  SpaBucketName:
+    Description: SPA ビルド成果物の同期先バケット
+    Value: !Ref SpaBucket
+  SiteUrl:
+    Description: サイト URL
+    Value: !Sub 'https://${SiteDomain}'

@@ -1,0 +1,27 @@
+version = 0.1
+
+[default.build.parameters]
+use_container = true
+
+[default.deploy.parameters]
+stack_name = "example-backoffice-shared-dev"
+region = "ap-northeast-1"
+s3_bucket = "example-sam-ap-northeast-1"
+s3_prefix = "example-backoffice-shared-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+tags = "Project=example-backoffice App=shared Env=dev"
+parameter_overrides = "ProjectName=example-backoffice Env=dev SlackMode=bot"
+
+[production.build.parameters]
+use_container = true
+
+[production.deploy.parameters]
+stack_name = "example-backoffice-shared-prod"
+region = "ap-northeast-1"
+s3_bucket = "example-sam-ap-northeast-1"
+s3_prefix = "example-backoffice-shared-prod"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+tags = "Project=example-backoffice App=shared Env=prod"
+parameter_overrides = "ProjectName=example-backoffice Env=prod SlackMode=webhook"

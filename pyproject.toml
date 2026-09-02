@@ -1,0 +1,51 @@
+[project]
+name = "example-backoffice"
+version = "0.1.0"
+description = "社内保守管理サイト example-backoffice のバックエンド"
+requires-python = ">=3.12"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=6.0",
+    "moto[dynamodb,s3,sqs,ssm,ses,cognitoidp,stepfunctions]>=5.1",
+    "responses>=0.25",
+    "jsonschema>=4.23",
+    "boto3>=1.37.27",
+    "aws-lambda-powertools>=3.7",
+    "XlsxWriter>=3.2.9",
+    "openpyxl>=3.1.5",
+    "ruff>=0.9",
+    "pycognito>=2024.5",
+    "cfn-lint>=1.51.3",
+    "pyyaml>=6.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["shared/tests", "infra/core/tests", "tests/infra", "apps"]
+pythonpath = [
+    "shared/layers",
+    "infra/core/src",
+    "apps/saas-a-billing/functions",
+]
+addopts = "-ra --strict-markers --import-mode=importlib"
+filterwarnings = ["error::DeprecationWarning:example_backoffice.*"]
+
+[tool.coverage.run]
+branch = true
+omit = ["*/tests/*", "*/.venv/*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [".venv", ".aws-sam", "node_modules", "frontend", "*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "S", "C4", "SIM"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S105", "S106", "S311"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["example_backoffice"]

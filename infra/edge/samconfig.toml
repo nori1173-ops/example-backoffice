@@ -1,0 +1,21 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "example-backoffice-edge-dev"
+region = "ap-northeast-1"
+s3_bucket = "example-sam-ap-northeast-1"
+s3_prefix = "example-backoffice-edge-dev"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+tags = "Project=example-backoffice App=edge Env=dev"
+parameter_overrides = "ProjectName=example-backoffice Env=dev SiteDomain=backoffice-dev.example-cloud.com HostedZoneId=Z0EXAMPLEZONE0 AcmCertificateArn=arn:aws:acm:us-east-1:210000000001:certificate/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee AllowedIpAddresses=203.0.113.10/32"
+
+[production.deploy.parameters]
+stack_name = "example-backoffice-edge-prod"
+region = "ap-northeast-1"
+s3_bucket = "example-sam-ap-northeast-1"
+s3_prefix = "example-backoffice-edge-prod"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+tags = "Project=example-backoffice App=edge Env=prod"
+parameter_overrides = "ProjectName=example-backoffice Env=prod SiteDomain=backoffice.example-cloud.com HostedZoneId=Z0EXAMPLEZONE0 AcmCertificateArn=arn:aws:acm:us-east-1:210000000001:certificate/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee AllowedIpAddresses=203.0.113.10/32"

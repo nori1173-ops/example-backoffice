@@ -1,0 +1,787 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice app saas-a-billing - HTTP API / api・trigger・batch Lambda / Step Functions / DynamoDB
+
+# 前提: shared -> core の順にデプロイ済みであること（プラットフォーム設計 3.3）。
+# SSM 型パラメータの Default は dev のキー名。prod は samconfig の
+# [production.deploy.parameters] でキー名（値ではない）を上書きする（同 4.4）。
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  LogLevel:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Default: INFO
+  PortalUrl:
+    Type: String
+    Default: https://backoffice-dev.example-cloud.com/saas-a-billing
+    Description: 通知に載せるポータルの入口（設計 5.1）。prod は samconfig で上書きする
+  ExamplePowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86
+    Description: 社内レイヤ ExamplePowertoolsPython の ARN。LambdaLogger のために参照する
+  PowertoolsLayerArn:
+    Type: String
+    Description: AWS 提供の Powertools for AWS Lambda (Python) レイヤ ARN。samconfig で環境ごとに指定する
+  UserPoolIssuer:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/issuer
+    Description: JWT authorizer が検証する issuer（設計 5.4）
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/client-id
+    Description: JWT authorizer の audience（設計 5.4）
+  NotifyQueueUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-url
+    Description: 通知キュー URL。shared notify.send が環境変数 NOTIFY_QUEUE_URL から読む
+  NotifyQueueArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-arn
+    Description: 通知キュー ARN。sqs:SendMessage の Resource に使う
+  AttachmentsBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/attachments/bucket
+    Description: 添付バケット名。parts / xlsx / result.json の置き場
+  SharedLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/shared/layer-arn
+    Description: 共通レイヤ example_backoffice のバージョン付き ARN
+
+Conditions:
+  IsProd: !Equals [!Ref Env, prod]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    PropagateTags: true
+    Layers:
+      - !Ref SharedLayerArn
+      - !Ref ExamplePowertoolsLayerArn
+      - !Ref PowertoolsLayerArn
+    Environment:
+      Variables:
+        ENV: !Ref Env
+        APP_NAME: saas-a-billing
+        TABLE_NAME: !Ref DataTable
+        ATTACHMENTS_BUCKET: !Ref AttachmentsBucket
+        S3_PREFIX: saas-a-billing
+        NOTIFY_QUEUE_URL: !Ref NotifyQueueUrl
+        PORTAL_URL: !Ref PortalUrl
+        API_PREFIX: /api/saas-a-billing
+        SSM_PREFIX: !Sub /${ProjectName}/${Env}/apps/saas-a-billing
+        EXPORT_WINDOW_DAYS: "7"
+        TIME_BUDGET_MARGIN_SEC: "150"
+        POWERTOOLS_SERVICE_NAME: saas-a-billing
+        POWERTOOLS_METRICS_NAMESPACE: example-backoffice/saas-a-billing
+        LOG_LEVEL: !Ref LogLevel
+    Tags:
+      Project: !Ref ProjectName
+      Name: Function
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref UserPoolIssuer
+              audience:
+                - !Ref UserPoolClientId
+        DefaultAuthorizer: CognitoJwt
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","path":"$context.path","status":"$context.status","sub":"$context.authorizer.claims.sub","latency":"$context.responseLatency"}'
+      Tags:
+        Project: !Ref ProjectName
+        Name: Api
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${ProjectName}-saas-a-billing-${Env}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-api-${Env}
+      Description: 設定・単価・実行履歴・手動実行の HTTP API（設計 8 章）
+      CodeUri: functions/
+      Handler: api.app.handler
+      Timeout: 29
+      MemorySize: 512
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/saas-a-billing/{proxy+}
+            Method: ANY
+            PayloadFormatVersion: "2.0"
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt DataTable.Arn
+            - Sid: ReadOwnAttachments
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/saas-a-billing/*
+            # ListBucket が無いと存在しないキーの GetObject が 404 でなく AccessDenied になり、
+            # result.json 未生成の月を「未生成」と判定できない（設計 8 章の GET /runs/{month}?detail）
+            - Sid: LocateOwnAttachments
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            - Sid: StartOwnStateMachine
+              Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref StateMachine
+            - Sid: ReadOwnOriginVerifyAndSlackMode
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource:
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/*
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/mode
+            - Sid: DecryptSecureStringParameters
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  TriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-trigger-${Env}
+      Description: 締め日時と RUN 状態を判定してステートマシンを起動する（設計 6.2）
+      CodeUri: functions/
+      Handler: batch.handlers.trigger.handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 6 * * ? *)
+            ScheduleExpressionTimezone: Asia/Tokyo
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            DeadLetterConfig:
+              Arn: !GetAtt SchedulerDlq.Arn
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt TriggerFailureQueue.Arn
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DataTable.Arn
+            - Sid: StartOwnStateMachine
+              Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref StateMachine
+            - Sid: EnqueueNotifications
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Ref NotifyQueueArn
+
+  TriggerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TriggerFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  InitFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-init-${Env}
+      Description: RUN 取得・設定/単価解決・getToken・tenant/list（設計 6.3 の Init）
+      CodeUri: functions/
+      Handler: batch.handlers.init.handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DataTable.Arn
+            - Sid: AccessOwnAttachments
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/saas-a-billing/*
+            # ListBucket が無いと存在しないキーの GetObject が 404 でなく AccessDenied になり、
+            # parts / tenants.json / 前回 result の欠損を「欠損」として続行できない（設計 6.5）
+            - Sid: LocateOwnAttachments
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            - Sid: ReadTargetCredentials
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/*
+            - Sid: DecryptSecureStringParameters
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+
+  InitLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${InitFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  CollectTenantFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-collect-tenant-${Env}
+      Description: テナント 1 件の device/group/export 収集と parts の書き出し（設計 6.4）
+      CodeUri: functions/
+      Handler: batch.handlers.collect_tenant.handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DataTable.Arn
+            - Sid: AccessOwnAttachments
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/saas-a-billing/*
+            # ListBucket が無いと存在しないキーの GetObject が 404 でなく AccessDenied になり、
+            # parts / tenants.json / 前回 result の欠損を「欠損」として続行できない（設計 6.5）
+            - Sid: LocateOwnAttachments
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            - Sid: ReadTargetCredentials
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+                - ssm:GetParametersByPath
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/*
+            - Sid: DecryptSecureStringParameters
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+            - Sid: PublishOwnMetrics
+              Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: example-backoffice/saas-a-billing
+
+  CollectTenantLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${CollectTenantFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  AggregateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-aggregate-${Env}
+      Description: parts 集約・判定・Excel 生成・S3 保存・通知（設計 6.5-6.8）
+      CodeUri: functions/
+      Handler: batch.handlers.aggregate.handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DataTable.Arn
+            - Sid: AccessOwnAttachments
+              Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutObjectTagging
+                - s3:GetObject
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}/saas-a-billing/*
+            # ListBucket が無いと存在しないキーの GetObject が 404 でなく AccessDenied になり、
+            # parts / tenants.json / 前回 result の欠損を「欠損」として続行できない（設計 6.5）
+            - Sid: LocateOwnAttachments
+              Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub arn:aws:s3:::${AttachmentsBucket}
+            - Sid: EnqueueNotifications
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Ref NotifyQueueArn
+            - Sid: PublishOwnMetrics
+              Effect: Allow
+              Action: cloudwatch:PutMetricData
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  cloudwatch:namespace: example-backoffice/saas-a-billing
+
+  AggregateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AggregateFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  MarkFailedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-saas-a-billing-mark-failed-${Env}
+      Description: RUN を failed にしてエラー要約と失敗通知を出す（設計 6.3 の MarkFailed）
+      CodeUri: functions/
+      Handler: batch.handlers.mark_failed.handler
+      Timeout: 900
+      MemorySize: 1024
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AccessOwnTable
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DataTable.Arn
+            - Sid: EnqueueNotifications
+              Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Ref NotifyQueueArn
+
+  MarkFailedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${MarkFailedFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  StateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${ProjectName}-saas-a-billing-run-${Env}
+      Type: STANDARD
+      DefinitionUri: statemachine/run.asl.json
+      DefinitionSubstitutions:
+        InitFunctionArn: !GetAtt InitFunction.Arn
+        CollectTenantFunctionArn: !GetAtt CollectTenantFunction.Arn
+        AggregateFunctionArn: !GetAtt AggregateFunction.Arn
+        MarkFailedFunctionArn: !GetAtt MarkFailedFunction.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: InvokeOwnTasks
+              Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource:
+                - !GetAtt InitFunction.Arn
+                - !GetAtt CollectTenantFunction.Arn
+                - !GetAtt AggregateFunction.Arn
+                - !GetAtt MarkFailedFunction.Arn
+            - Sid: DeliverExecutionLogs
+              Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: "*"
+      Tags:
+        Project: !Ref ProjectName
+        Name: StateMachine
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${ProjectName}-saas-a-billing-run-${Env}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${ProjectName}-saas-a-billing-data-${Env}
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      DeletionProtectionEnabled: !If [IsProd, true, false]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Table
+
+  SchedulerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-saas-a-billing-scheduler-dlq-${Env}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Queue
+
+  TriggerFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-saas-a-billing-trigger-failure-${Env}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Queue
+
+  ApiDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/apps/saas-a-billing/api-domain
+      Type: String
+      Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+      Description: HTTP API のドメイン。edge が origin の DomainName として読む（設計 5.4）
+
+  # 業務上の失敗は MarkFailed（End: true）が吸収するため ExecutionsFailed は上がらない。
+  # ここで拾えるのは実行タイムアウト・States.Runtime・MarkFailed 自体の失敗（設計 6.3 / 14.2）。
+  StateMachineFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-saas-a-billing-state-machine-failed-${Env}
+      AlarmDescription: saas-a-billing-run が MarkFailed を通らずに異常終了した。実行履歴で失敗ステートを特定する
+      Metrics:
+        - Id: failed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsFailed
+              Dimensions:
+                - Name: StateMachineArn
+                  Value: !Ref StateMachine
+            Period: 86400
+            Stat: Sum
+        - Id: timedout
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/States
+              MetricName: ExecutionsTimedOut
+              Dimensions:
+                - Name: StateMachineArn
+                  Value: !Ref StateMachine
+            Period: 86400
+            Stat: Sum
+        - Id: abnormal
+          Expression: failed + timedout
+          Label: ExecutionsFailed + ExecutionsTimedOut
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Alarm
+
+  # 口座内の全 Lambda を巻き込まないよう、自スタックの 6 関数だけを合算する。
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-saas-a-billing-lambda-errors-${Env}
+      AlarmDescription: saas-a-billing のいずれかの Lambda が失敗した（タイムアウトも Errors に計上される）
+      Metrics:
+        - Id: api
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref ApiFunction
+            Period: 86400
+            Stat: Sum
+        - Id: trigger
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref TriggerFunction
+            Period: 86400
+            Stat: Sum
+        - Id: init
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref InitFunction
+            Period: 86400
+            Stat: Sum
+        - Id: collect
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref CollectTenantFunction
+            Period: 86400
+            Stat: Sum
+        - Id: aggregate
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref AggregateFunction
+            Period: 86400
+            Stat: Sum
+        - Id: markfailed
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref MarkFailedFunction
+            Period: 86400
+            Stat: Sum
+        - Id: errors
+          Expression: api + trigger + init + collect + aggregate + markfailed
+          Label: saas-a-billing Lambda Errors
+          ReturnData: true
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Alarm
+
+  SchedulerDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-saas-a-billing-scheduler-dlq-${Env}
+      AlarmDescription: Scheduler が trigger の Invoke に失敗して DLQ に溜まった。権限とスロットルを確認する
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SchedulerDlq.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Alarm
+
+  TriggerFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-saas-a-billing-trigger-failure-${Env}
+      AlarmDescription: trigger の非同期実行が未処理例外で終わった。翌日 06:00 の再評価までに原因を確認する
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt TriggerFailureQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: Alarm
+
+Outputs:
+  ApiDomain:
+    Description: HTTP API のドメイン（edge の origin DomainName）
+    Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  DataTableName:
+    Description: アプリの単一テーブル名
+    Value: !Ref DataTable
+  StateMachineArn:
+    Description: 月次課金集計のステートマシン ARN
+    Value: !Ref StateMachine

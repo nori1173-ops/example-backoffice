@@ -1,0 +1,2 @@
+# 依存はレイヤ（shared / Powertools / ExamplePowertoolsPython）で供給する。
+# このアプリだけで使うライブラリがあればここに追記する（バージョンを固定すること）。

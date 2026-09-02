@@ -1,0 +1,14 @@
+{
+  "userInfo": {
+    "user_id": "00000000-0000-0000-0000-000000000001",
+    "user_cd": "billing-bot",
+    "user_name": "課金集計ボット",
+    "authority": "system_admin"
+  },
+  "token_info": {
+    "token_type": "Bearer",
+    "access_token": "dummy-access-token",
+    "refresh_token": "dummy-refresh-token",
+    "expires_at": "2026-08-21 08:48:25"
+  }
+}

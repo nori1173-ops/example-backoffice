@@ -1,0 +1,733 @@
+"""DynamoDB アクセス（設計 7.1 のアイテム種別・アクセスパターン、6.9 の条件式）。
+
+単一テーブル（`PK` / `SK`）に SETTINGS / PRICE / RUN / AUDIT の 4 種別を置く。
+低レベルの `client("dynamodb")` を使い、`to_python` / `to_dynamo` で属性値の型と
+Python の型を相互変換する。DynamoDB の数値は `Decimal` で返るため、整数は `int`
+に戻してから呼び出し側へ渡す（金額・件数を float にしない）。
+
+RUN の状態遷移は設計 6.9 の表どおり条件付き書き込みで守る。条件が成立しなかった
+場合、`acquire_run` は `RunAcquisitionError` に翻訳し、それ以外の更新は botocore の
+`ConditionalCheckFailedException` をそのまま送出する（ステートマシンの Catch が
+`MarkFailed` へ運ぶ）。
+
+式の属性名は必ずプレースホルダ経由で書く（`status` / `version` / `error` などは
+DynamoDB の予約語）。SET する値は `:{属性名}`、条件で使う値は `:cond_*` を使い、
+両者が衝突しないようにする。
+"""
+
+import os
+import uuid
+from datetime import date, datetime
+from decimal import Decimal
+
+import boto3
+from boto3.dynamodb.types import TypeDeserializer, TypeSerializer
+from botocore.exceptions import ClientError
+
+from saas_a_billing.messages import DEFAULT_SLACK_TEMPLATE
+from saas_a_billing.period import JST
+from saas_a_billing.pricing import PriceTableNotFoundError, default_price_table_item
+
+SETTINGS_PK = "SETTINGS"
+SETTINGS_SK = "current"
+PRICE_PK = "PRICE"
+PRICE_SK_PREFIX = "EFFECTIVE#"
+AUDIT_PK = "AUDIT"
+RUN_PK_PREFIX = "RUN#"
+KEY_ATTRIBUTES = ("PK", "SK")
+
+TARGET_ENVS = ("verification", "production")
+DEFAULT_PRICE_EFFECTIVE_FROM = "2025-09-01"
+RUN_LIST_LIMIT = 24
+AUDIT_LIST_LIMIT = 50
+SYSTEM_ACTOR = "system"
+
+QUEUED = "queued"
+RUNNING = "running"
+SUCCEEDED = "succeeded"
+FAILED = "failed"
+DISTRIBUTED = "distributed"
+ACTIVE_STATUSES = (QUEUED, RUNNING)
+DONE_STATUSES = (SUCCEEDED, DISTRIBUTED)
+
+TOKEN_ATTRIBUTES = ("api_token", "token_expires_at")
+PREVIOUS_ATTEMPT_ATTRIBUTES = ("error", "finished_at", "execution_arn", "summary", *TOKEN_ATTRIBUTES)
+DISTRIBUTION_TOGGLES = ("mail_enabled", "slack_enabled")
+
+ALREADY_RUNNING = "ALREADY_RUNNING"
+ALREADY_SUCCEEDED = "ALREADY_SUCCEEDED"
+
+CONDITION_FAILED = "ConditionalCheckFailedException"
+TRANSACTION_CANCELED = "TransactionCanceledException"
+
+_SERIALIZER = TypeSerializer()
+_DESERIALIZER = TypeDeserializer()
+_client_cache = None
+
+
+class VersionConflictError(Exception):
+    """`SETTINGS#current` の楽観ロック（`version`）が一致しない。"""
+
+
+class AlreadyExistsError(Exception):
+    """同じ `effective_from` の単価表の版が既にある。"""
+
+
+class RunAcquisitionError(Exception):
+    """RUN を取得できない。`reason` は `ALREADY_RUNNING` / `ALREADY_SUCCEEDED`。"""
+
+    def __init__(self, reason: str):
+        super().__init__(f"RUN を取得できません: {reason}")
+        self.reason = reason
+
+
+def reset_clients() -> None:
+    """boto3 クライアントのキャッシュを捨てる（moto の `mock_aws` 用）。"""
+    global _client_cache
+    _client_cache = None
+
+
+def _client():
+    global _client_cache
+    if _client_cache is None:
+        _client_cache = boto3.client("dynamodb")
+    return _client_cache
+
+
+def _table_name() -> str:
+    return os.environ["TABLE_NAME"]
+
+
+def to_dynamo(value) -> dict:
+    """Python の値を属性値へ変換する。`float` は `Decimal` を経由する。"""
+    return _SERIALIZER.serialize(_for_dynamo(value))
+
+
+def to_python(item: dict) -> dict:
+    """属性値のアイテムを Python の dict へ変換する。整数の `Decimal` は `int` に戻す。"""
+    return {name: _for_python(_DESERIALIZER.deserialize(value)) for name, value in item.items()}
+
+
+def _for_dynamo(value):
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {name: _for_dynamo(item) for name, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_for_dynamo(item) for item in value]
+    return value
+
+
+def _for_python(value):
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, dict):
+        return {name: _for_python(item) for name, item in value.items()}
+    if isinstance(value, list):
+        return [_for_python(item) for item in value]
+    return value
+
+
+def _item(values: dict) -> dict:
+    return {name: to_dynamo(value) for name, value in values.items()}
+
+
+def _without_keys(values: dict) -> dict:
+    return {name: value for name, value in values.items() if name not in KEY_ATTRIBUTES}
+
+
+def _values(item: dict, **extra) -> dict:
+    values = _without_keys(to_python(item))
+    values.update(extra)
+    return values
+
+
+def _code(error: ClientError) -> str:
+    return error.response["Error"]["Code"]
+
+
+def _as_jst(value: datetime) -> datetime:
+    return value.replace(tzinfo=JST) if value.tzinfo is None else value.astimezone(JST)
+
+
+def _iso(value: datetime) -> str:
+    return _as_jst(value).isoformat()
+
+
+def _now() -> datetime:
+    return datetime.now(JST)
+
+
+def _settings_key() -> dict:
+    return {"PK": {"S": SETTINGS_PK}, "SK": {"S": SETTINGS_SK}}
+
+
+def _price_key(effective_from: str) -> dict:
+    return {"PK": {"S": PRICE_PK}, "SK": {"S": f"{PRICE_SK_PREFIX}{effective_from}"}}
+
+
+def _run_key(target_env: str, month: str) -> dict:
+    return {"PK": {"S": f"{RUN_PK_PREFIX}{target_env}"}, "SK": {"S": month}}
+
+
+def _names(*attributes: str) -> dict:
+    return {f"#{name}": name for name in attributes}
+
+
+def _set_expression(values: dict) -> tuple[str, dict, dict]:
+    names = _names(*values)
+    attribute_values = {f":{name}": to_dynamo(value) for name, value in values.items()}
+    expression = "SET " + ", ".join(f"#{name} = :{name}" for name in values)
+    return expression, names, attribute_values
+
+
+def _query(key_condition: str, names: dict, values: dict, *, limit: int | None = None) -> list[dict]:
+    """`ScanIndexForward=False` の Query。`limit` 件に達するまでページを辿る。"""
+    if limit is not None and limit <= 0:
+        return []
+    items: list[dict] = []
+    start_key = None
+    while True:
+        request = {
+            "TableName": _table_name(),
+            "KeyConditionExpression": key_condition,
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values,
+            "ScanIndexForward": False,
+        }
+        if limit is not None:
+            request["Limit"] = limit - len(items)
+        if start_key is not None:
+            request["ExclusiveStartKey"] = start_key
+        response = _client().query(**request)
+        items.extend(response["Items"])
+        start_key = response.get("LastEvaluatedKey")
+        if start_key is None or (limit is not None and len(items) >= limit):
+            break
+    return items[:limit] if limit is not None else items
+
+
+def _audit_item(target: str, actor: str, actor_email: str, before: dict, after: dict, at: str) -> dict:
+    values = {
+        "target": target,
+        "actor": actor,
+        "actor_email": actor_email,
+        "before": before,
+        "after": after,
+        "at": at,
+    }
+    return {**_item(values), "PK": {"S": AUDIT_PK}, "SK": {"S": f"{at}#{uuid.uuid4()}"}}
+
+
+def _default_settings(actor: str, now: datetime) -> dict:
+    """設計 3.3 の既定値。`slack_channel_id` は空、`auto_run_enabled` と配布トグルは False。"""
+    return {
+        "target_env": "verification",
+        "cutoff_day": 20,
+        "cutoff_time": "24:00",
+        "auto_retry_days": 5,
+        "auto_run_enabled": False,
+        "auto_run_from_month": _as_jst(now).strftime("%Y-%m"),
+        "mail_enabled": False,
+        "slack_enabled": False,
+        "mail_to": ["devA@example.co.jp"],
+        "mail_cc": [],
+        "slack_channel_id": "",
+        "slack_channel_label": "#proj-saas-a-billing",
+        "slack_mention": "",
+        "slack_template": DEFAULT_SLACK_TEMPLATE,
+        "exclude_keywords": ["デモ"],
+        "camera_format_names": [],
+        "version": 0,
+        "updated_at": _iso(now),
+        "updated_by": actor,
+        "updated_by_email": "",
+    }
+
+
+def _with_distribution_toggles(settings: dict) -> dict:
+    """配布トグルを持たない保存済みの設定でも、両キーが必ず含まれるよう False で補う。"""
+    return {**dict.fromkeys(DISTRIBUTION_TOGGLES, False), **settings}
+
+
+def get_settings() -> dict:
+    """`SETTINGS#current` を返す。未作成なら既定値を `version = 0` で seed する。"""
+    item = _client().get_item(TableName=_table_name(), Key=_settings_key()).get("Item")
+    if item is not None:
+        return _with_distribution_toggles(_values(item))
+    return _with_distribution_toggles(_seed_settings(SYSTEM_ACTOR))
+
+
+def _seed_settings(actor: str) -> dict:
+    settings = _default_settings(actor, _now())
+    try:
+        _client().put_item(
+            TableName=_table_name(),
+            Item={**_item(settings), **_settings_key()},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+    except ClientError as error:
+        if _code(error) != CONDITION_FAILED:
+            raise
+        response = _client().get_item(TableName=_table_name(), Key=_settings_key(), ConsistentRead=True)
+        return _values(response["Item"])
+    return settings
+
+
+def put_settings(new: dict, expected_version: int, actor: str, actor_email: str) -> dict:
+    """設定を更新し監査を残す。`version` 不一致は `VersionConflictError`。"""
+    current = get_settings()
+    now = _now()
+    managed = ("version", "updated_at", "updated_by", "updated_by_email")
+    changes = {name: value for name, value in _without_keys(new).items() if name not in managed}
+    updates = {
+        **changes,
+        "version": expected_version + 1,
+        "updated_at": _iso(now),
+        "updated_by": actor,
+        "updated_by_email": actor_email,
+    }
+    stored = {**current, **updates}
+    expression, names, values = _set_expression(updates)
+    values[":cond_version"] = to_dynamo(expected_version)
+    try:
+        _client().transact_write_items(
+            TransactItems=[
+                {
+                    "Update": {
+                        "TableName": _table_name(),
+                        "Key": _settings_key(),
+                        "UpdateExpression": expression,
+                        "ConditionExpression": "#version = :cond_version",
+                        "ExpressionAttributeNames": names,
+                        "ExpressionAttributeValues": values,
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": _table_name(),
+                        "Item": _audit_item("settings", actor, actor_email, current, stored, _iso(now)),
+                    }
+                },
+            ]
+        )
+    except ClientError as error:
+        if _code(error) != TRANSACTION_CANCELED:
+            raise
+        raise VersionConflictError(f"設定の version が一致しません（期待 {expected_version}）") from error
+    return stored
+
+
+def _query_prices(limit: int | None = None) -> list[dict]:
+    return _query("#pk = :pk", {"#pk": "PK"}, {":pk": to_dynamo(PRICE_PK)}, limit=limit)
+
+
+def _ensure_prices_seeded() -> None:
+    """1 版も無ければ既定値（設計 2.3 / support-tracker #2001）を作る。登録済みなら触らない。"""
+    if not _query_prices(limit=1):
+        seed_defaults()
+
+
+def list_prices() -> list[dict]:
+    """単価表の版を `effective_from` 降順で返す。1 版も無ければ既定値をシードする。"""
+    _ensure_prices_seeded()
+    return [_values(item) for item in _query_prices()]
+
+
+def get_price_table_at(as_of: date) -> dict:
+    """`as_of` 時点で有効な最新の版（同日の版は有効）。無ければ `PriceTableNotFoundError`。
+
+    1 版も無いときは既定値をシードしてから解決する（誰かが版を登録済みなら尊重し、
+    `as_of` より未来の版しか無い場合は従来どおり失敗させる）。
+    """
+    _ensure_prices_seeded()
+    items = _query(
+        "#pk = :pk AND #sk <= :sk",
+        {"#pk": "PK", "#sk": "SK"},
+        {":pk": to_dynamo(PRICE_PK), ":sk": to_dynamo(f"{PRICE_SK_PREFIX}{as_of.isoformat()}")},
+        limit=1,
+    )
+    if not items:
+        raise PriceTableNotFoundError(f"{as_of.isoformat()} 時点で有効な単価表の版がありません")
+    return _values(items[0])
+
+
+def put_price(item: dict, actor: str, actor_email: str) -> dict:
+    """単価表の版を追加し監査を残す。同じ `effective_from` があれば `AlreadyExistsError`。"""
+    now = _now()
+    values = _without_keys(item)
+    stored = {
+        **values,
+        "created_at": _iso(now),
+        "created_by": actor,
+        "created_by_email": actor_email,
+    }
+    try:
+        _client().transact_write_items(
+            TransactItems=[
+                {
+                    "Put": {
+                        "TableName": _table_name(),
+                        "Item": {**_item(stored), **_price_key(stored["effective_from"])},
+                        "ConditionExpression": "attribute_not_exists(SK)",
+                    }
+                },
+                {
+                    "Put": {
+                        "TableName": _table_name(),
+                        "Item": _audit_item("price", actor, actor_email, {}, stored, _iso(now)),
+                    }
+                },
+            ]
+        )
+    except ClientError as error:
+        if _code(error) != TRANSACTION_CANCELED:
+            raise
+        raise AlreadyExistsError(f"{stored['effective_from']} の単価表の版は既にあります") from error
+    return stored
+
+
+def seed_defaults(actor: str = SYSTEM_ACTOR) -> None:
+    """設定と既定の単価表（設計 2.3 / support-tracker #2001）を無ければ作る。"""
+    _seed_settings(actor)
+    now = _now()
+    stored = {
+        **default_price_table_item(DEFAULT_PRICE_EFFECTIVE_FROM),
+        "created_at": _iso(now),
+        "created_by": actor,
+        "created_by_email": "",
+    }
+    try:
+        _client().put_item(
+            TableName=_table_name(),
+            Item={**_item(stored), **_price_key(DEFAULT_PRICE_EFFECTIVE_FROM)},
+            ConditionExpression="attribute_not_exists(SK)",
+        )
+    except ClientError as error:
+        if _code(error) != CONDITION_FAILED:
+            raise
+
+
+def get_run(target_env: str, month: str) -> dict | None:
+    """`RUN#{target_env}/{month}` を返す。無ければ `None`。"""
+    item = _client().get_item(TableName=_table_name(), Key=_run_key(target_env, month)).get("Item")
+    return None if item is None else _values(item, month=month)
+
+
+def list_runs(target_env: str | None = None, limit: int = RUN_LIST_LIMIT) -> list[dict]:
+    """実行履歴を月降順で返す。`target_env` 省略時は両環境をマージする。"""
+    if target_env is not None:
+        return _list_runs_of(target_env, limit)
+    runs = [run for env in TARGET_ENVS for run in _list_runs_of(env, limit)]
+    runs.sort(key=lambda run: (run["month"], run["target_env"]), reverse=True)
+    return runs[:limit]
+
+
+def _list_runs_of(target_env: str, limit: int) -> list[dict]:
+    items = _query(
+        "#pk = :pk",
+        {"#pk": "PK"},
+        {":pk": to_dynamo(f"{RUN_PK_PREFIX}{target_env}")},
+        limit=limit,
+    )
+    return [_values(item, month=item["SK"]["S"]) for item in items]
+
+
+def acquire_run(
+    target_env: str,
+    month: str,
+    *,
+    trigger: str,
+    force: bool,
+    run_token: str,
+    requested_by: str | None = None,
+    requested_by_email: str | None = None,
+    distribute: bool = True,
+    stale_before: datetime,
+) -> dict:
+    """設計 6.9 の 3 パターンで RUN を `queued` として取得する。取得不可は `RunAcquisitionError`。
+
+    再取得では前回 attempt の残留属性（`PREVIOUS_ATTEMPT_ATTRIBUTES`）を REMOVE する。
+    特に `api_token` を新しい attempt へ持ち越さない。
+    """
+    scheduled = trigger == "scheduled"
+    values = {
+        "target_env": target_env,
+        "status": QUEUED,
+        "trigger": trigger,
+        "run_token": run_token,
+        "requested_by": requested_by,
+        "requested_by_email": requested_by_email,
+        "distribute": bool(distribute),
+        "force": bool(force),
+        "started_at": _iso(_now()),
+        "retry_alert_sent": False,
+    }
+    created = {**values, "attempt": 1, "auto_attempts": 1 if scheduled else 0}
+    try:
+        _client().put_item(
+            TableName=_table_name(),
+            Item={**_item(created), **_run_key(target_env, month)},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+    except ClientError as error:
+        if _code(error) != CONDITION_FAILED:
+            raise
+    else:
+        return {**created, "month": month}
+    return _reacquire_run(target_env, month, values, scheduled=scheduled, force=force, stale_before=stale_before)
+
+
+def _reacquire_run(
+    target_env: str,
+    month: str,
+    values: dict,
+    *,
+    scheduled: bool,
+    force: bool,
+    stale_before: datetime,
+) -> dict:
+    expression, names, attribute_values = _set_expression(values)
+    counters = ["#attempt = if_not_exists(#attempt, :cond_zero) + :cond_one"]
+    names.update(_names("attempt"))
+    attribute_values[":cond_zero"] = to_dynamo(0)
+    attribute_values[":cond_one"] = to_dynamo(1)
+    if scheduled:
+        counters.append("#auto_attempts = if_not_exists(#auto_attempts, :cond_zero) + :cond_one")
+        names.update(_names("auto_attempts"))
+    names.update(_names(*PREVIOUS_ATTEMPT_ATTRIBUTES))
+    removes = ", ".join(f"#{name}" for name in PREVIOUS_ATTEMPT_ATTRIBUTES)
+    request = {
+        "TableName": _table_name(),
+        "Key": _run_key(target_env, month),
+        "UpdateExpression": f"{expression}, {', '.join(counters)} REMOVE {removes}",
+        "ExpressionAttributeNames": names,
+        "ExpressionAttributeValues": attribute_values,
+        "ReturnValues": "ALL_NEW",
+    }
+    if not force:
+        names.update(_names("started_at"))
+        attribute_values[":cond_failed"] = to_dynamo(FAILED)
+        attribute_values[":cond_queued"] = to_dynamo(QUEUED)
+        attribute_values[":cond_running"] = to_dynamo(RUNNING)
+        attribute_values[":cond_stale"] = to_dynamo(_iso(stale_before))
+        request["ConditionExpression"] = (
+            "#status = :cond_failed OR (#status IN (:cond_queued, :cond_running) AND #started_at < :cond_stale)"
+        )
+    try:
+        response = _client().update_item(**request)
+    except ClientError as error:
+        if _code(error) != CONDITION_FAILED:
+            raise
+        raise RunAcquisitionError(_acquisition_reason(target_env, month)) from error
+    return _values(response["Attributes"], month=month)
+
+
+def _acquisition_reason(target_env: str, month: str) -> str:
+    run = get_run(target_env, month) or {}
+    return ALREADY_SUCCEEDED if run.get("status") in DONE_STATUSES else ALREADY_RUNNING
+
+
+def _attempt_condition(attempt: int, status: str | None = None) -> tuple[str, dict, dict]:
+    names = _names("attempt")
+    values = {":cond_attempt": to_dynamo(attempt)}
+    condition = "#attempt = :cond_attempt"
+    if status is not None:
+        names.update(_names("status"))
+        values[":cond_status"] = to_dynamo(status)
+        condition = f"#status = :cond_status AND {condition}"
+    return condition, names, values
+
+
+def _update_run(
+    target_env: str,
+    month: str,
+    values: dict,
+    condition: tuple[str, dict, dict],
+    *,
+    removes: tuple[str, ...] = (),
+    adds: dict | None = None,
+) -> None:
+    expression, names, attribute_values = _set_expression(values) if values else ("", {}, {})
+    if adds:
+        names.update(_names(*adds))
+        attribute_values.update({f":{name}": to_dynamo(value) for name, value in adds.items()})
+        expression = f"{expression} ADD " + ", ".join(f"#{name} :{name}" for name in adds)
+    if removes:
+        names.update(_names(*removes))
+        expression = f"{expression} REMOVE " + ", ".join(f"#{name}" for name in removes)
+    condition_expression, condition_names, condition_values = condition
+    names.update(condition_names)
+    attribute_values.update(condition_values)
+    request = {
+        "TableName": _table_name(),
+        "Key": _run_key(target_env, month),
+        "UpdateExpression": expression.strip(),
+        "ExpressionAttributeNames": names,
+        "ConditionExpression": condition_expression,
+    }
+    if attribute_values:
+        request["ExpressionAttributeValues"] = attribute_values
+    _client().update_item(**request)
+
+
+def start_run(target_env: str, month: str, attempt: int, run_token: str) -> None:
+    """`queued` → `running`。取得時のトークンと試行が一致する場合だけ書ける。"""
+    condition, names, values = _attempt_condition(attempt, QUEUED)
+    names.update(_names("run_token"))
+    values[":cond_run_token"] = to_dynamo(run_token)
+    _update_run(
+        target_env,
+        month,
+        {"status": RUNNING},
+        (f"{condition} AND #run_token = :cond_run_token", names, values),
+    )
+
+
+def set_execution_arn(target_env: str, month: str, attempt: int, execution_arn: str) -> None:
+    """実行 ARN を記録する。条件は試行の一致のみ（`Init` が状態遷移の直後に書く）。"""
+    _update_run(target_env, month, {"execution_arn": execution_arn}, _attempt_condition(attempt))
+
+
+def set_saasa_host(target_env: str, month: str, attempt: int, saasa_host: str) -> None:
+    """集計に使った SaaS_A のホスト名を記録する（設計 7.1 の `saasa_host`）。"""
+    _update_run(target_env, month, {"saasa_host": saasa_host}, _attempt_condition(attempt))
+
+
+def set_token(target_env: str, month: str, attempt: int, token: str, expires_at: str) -> None:
+    """SaaS_A のアクセストークンを RUN の属性として保持する（KMS SSE で保管時暗号化）。"""
+    _update_run(
+        target_env,
+        month,
+        {"api_token": token, "token_expires_at": expires_at},
+        _attempt_condition(attempt, RUNNING),
+    )
+
+
+def clear_token(target_env: str, month: str, attempt: int) -> None:
+    """アクセストークンを RUN から消す。"""
+    _update_run(
+        target_env,
+        month,
+        {},
+        _attempt_condition(attempt, RUNNING),
+        removes=TOKEN_ATTRIBUTES,
+    )
+
+
+def set_progress(target_env: str, month: str, attempt: int, tenants_total: int, tenants_done: int) -> None:
+    """テナントの進捗を絶対値で記録する（`Init` が総数を置くときに使う）。"""
+    _update_run(
+        target_env,
+        month,
+        {"tenants_total": tenants_total, "tenants_done": tenants_done},
+        _attempt_condition(attempt, RUNNING),
+    )
+
+
+def increment_tenants_done(target_env: str, month: str, attempt: int) -> None:
+    """終わったテナントを 1 件進める。`ADD` の原子的インクリメントで並行更新でも落ちない。"""
+    _update_run(
+        target_env,
+        month,
+        {},
+        _attempt_condition(attempt, RUNNING),
+        adds={"tenants_done": 1},
+    )
+
+
+def finish_success(
+    target_env: str,
+    month: str,
+    attempt: int,
+    *,
+    summary: dict,
+    s3_xlsx_key: str,
+    s3_result_key: str,
+    closing_period: dict,
+    price_effective_from: str,
+    metrics: dict,
+) -> None:
+    """`running` → `succeeded`。成果物のキーと集計サマリを記録し、トークンを消す。"""
+    _update_run(
+        target_env,
+        month,
+        {
+            "status": SUCCEEDED,
+            "finished_at": _iso(_now()),
+            "summary": summary,
+            "s3_xlsx_key": s3_xlsx_key,
+            "s3_result_key": s3_result_key,
+            "closing_period": closing_period,
+            "price_effective_from": price_effective_from,
+            "metrics": metrics,
+        },
+        _attempt_condition(attempt, RUNNING),
+        removes=TOKEN_ATTRIBUTES,
+    )
+
+
+def finish_distributed(
+    target_env: str,
+    month: str,
+    attempt: int,
+    *,
+    notify_message_id: str,
+    notify_channels: list[str],
+    distribute_note: str,
+) -> None:
+    """`succeeded` → `distributed`。共通 notify への投函結果を記録する。"""
+    _update_run(
+        target_env,
+        month,
+        {
+            "status": DISTRIBUTED,
+            "notified_at": _iso(_now()),
+            "notify_message_id": notify_message_id,
+            "notify_channels": notify_channels,
+            "distribute_note": distribute_note,
+        },
+        _attempt_condition(attempt, SUCCEEDED),
+    )
+
+
+def set_distribute_note(target_env: str, month: str, attempt: int, note: str) -> None:
+    """配布しなかった理由を記録する。状態は `succeeded` のままにする（設計 6.8）。"""
+    _update_run(target_env, month, {"distribute_note": note}, _attempt_condition(attempt, SUCCEEDED))
+
+
+def set_notify_error(target_env: str, month: str, attempt: int, error: str) -> None:
+    """通知の投函に失敗したことを記録する。状態は `succeeded` のままにする（設計 11.1）。"""
+    _update_run(target_env, month, {"error": error}, _attempt_condition(attempt, SUCCEEDED))
+
+
+def finish_failed(target_env: str, month: str, attempt: int, error: str) -> None:
+    """`failed` にする。状態は見ず、試行の一致だけを条件にする。トークンは消す。"""
+    _update_run(
+        target_env,
+        month,
+        {"status": FAILED, "finished_at": _iso(_now()), "error": error},
+        _attempt_condition(attempt),
+        removes=TOKEN_ATTRIBUTES,
+    )
+
+
+def mark_retry_alert_sent(target_env: str, month: str) -> None:
+    """自動再実行の上限到達アラームを送ったことを記録する（二重送信の防止）。"""
+    _update_run(target_env, month, {"retry_alert_sent": True}, ("attribute_exists(PK)", {}, {}))
+
+
+def list_audits(limit: int = AUDIT_LIST_LIMIT) -> list[dict]:
+    """監査アイテムを新しい順に最大 `limit` 件返す。"""
+    items = _query("#pk = :pk", {"#pk": "PK"}, {":pk": to_dynamo(AUDIT_PK)}, limit=limit)
+    return [_values(item) for item in items]
+
+
+def is_stale(run: dict, now: datetime) -> bool:
+    """`queued` / `running` のまま `started_at` が前日以前なら奪取してよい（設計 6.2）。"""
+    if run.get("status") not in ACTIVE_STATUSES:
+        return False
+    started_at = run.get("started_at")
+    if not started_at:
+        return False
+    return _as_jst(datetime.fromisoformat(started_at)).date() < _as_jst(now).date()

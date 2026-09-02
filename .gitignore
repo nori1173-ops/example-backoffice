@@ -1,0 +1,46 @@
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# AWS SAM
+.aws-sam/
+
+# Auto-generated frontend config (from CloudFormation Outputs)
+frontend/src/amplifyconfiguration.ts
+frontend/src/aws-exports.*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Tooling / OS
+.playwright-mcp/
+playwright-report/
+test-results/
+frontend/e2e/.auth/
+.DS_Store
+Thumbs.db
+.idea/
+*.log
+
+# SAM build artifacts
+packaged.yaml
+samconfig.local.toml
+
+# Office lock files
+~$*
