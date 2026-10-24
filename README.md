@@ -8,6 +8,17 @@
 - スタック間の契約は SSM Parameter Store `/example-backoffice/{env}/...`。ID や ARN を人がコピーしない。
 - アプリは `apps/{app}`（独立 SAM スタック）と `frontend/src/apps/{app}`（マニフェスト）を足すだけで追加できる。
 
+## 見どころ: AWS日次セキュリティレポート（`daily-security-report`）
+
+AWS アカウント全体（GuardDuty・CloudTrail・CloudWatch・WAF・Logs Insights）を毎朝集計し、Amazon Bedrock の Claude が 3 段階（重大・警告・異常なし）で判定して Slack とメールに届ける。
+
+- 設計から本番稼働まで 2 日（v1）。翌日に AI 判定を加えた v2、所見の追跡性を足した v2.1、S3 区分の v2.2 と、毎朝のレポートで出た誤検知を直しながら育てている
+- 通知には判定と該当項目だけを載せ、証拠（時刻・ログの場所・コンソールへのリンク・判定の根拠）は詳細画面に分離。管理者は詳細画面から元のログ（Logs Insights / CloudTrail / GuardDuty）をその場で引ける
+- 長く使われていない権限の利用・初見の操作主体・他アカウントからのアクセスを検出し、週次で認証情報を棚卸しする
+- 費用は実測で見積もり直し、費用対効果の低い監視を CloudWatch 指標による翌朝の検知に置き換えた
+- AI 駆動開発: 設計・レビュー・監査は開発者本人、実装は AI エージェント（Codex・Claude）。pytest 1,100 件超
+- 設計書: [Documents/apps/daily-security-report/DESIGN.md](Documents/apps/daily-security-report/DESIGN.md) ／ 料金見積: [COST-ESTIMATE.md](Documents/apps/daily-security-report/COST-ESTIMATE.md)
+
 ## ディレクトリ構成
 
 ```text
