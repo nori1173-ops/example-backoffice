@@ -23,6 +23,16 @@ Parameters:
       - production
     Default: verification
     Description: 集計対象の SaaS_A 環境。サイトごとに固定し、画面や実行入力では変えられない（設計 3.3）
+  ScheduleHour:
+    Type: String
+    AllowedPattern: ^([01]?[0-9]|2[0-3])$
+    Default: "6"
+    Description: 月次集計を起動する時刻（時）。api の「スケジュール直前」判定にも渡す（設計 6.2）
+  ScheduleMinute:
+    Type: String
+    AllowedPattern: ^([0-5]?[0-9])$
+    Default: "0"
+    Description: 月次集計を起動する時刻（分）。ScheduleHour と対で使う
   LogLevel:
     Type: String
     AllowedValues:
@@ -154,6 +164,11 @@ Resources:
       Environment:
         Variables:
           STATE_MACHINE_ARN: !Ref StateMachine
+          # スケジュール実行と手動実行が重なると SaaS_A のトークンを奪い合うため、
+          # api も同じ時刻を知る必要がある（設計 6.2 / #1006）。
+          SCHEDULE_HOUR: !Ref ScheduleHour
+          SCHEDULE_MINUTE: !Ref ScheduleMinute
+          SCHEDULE_TIMEZONE: Asia/Tokyo
       Events:
         Api:
           Type: HttpApi
@@ -189,7 +204,8 @@ Resources:
               Action: states:StartExecution
               Resource: !Ref StateMachine
             # get_parameters_by_path はパスそのものの ARN にも権限が要るため、パスと配下の 2 本を並べる
-            - Sid: ReadOwnOriginVerifyAndSlackMode
+            # bot-token は設定画面の候補検索（#1011）の読み取り専用。投稿は notifier が行う
+            - Sid: ReadOwnOriginVerifyAndSlack
               Effect: Allow
               Action:
                 - ssm:GetParameter
@@ -200,6 +216,7 @@ Resources:
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/apps/saas-a-billing/targets/${TargetEnv}/*
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret
                 - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/mode
+                - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/bot-token
             - Sid: DecryptSecureStringParameters
               Effect: Allow
               Action: kms:Decrypt
@@ -228,7 +245,8 @@ Resources:
       Description: 締め日時と RUN 状態を判定してステートマシンを起動する（設計 6.2）
       CodeUri: functions/
       Handler: batch.handlers.trigger.handler
-      Timeout: 60
+      # 実行中の RUN が空くのを最長 10 分待つ（設計 6.2 / #1006）
+      Timeout: 900
       MemorySize: 256
       Environment:
         Variables:
@@ -241,7 +259,7 @@ Resources:
             # 一意な Scheduler の名前が dev / prod で衝突する（prod 作成時に実際に失敗）。
             Name: !Sub ${ProjectName}-saas-a-billing-trigger-${Env}
             Description: !Sub ${ProjectName} saas-a-billing の月次集計トリガー (${Env})
-            ScheduleExpression: cron(0 6 * * ? *)
+            ScheduleExpression: !Sub "cron(${ScheduleMinute} ${ScheduleHour} * * ? *)"
             ScheduleExpressionTimezone: Asia/Tokyo
             FlexibleTimeWindow:
               Mode: "OFF"
@@ -263,6 +281,8 @@ Resources:
               Effect: Allow
               Action:
                 - dynamodb:GetItem
+                # 実行中 RUN の判定（repo.active_runs）が RUN#{target_env} を Query する
+                - dynamodb:Query
                 - dynamodb:PutItem
                 - dynamodb:UpdateItem
               Resource: !GetAtt DataTable.Arn

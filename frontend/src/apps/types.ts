@@ -4,7 +4,6 @@ import type { RouteRecordRaw } from 'vue-router'
 export const RESERVED_PATHS: readonly string[] = [
   'login',
   'signup',
-  'mfa',
   'forbidden',
   'api',
   'assets',
@@ -24,6 +23,7 @@ export interface AppManifest {
   description?: string // ホーム画面のカード説明
   order?: number // サイドバー並び順（小さいほど上、既定 50）
   requiredGroups?: string[] // 空なら全ログインユーザー
+  helpMode?: boolean // true のときだけアプリバーに「？」トグルを出す（画面が HelpTip に対応しているアプリ）
   routes: RouteRecordRaw[] // /{id} 配下の子ルート。path は相対、component は () => import()
   nav: AppNavItem[] // アプリ内サブナビ（app-bar のタブに描画）
 }

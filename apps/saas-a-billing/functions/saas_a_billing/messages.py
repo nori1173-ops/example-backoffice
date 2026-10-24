@@ -67,12 +67,16 @@ def _field_names(template: str) -> list[str]:
         raise ValueError(f"Slack 文面のプレースホルダが不正です: {error}") from error
 
 
-def mail_subject(month: str, cutoff_day: int, target_env: str, attempt: int) -> str:
-    """`【SaaS_A】月額ライセンス料金一覧 2026年10月分（10/20締め）`（設計 3.6 / 6.8）。"""
+def mail_subject(month: str, cutoff_day: int, target_env: str, distribution_no: int) -> str:
+    """`【SaaS_A】月額ライセンス料金一覧 2026年10月分（10/20締め）`（設計 3.6 / 6.8）。
+
+    `distribution_no` は「今回が何回目の配布か」（1 始まり）。再実行の回数ではないため、
+    配布を伴わない試行を重ねても 2 回目以降にはならない（#1013）。
+    """
     _, target = _month_parts(month)
     subject = f"【SaaS_A】月額ライセンス料金一覧 {_month_label(month)}（{target}/{cutoff_day}締め）"
-    if attempt > 1:
-        subject += f"（再送（第 {attempt} 回））"
+    if distribution_no > 1:
+        subject += f"（再送（第 {distribution_no} 回））"
     if target_env == VERIFICATION:
         subject += " [検証環境]"
     return subject
@@ -96,7 +100,7 @@ def mail_body(
         "",
         f"対象月: {_month_label(month)}（{target}/{period.cutoff_day}締め）",
         f"集計対象環境: {_target_env_label(target_env)}",
-        f"課金対象期間: {_period_label(period)}（受信日時基準・JST）",
+        f"課金対象期間: {_period_label(period)}（観測データの日時基準・JST）",
         f"使用単価表: {price_effective_from.replace('-', '/')} 適用版",
         "",
         f"テナント数: {_count(summary['tenant_count'])}",
@@ -144,6 +148,60 @@ def slack_text(
     return text
 
 
+def partial_failure_mail_subject(month: str, failed_tenant_count: int, target_env: str, distribution_no: int) -> str:
+    """取得失敗があって配布を見送ったときの件名（設計 6.8 / 11.1）。
+
+    再送表記と検証環境ラベルは成功メール（`mail_subject`）と同じ規則で付ける。
+    """
+    failed = _count(failed_tenant_count)
+    subject = f"【要再実行】【SaaS_A】{_month_label(month)}の配布を見送りました（取得失敗 {failed} テナント）"
+    if distribution_no > 1:
+        subject += f"（再送（第 {distribution_no} 回））"
+    if target_env == VERIFICATION:
+        subject += " [検証環境]"
+    return subject
+
+
+def partial_failure_mail_body(
+    *, month: str, summary: dict, portal_url: str, target_env: str, failed_tenants: list[str]
+) -> str:
+    """取得失敗があって配布を見送ったときのメール本文（設計 6.8 / 11.1）。
+
+    取得失敗のテナントは集計外になり合計金額が過少になるため、Excel は添付しない。
+    """
+    lines = [
+        f"SaaS_A 月額課金レポート {_month_label(month)}に取得失敗のテナントがあるため、Excel の配布を見送りました。",
+        "原因を確認して再実行してください。",
+        "",
+        f"集計対象環境: {_target_env_label(target_env)}",
+        f"取得失敗: {_count(summary['failed_tenant_count'])} テナント（集計外）",
+        f"テナント数: {_count(summary['tenant_count'])}",
+    ]
+    if failed_tenants:
+        lines += ["", f"取得失敗テナント: {', '.join(failed_tenants)}"]
+    lines += ["", "明細はポータルで確認できます。", "", portal_url]
+    return "\n".join(lines) + "\n"
+
+
+def partial_failure_slack_text(
+    *, month: str, summary: dict, portal_url: str, target_env: str, failed_tenants: list[str]
+) -> str:
+    """取得失敗があって配布を見送ったときの Slack 本文（設計 6.8）。
+
+    定型の連絡なので設定の文面テンプレートは使わない。メンションは `notify.Slack` 側が付ける。
+    """
+    text = (
+        f"{_month_label(month)}の SaaS_A 月額課金レポートは"
+        f"取得失敗 {_count(summary['failed_tenant_count'])} テナントのため配布を見送りました。"
+        "原因を確認して再実行してください。"
+    )
+    if target_env == VERIFICATION:
+        text = f"【検証環境】{text}"
+    if failed_tenants:
+        text += f"\n\n取得失敗テナント: {'、'.join(failed_tenants)}"
+    return f"{text}\n\n{portal_url}"
+
+
 def failure_message(month: str, error: str, portal_url: str) -> tuple[str, str]:
     """失敗通知の（件名, 本文）（設計 6.8 / 11.1）。メールと Slack で同じ本文を使う。"""
     subject = f"【SaaS_A 月額課金レポート】{_month_label(month)}の集計に失敗しました"
@@ -151,10 +209,24 @@ def failure_message(month: str, error: str, portal_url: str) -> tuple[str, str]:
     return subject, body
 
 
-def retry_exhausted_message(month: str, attempts: int, portal_url: str) -> tuple[str, str]:
-    """自動再実行の上限到達アラームの（件名, 本文）（設計 6.8 / 11.1）。"""
-    subject = f"【要手動】{_month_label(month)}の自動再実行が {attempts} 回失敗しました"
-    body = "\n".join([f"{subject}。", "自動再実行を停止しました。", "手動実行:", "", portal_url])
+def busy_skip_message(month: str, running_months: list[str], portal_url: str, target_env: str) -> tuple[str, str]:
+    """実行中の RUN が空かず、スケジュール実行を見送ったときの（件名, 本文）（設計 6.2 / 6.8）。
+
+    メールと Slack で同じ本文を使うため、検証環境ラベルは件名に付けて本文の 1 行目に載せる。
+    """
+    subject = f"【要手動】{_month_label(month)}のスケジュール実行を見送りました"
+    if target_env == VERIFICATION:
+        subject += " [検証環境]"
+    body = "\n".join(
+        [
+            f"{subject}。",
+            f"実行中の RUN: {'、'.join(running_months)}",
+            "SaaS_A の管理 API は 1 ユーザー 1 トークンのため、重ねて実行できません。",
+            "実行中の RUN が終わったら手動で実行してください:",
+            "",
+            portal_url,
+        ]
+    )
     return subject, body
 
 

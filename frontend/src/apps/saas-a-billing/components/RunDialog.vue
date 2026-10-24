@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { useUiStore } from '@/stores/ui'
+import HelpTip from '@/components/HelpTip.vue'
 import RunConfirmSummary from './RunConfirmSummary.vue'
+import { HELP } from '../help'
 import { useRunsStore } from '../stores/runs'
 import type { SettingsView, TargetEnv } from '../types'
 
@@ -176,36 +178,51 @@ reset()
           </div>
         </div>
 
-        <v-text-field
-          v-model="month"
-          data-test="run-month"
-          label="対象月"
-          placeholder="YYYY-MM"
-          density="comfortable"
-          variant="outlined"
-          :error-messages="monthValid ? [] : ['対象月は YYYY-MM 形式で指定してください']"
-        />
+        <HelpTip :text="HELP.runDialog.month">
+          <template #default="{ props: tip }">
+            <v-text-field
+              v-bind="tip"
+              v-model="month"
+              data-test="run-month"
+              label="対象月"
+              placeholder="YYYY-MM"
+              density="comfortable"
+              variant="outlined"
+              :error-messages="monthValid ? [] : ['対象月は YYYY-MM 形式で指定してください']"
+            />
+          </template>
+        </HelpTip>
 
-        <v-checkbox
-          v-model="distribute"
-          data-test="run-distribute"
-          label="メール・Slack へ配布する"
-          density="compact"
-          hide-details
-        />
+        <HelpTip :text="HELP.runDialog.distribute">
+          <template #default="{ props: tip }">
+            <v-checkbox
+              v-bind="tip"
+              v-model="distribute"
+              data-test="run-distribute"
+              label="メール・Slack へ配布する"
+              density="compact"
+              hide-details
+            />
+          </template>
+        </HelpTip>
         <div
           data-test="distribute-targets"
           class="text-caption text-medium-emphasis ms-10 mb-2"
         >
           {{ distributeTargets }}
         </div>
-        <v-checkbox
-          v-model="force"
-          data-test="run-force"
-          label="強制再実行（成功済みの月を集計し直す）"
-          density="compact"
-          hide-details
-        />
+        <HelpTip :text="HELP.runDialog.force">
+          <template #default="{ props: tip }">
+            <v-checkbox
+              v-bind="tip"
+              v-model="force"
+              data-test="run-force"
+              label="強制再実行（成功済みの月を集計し直す）"
+              density="compact"
+              hide-details
+            />
+          </template>
+        </HelpTip>
       </v-card-text>
 
       <v-card-text
@@ -217,15 +234,22 @@ reset()
           :month="month"
           :distribute="distribute"
         />
-        <v-checkbox
+        <HelpTip
           v-if="distribute"
-          v-model="distributeAck"
-          data-test="distribute-ack"
-          label="上の配布先へ送ることを確認しました"
-          density="compact"
-          hide-details
-          class="mt-2"
-        />
+          :text="HELP.runDialog.ack"
+        >
+          <template #default="{ props: tip }">
+            <v-checkbox
+              v-bind="tip"
+              v-model="distributeAck"
+              data-test="distribute-ack"
+              label="上の配布先へ送ることを確認しました"
+              density="compact"
+              hide-details
+              class="mt-2"
+            />
+          </template>
+        </HelpTip>
       </v-card-text>
 
       <v-card-text
@@ -244,40 +268,56 @@ reset()
 
       <v-card-actions>
         <v-spacer />
-        <v-btn
-          v-if="confirming"
-          data-test="run-back"
-          @click="confirming = false"
-        >
-          戻る
-        </v-btn>
-        <v-btn
-          v-else
-          data-test="run-cancel"
-          @click="open = false"
-        >
-          キャンセル
-        </v-btn>
-        <v-btn
-          v-if="confirming"
-          data-test="run-submit"
-          :color="dangerous ? 'error' : 'primary'"
-          variant="flat"
-          :disabled="!confirmed"
-          @click="submit"
-        >
-          {{ dangerous ? '本番へ配布して実行' : '実行' }}
-        </v-btn>
-        <v-btn
-          v-else
-          data-test="run-next"
-          color="primary"
-          variant="flat"
-          :disabled="!canSubmit"
-          @click="confirming = true"
-        >
-          確認へ
-        </v-btn>
+        <HelpTip :text="confirming ? HELP.runDialog.back : HELP.runDialog.cancel">
+          <template #default="{ props: tip }">
+            <v-btn
+              v-if="confirming"
+              v-bind="tip"
+              data-test="run-back"
+              @click="confirming = false"
+            >
+              戻る
+            </v-btn>
+            <v-btn
+              v-else
+              v-bind="tip"
+              data-test="run-cancel"
+              @click="open = false"
+            >
+              キャンセル
+            </v-btn>
+          </template>
+        </HelpTip>
+        <!-- disabled なボタンはマウスイベントを受け取らないので、activator をラッパ側に置く -->
+        <HelpTip :text="confirming ? HELP.runDialog.submit : HELP.runDialog.next">
+          <template #default="{ props: tip }">
+            <span
+              v-bind="tip"
+              class="d-inline-block"
+            >
+              <v-btn
+                v-if="confirming"
+                data-test="run-submit"
+                :color="dangerous ? 'error' : 'primary'"
+                variant="flat"
+                :disabled="!confirmed"
+                @click="submit"
+              >
+                {{ dangerous ? '本番へ配布して実行' : '実行' }}
+              </v-btn>
+              <v-btn
+                v-else
+                data-test="run-next"
+                color="primary"
+                variant="flat"
+                :disabled="!canSubmit"
+                @click="confirming = true"
+              >
+                確認へ
+              </v-btn>
+            </span>
+          </template>
+        </HelpTip>
       </v-card-actions>
     </v-card>
   </v-dialog>

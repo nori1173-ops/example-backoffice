@@ -163,3 +163,16 @@ def test_re_put_overwrites_same_key(bucket):
     assert storage.get_result(PRODUCTION, MONTH)["summary"]["total_amount"] == 2
     listed = s3().list_objects_v2(Bucket=bucket, Prefix=storage.prefix(PRODUCTION, MONTH))
     assert listed["KeyCount"] == 1
+
+
+def test_mail_attachment_xlsx_key_content_type_and_retention(bucket):
+    full_key = storage.put_xlsx(VERIFICATION, MONTH, b"full")
+    mail_key = storage.put_xlsx(VERIFICATION, MONTH, b"billing", billing_only=True)
+    assert mail_key == f"{storage.prefix(VERIFICATION, MONTH)}/mail/{full_key.rsplit('/', 1)[1]}"
+    assert mail_key != full_key
+    client = boto3.client("s3")
+    assert client.get_object(Bucket=bucket, Key=full_key)["Body"].read() == b"full"
+    obj = client.get_object(Bucket=bucket, Key=mail_key)
+    assert obj["Body"].read() == b"billing"
+    assert obj["ContentType"] == storage.XLSX_CONTENT_TYPE
+    assert client.get_object_tagging(Bucket=bucket, Key=mail_key)["TagSet"] == []

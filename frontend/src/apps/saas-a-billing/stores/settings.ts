@@ -3,18 +3,17 @@ import { ref } from 'vue'
 import { extractApiError } from '@/services/http'
 import { billingApi } from '../api'
 import type {
-  AuditEntry,
   EditableSettings,
   PriceTable,
   PriceVersion,
   SettingsView,
+  SlackDirectory,
   SlackMode,
   TargetEnv,
 } from '../types'
 
 const VERSION_CONFLICT = 'VERSION_CONFLICT'
 const TARGET_ENV_FIXED = 'TARGET_ENV_FIXED'
-const FORBIDDEN = 403
 
 const SAVE_ERRORS: Record<string, string> = {
   [VERSION_CONFLICT]: '他の人が更新しました。画面を読み込み直してから保存してください。',
@@ -30,22 +29,17 @@ function messageOf(error: unknown, fallback: string): string {
   return extractApiError(error)?.message ?? fallback
 }
 
-function statusOf(error: unknown): number | undefined {
-  if (error && typeof error === 'object' && 'response' in error) {
-    return (error as { response?: { status?: number } }).response?.status
-  }
-  return undefined
-}
-
 export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
   const settings = ref<SettingsView | null>(null)
   const prices = ref<PriceVersion[]>([])
-  const audits = ref<AuditEntry[]>([])
   const slackMode = ref<SlackMode | null>(null)
   const targets = ref<Partial<Record<TargetEnv, boolean>>>(noTargets())
   const saasaHost = ref<string | null>(null)
   const loading = ref(false)
   const error = ref<string | null>(null)
+  const directory = ref<SlackDirectory | null>(null)
+  const directoryLoading = ref(false)
+  const directoryError = ref<string | null>(null)
 
   async function fetch(): Promise<void> {
     loading.value = true
@@ -56,6 +50,11 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
         billingApi.listPrices(),
       ])
       settings.value = view
+        ? {
+          ...view,
+          mail_attachment_sheets: view.mail_attachment_sheets === 'all' ? 'all' : 'billing_only',
+        }
+        : null
       slackMode.value = view?.slack_mode ?? null
       targets.value = view?.targets ?? noTargets()
       saasaHost.value = view?.saasa_host ?? null
@@ -90,6 +89,22 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
     return true
   }
 
+  /**
+   * Slack の候補（`#` / `@` の入力補助）。取得できなくても設定の編集と保存は続けられる
+   * ように、失敗は例外にせず理由だけ持つ（#1011）。
+   */
+  async function loadSlackDirectory(refresh = false): Promise<void> {
+    directoryLoading.value = true
+    directoryError.value = null
+    try {
+      directory.value = await billingApi.getSlackDirectory(refresh)
+    } catch (e: unknown) {
+      directoryError.value = messageOf(e, '通信に失敗しました')
+    } finally {
+      directoryLoading.value = false
+    }
+  }
+
   async function addPrice(version: PriceTable): Promise<boolean> {
     loading.value = true
     error.value = null
@@ -105,29 +120,20 @@ export const useSettingsStore = defineStore('saas-a-billing/settings', () => {
     }
   }
 
-  /** admin 以外は 403 になる。閲覧者に見せる情報ではないのでエラー表示はしない（設計 12.1）。 */
-  async function fetchAudits(): Promise<void> {
-    try {
-      audits.value = (await billingApi.listAudits()) ?? []
-    } catch (e: unknown) {
-      if (statusOf(e) !== FORBIDDEN) {
-        error.value = messageOf(e, '変更履歴の取得に失敗しました')
-      }
-    }
-  }
-
   return {
     settings,
     prices,
-    audits,
     slackMode,
     targets,
     saasaHost,
     loading,
     error,
+    directory,
+    directoryLoading,
+    directoryError,
     fetch,
     save,
     addPrice,
-    fetchAudits,
+    loadSlackDirectory,
   }
 })

@@ -11,13 +11,12 @@
 # キーパスの文字列がそのまま origin の DomainName になり、API 経路が壊れる
 #（SSM から解決されるのは Type: AWS::SSM::Parameter::Value<String> のパラメータだけ）。
 #
-# 【2 アプリ目以降の注意】origin も behavior も「リストの要素ごとに !If」で書く。
-# edge テンプレートが 1 アプリだけのときの
+# origin も behavior も「リストの要素ごとに !If」で書く。edge テンプレートの Origins /
+# CacheBehaviors は既にこの形（#1007 で書き換え済み）なので、下をそのまま末尾に足せばよい。
 #     CacheBehaviors: !If [HasXxxApi, [<behavior>], !Ref AWS::NoValue]
-# という「リスト全体を !If」の形のままここへ 2 本目を足すと、追加した behavior が
-# 他アプリの Condition に巻き込まれる。origin だけ消えて behavior が残ればデプロイが失敗し、
-# CacheBehaviors ごと消えれば /api/{app}/* が SPA へフォールスルーする。
-# 2 本目を足すときは、先に既存の behavior を下と同じ「- !If」形へ書き換えてから追記する。
+# のようにリスト全体を !If にすると、後から足した behavior が他アプリの Condition に
+# 巻き込まれる。origin だけ消えて behavior が残ればデプロイが失敗し、CacheBehaviors ごと
+# 消えれば /api/{app}/* が SPA へフォールスルーする。この形へ戻さないこと。
 
 # --- Parameters に追加 -------------------------------------------------------
 Parameters:

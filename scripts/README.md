@@ -33,7 +33,8 @@ scripts/deploy-all.sh prod
 
 # 5. Ops トピックのメール購読を作る（core デプロイ直後。下記「アラーム通知の購読」参照）
 
-# 6. 最初の管理者を付ける（本人のサインアップ後。admin が居ないと設定画面が読み取り専用）
+# 6. 最初の管理者を付ける（本人のサインアップ後。admin が居ないとユーザー管理画面も設定画面も開けない）
+#    2 人目以降はこの管理者が https://backoffice.example-cloud.com/admin-users から付ける
 scripts/add-admin.sh prod devA@example.co.jp
 ```
 
@@ -98,9 +99,9 @@ sam deploy --config-env production
 | `deploy-edge.sh` | `{env}` | SSM から秘密を取り出して edge スタックをデプロイする |
 | `deploy-frontend.sh` | `{env}` | frontend をビルドして S3 へ同期し CloudFront を無効化する |
 | `deploy-all.sh` | `{env}` | shared → core → apps/\* → edge → frontend の順に一括デプロイする |
-| `add-admin.sh` | `{env} {email}` | サインアップ済みユーザーを `admin` グループに追加する |
+| `add-admin.sh` | `{env} {email}` | サインアップ済みユーザーを `admin` グループに追加する（**最初の 1 人**と画面が使えないときの退路。通常はユーザー管理画面から） |
 | `list-mfa-status.sh` | `{env}` | Cognito ユーザーの MFA 設定状況を一覧する |
-| `get_id_token.py` | `{env} {email} [--totp-code CODE]` | Cognito の ID トークンを標準出力へ出す |
+| `get_id_token.py` | `{env} {email} [--totp-code CODE]` | Cognito の ID トークンを標準出力へ出す（`--totp-code` は TOTP 登録済みユーザーのみ） |
 | `validate-templates.sh` | なし | 全テンプレートに `sam validate` と `cfn-lint` をかける |
 
 ## init-secrets.sh
@@ -133,6 +134,10 @@ scripts/register-slack.sh dev webhook  # Webhook URL を登録する
 | --- | --- | --- |
 | `bot` | `/example-backoffice/{env}/shared/slack/bot-token` | SecureString |
 | `webhook` | `/example-backoffice/{env}/shared/slack/webhook-url` | SecureString |
+
+Bot token に要るスコープは `chat:write` + `chat:write.public`（投稿）と
+`channels:read` / `groups:read` / `users:read` / `usergroups:read`（設定画面の `#` / `@` 候補検索）。
+`bot-token` を読むのは notifier（投稿）と課金アプリの api（候補検索。読み取りのみ）の 2 つである。
 
 どちらも秘密の登録・ローテートだけを行い、投稿方式（`/shared/slack/mode`）は書かない。
 このパラメータは shared スタックが `SlackMode` から作る CloudFormation 管理のリソースで、
@@ -211,6 +216,9 @@ ID_TOKEN=$(uv run python scripts/get_id_token.py dev devA@example.co.jp)
 uv run python scripts/get_id_token.py dev devA@example.co.jp --totp-code 123456
 ```
 
+MFA は任意（`MfaConfiguration: OPTIONAL`）なので、TOTP 未登録のユーザーはコード無しで通る。
+`--totp-code` が要るのは認証アプリを登録済みのユーザーだけである。
+
 SPA 用 App Client（`ALLOW_USER_SRP_AUTH`・シークレット無し）を `pycognito` の SRP 認証で
 そのまま使うため、E2E 専用の App Client は作らない。パスワードは引数では渡せない
 （環境変数 `COGNITO_PASSWORD` か対話入力）。標準出力へ出るのは ID トークンだけで、
@@ -227,7 +235,12 @@ scripts/add-admin.sh prod devA@example.co.jp
 `admin-get-user` の失敗を検出して終了コード 1。prod は付与前に確認プロンプトを出す。
 反映は次回サインイン（ID トークン再取得）から。
 
-ユーザー管理のその他の操作（設計 6.3 の runbook）:
+**このスクリプトの出番は 2 つだけ**（#1007 以降）: サイトの**最初の管理者**を作るときと、
+ユーザー管理画面（`/admin-users`）が使えない・admin が 1 人も居なくなったときの退路。
+普段の付与・解除・無効化・パスワードリセット・削除は admin が画面から行う
+（[Documents/apps/admin-users/DESIGN.md](../Documents/apps/admin-users/DESIGN.md)）。
+
+画面を使わずに CLI で行う場合（設計 6.3 の runbook）:
 
 ```bash
 POOL=$(aws ssm get-parameter --name /example-backoffice/prod/cognito/user-pool-id \
@@ -239,14 +252,14 @@ aws cognito-idp admin-delete-user  --user-pool-id "$POOL" --username x@example.c
 
 削除しても実行履歴の `requested_by`（Cognito の `sub`）は残る。
 
-**認証アプリ（TOTP）を失った場合**: このプールは `MfaConfiguration: "ON"`（MFA 必須）
-なので、`admin-set-user-mfa-preference` による TOTP の解除は AWS 仕様上できない。
-復旧はユーザーの作り直しで行う（プールを一時的に `OPTIONAL` へ落とす方式は採らない）。
+**認証アプリ（TOTP）を失った場合**: このプールは `MfaConfiguration: OPTIONAL`（MFA は任意）
+なので、管理者が TOTP だけを解除できる。ユーザーの作り直しは要らない。
 
 ```bash
-aws cognito-idp admin-delete-user --user-pool-id "$POOL" --username x@example.co.jp
-# → 本人が同じメールで再サインアップ（確認コード → 初回サインインで TOTP を再登録）
-scripts/add-admin.sh prod x@example.co.jp   # admin だった人には付け直す
+aws cognito-idp admin-set-user-mfa-preference --user-pool-id "$POOL" \
+  --username x@example.co.jp \
+  --software-token-mfa-settings Enabled=false,PreferredMfa=false
+# → 以降はパスワードだけでサインインできる（サイトに TOTP 登録画面は無い）
 ```
 
 ## list-mfa-status.sh

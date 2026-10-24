@@ -100,7 +100,7 @@ def test_select_table_raises_when_none_effective(effective_froms):
         select_table(price_items(*effective_froms), date(2026, 8, 31))
 
 
-def test_default_price_table_matches_2355():
+def test_default_price_table_matches_2001():
     table = PriceTable.from_item(default_price_table_item())
     assert table.effective_from == "2025-09-01"
     assert table.bands == [

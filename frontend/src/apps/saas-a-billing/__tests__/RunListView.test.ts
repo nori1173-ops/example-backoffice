@@ -5,6 +5,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { createVuetify } from 'vuetify'
 import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
+import { useUiStore } from '@/stores/ui'
 import { billingApi } from '../api'
 import EnvBadge from '../components/EnvBadge.vue'
 import StatusChip from '../components/StatusChip.vue'
@@ -86,13 +87,13 @@ function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
     target_env: 'verification',
     cutoff_day: 20,
     cutoff_time: '24:00',
-    auto_retry_days: 5,
     auto_run_enabled: true,
     auto_run_from_month: '2026-01',
     mail_enabled: false,
     slack_enabled: false,
     mail_to: ['devA@example.co.jp'],
     mail_cc: [],
+    mail_attachment_sheets: 'billing_only',
     slack_channel_id: 'C0123ABCD',
     slack_channel_label: '#proj-saas-a-billing',
     slack_mention: '',
@@ -131,7 +132,15 @@ async function mountView(): Promise<VueWrapper> {
   return wrapper as unknown as VueWrapper
 }
 
+/** 開いているツールチップの文言。 */
+function activeTooltips(): string {
+  return Array.from(document.body.querySelectorAll('.v-overlay--active'))
+    .map((overlay) => overlay.textContent ?? '')
+    .join(' ')
+}
+
 beforeEach(() => {
+  document.body.innerHTML = ''
   setActivePinia(createPinia())
   holder.runs.runs = []
   holder.runs.loading = false
@@ -357,6 +366,73 @@ describe('RunListView', () => {
     expect(wrapper.find('[data-test="download-reason-verification-2026-09"]').text()).toContain(
       '成功',
     )
+  })
+
+  // どの行がバッチの結果でどれが手動かを一目で分かるようにする（#1013）
+  it('スケジュール実行の行に「自動」バッジが出る', async () => {
+    holder.runs.runs = [makeRun({ trigger: 'scheduled' })]
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger-verification-2026-10"]').text()).toBe('自動')
+  })
+
+  it('手動実行の行に「手動」バッジが出る', async () => {
+    holder.runs.runs = [makeRun({ trigger: 'manual' })]
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger-verification-2026-10"]').text()).toBe('手動')
+  })
+
+  it('想定外の trigger ではバッジを出さない', async () => {
+    holder.runs.runs = [makeRun({ trigger: 'unknown' as RunSummary['trigger'] })]
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger-verification-2026-10"]').exists()).toBe(false)
+  })
+
+  // trigger を持たない過去の RUN でも警告を出さずに空にする（#1013 レビュー S2）
+  it('trigger が無い RUN ではバッジを出さない', async () => {
+    holder.runs.runs = [makeRun({ trigger: undefined as unknown as RunSummary['trigger'] })]
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger-verification-2026-10"]').exists()).toBe(false)
+  })
+
+  it('ヘルプモード ON で自動 / 手動バッジの説明が出る', async () => {
+    useUiStore().toggleHelpMode()
+    holder.runs.runs = [makeRun({ trigger: 'manual' })]
+    const wrapper = await mountView()
+
+    await wrapper.find('[data-test="trigger-verification-2026-10"]').trigger('mouseenter')
+    await flushPromises()
+
+    expect(activeTooltips()).toContain('締め日時より前の手動実行の結果は、締め後の自動実行が集計し直して上書きします')
+  })
+
+  // 画面の語の意味が分からないという指摘への対応（#1012）
+  it('ヘルプモード ON で更新ボタンと内訳カウント列の説明が出る', async () => {
+    useUiStore().toggleHelpMode()
+    holder.runs.runs = [makeRun()]
+    const wrapper = await mountView()
+
+    await wrapper.find('[data-test="refresh"]').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('実行履歴を取り直します')
+
+    const missingHeader = wrapper.findAll('th span').find((span) => span.text() === '消えた地点')
+    await missingHeader?.trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('今回の地点一覧に無い地点')
+  })
+
+  it('ヘルプモード OFF ではツールチップが開かない', async () => {
+    holder.runs.runs = [makeRun()]
+    const wrapper = await mountView()
+
+    await wrapper.find('[data-test="refresh"]').trigger('mouseenter')
+    await flushPromises()
+
+    expect(document.body.querySelectorAll('.v-overlay--active')).toHaveLength(0)
   })
 
   it('次回自動実行予定が設定から算出されて表示される', async () => {

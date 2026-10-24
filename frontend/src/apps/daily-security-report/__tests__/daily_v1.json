@@ -1,0 +1,63 @@
+{
+  "schema": "daily-security-report.daily.v1",
+  "date": "2026-10-14",
+  "sources": {
+    "guardduty": {
+      "status": "ok"
+    },
+    "cloudtrail": {
+      "status": "ok",
+      "details": {
+        "human_operations": [
+          {
+            "actor": "user-example",
+            "ip": "203.0.113.5",
+            "country": "JP",
+            "event": "ListBuckets",
+            "at": "2026-10-14T10:00:00+09:00"
+          }
+        ]
+      }
+    },
+    "metrics": {
+      "status": "ok"
+    },
+    "insights": {
+      "status": "ok"
+    },
+    "instances": {
+      "status": "ok"
+    }
+  },
+  "counters": {
+    "waf.blocked": 231
+  },
+  "comparisons": {
+    "waf.blocked": {
+      "baseline": 210,
+      "days": 7,
+      "ratio": 1.1,
+      "red": false,
+      "label": ""
+    }
+  },
+  "red": [],
+  "seen": {},
+  "excluded": {},
+  "instances": {
+    "ec2": [],
+    "lightsail": []
+  },
+  "duration_sec": 84,
+  "range": {
+    "from": "2026-10-14T00:00:00+09:00",
+    "to": "2026-10-15T00:00:00+09:00"
+  },
+  "no_baseline": [
+    "waf.blocked",
+    "seen.cloudtrail_human_ips",
+    "seen.alarmhuba_countries",
+    "lambda.errors",
+    "instances"
+  ]
+}

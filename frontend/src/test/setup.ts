@@ -46,8 +46,4 @@ vi.mock('aws-amplify/auth', () => ({
   resendSignUpCode: vi.fn(),
   resetPassword: vi.fn(),
   confirmResetPassword: vi.fn(),
-  setUpTOTP: vi.fn(),
-  verifyTOTPSetup: vi.fn(),
-  updateMFAPreference: vi.fn(),
-  fetchMFAPreference: vi.fn(),
 }))

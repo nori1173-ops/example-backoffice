@@ -39,12 +39,6 @@ const routes: RouteRecordRaw[] = [
         meta: { title: 'ホーム' },
       },
       {
-        path: 'mfa',
-        name: 'mfa',
-        component: () => import('@/views/MfaSetupView.vue'),
-        meta: { title: 'セキュリティ' },
-      },
-      {
         path: 'forbidden',
         name: 'forbidden',
         component: () => import('@/views/ForbiddenView.vue'),

@@ -97,9 +97,28 @@ describe('billingApi', () => {
     expect(captured[0].params).toEqual({ target_env: 'production' })
   })
 
-  it('listAudits が GET /audits を呼ぶ', async () => {
-    await billingApi.listAudits()
+  // 候補は admin のみ・読み取りのみ（#1011）。サーバのキャッシュは refresh で捨てる
+  it('getSlackDirectory が refresh のときだけ refresh=1 を載せる', async () => {
+    await billingApi.getSlackDirectory()
+    expect(captured[0].method).toBe('get')
+    expect(captured[0].url).toBe('/slack/directory')
+    expect(captured[0].params).toEqual({})
+
+    await billingApi.getSlackDirectory(true)
+    expect(captured[1].params).toEqual({ refresh: 1 })
+  })
+
+  it('listAudits が limit / target / since をクエリに載せる', async () => {
+    await billingApi.listAudits({ limit: 200, target: 'run', since: '2026-08-01T00:00:00.000Z' })
     expect(captured[0].method).toBe('get')
     expect(captured[0].url).toBe('/audits')
+    expect(captured[0].params).toEqual({
+      limit: 200,
+      target: 'run',
+      since: '2026-08-01T00:00:00.000Z',
+    })
+
+    await billingApi.listAudits()
+    expect(captured[1].params).toEqual({})
   })
 })

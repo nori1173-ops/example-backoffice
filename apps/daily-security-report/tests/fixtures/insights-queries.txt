@@ -1,0 +1,53 @@
+Q1
+filter @message like /"headers"\s*:/
+| parse @message /"X-Forwarded-For"\s*:\s*"(?<xff>[^",]+)/
+| parse @message /"sourceIp"\s*:\s*"(?<source_ip>[^"]+)"/
+| parse @message /"CloudFront-Viewer-Country"\s*:\s*"(?<country>[A-Z]{2})"/
+| parse @message /"X-Amz-Cf-Id"\s*:\s*"(?<cf_id>[^"]+)"/
+| fields coalesce(xff, source_ip) as src, coalesce(country, "") as cc, ispresent(cf_id) as cf
+| stats count(*) as count, min(@timestamp) as first_at, max(@timestamp) as last_at by src, cc, cf
+| sort count desc
+| limit 10000
+
+Q2
+filter @message like /"headers"\s*:/
+| parse @message /"X-Forwarded-For"\s*:\s*"(?<xff>[^",]+)/
+| parse @message /"sourceIp"\s*:\s*"(?<source_ip>[^"]+)"/
+| parse @message /"CloudFront-Viewer-Country"\s*:\s*"(?<country>[A-Z]{2})"/
+| parse @message /"X-Amz-Cf-Id"\s*:\s*"(?<cf_id>[^"]+)"/
+| fields coalesce(xff, source_ip) as src, coalesce(country, "") as cc, ispresent(cf_id) as cf
+| parse @message /"path"\s*:\s*"(?<path>[^"]+)"/
+| filter path like /__ADMIN_PATH_REGEX__/
+| stats count(*) as count, min(@timestamp) as first_at, max(@timestamp) as last_at by src, path, cc
+| sort count desc
+| limit 10000
+
+Q3
+parse @message /"request_id"\s*:\s*"(?<rid>[^"]+)"/
+| parse @message /"statusCode"\s*:\s*"?(?<status>401|403)/
+| filter ispresent(rid) and ispresent(status)
+| stats count(*) as count, latest(@timestamp) as latest, min(@timestamp) as first_at, max(@timestamp) as last_at by rid, status
+| sort latest desc
+| limit 10000
+
+Q4
+filter @message like /"headers"\s*:/
+| parse @message /"X-Forwarded-For"\s*:\s*"(?<xff>[^",]+)/
+| parse @message /"sourceIp"\s*:\s*"(?<source_ip>[^"]+)"/
+| parse @message /"CloudFront-Viewer-Country"\s*:\s*"(?<country>[A-Z]{2})"/
+| parse @message /"X-Amz-Cf-Id"\s*:\s*"(?<cf_id>[^"]+)"/
+| fields coalesce(xff, source_ip) as src, coalesce(country, "") as cc, ispresent(cf_id) as cf
+| parse @message /"request_id"\s*:\s*"(?<rid>[^"]+)"/
+| parse @message /"path"\s*:\s*"(?<path>[^"]+)"/
+| filter rid in __REQUEST_IDS__
+| stats count(*) as count, min(@timestamp) as first_at, max(@timestamp) as last_at by src, path, cc
+| sort count desc
+| limit 10000
+
+Q5
+filter @message like /受信しました。/
+| parse @message /受信しました。\s+(?<method>\S+)\s+(?<path>\S+)\s+(?<src>[^\s"\\]+)/
+| filter ispresent(src)
+| stats count(*) as count, min(@timestamp) as first_at, max(@timestamp) as last_at by src, method
+| sort count desc
+| limit 10000

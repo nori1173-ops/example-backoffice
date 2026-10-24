@@ -20,7 +20,7 @@
 
 必要な環境: AWS CLI（`AWS_PROFILE` を環境変数で設定）、SAM CLI、cfn-lint 1.51.3 以上、Docker（`--use-container` 用）、Node.js 24、Python 3.13。
 
-アプリ id の規約: 小文字英数とハイフン（kebab-case）、3〜30 文字。予約パス（`login` `signup` `mfa` `forbidden` `api` `assets`）は使えない。id は SPA ルート `/{app}`、API `/api/{app}`、スタック名 `example-backoffice-app-{app}-{env}` に使われる。
+アプリ id の規約: 小文字英数とハイフン（kebab-case）、3〜30 文字。予約パス（`login` `signup` `forbidden` `api` `assets`）は使えない。id は SPA ルート `/{app}`、API `/api/{app}`、スタック名 `example-backoffice-app-{app}-{env}` に使われる。
 
 ---
 
@@ -63,7 +63,7 @@ aws ssm get-parameters-by-path --path /example-backoffice/dev --recursive --quer
 4. 通知は `notify.send(...)`（shared レイヤ）。添付は `notify.put_attachment(app, filename, data, subprefix=None)` で `{app}/[{subprefix}/]{yyyy}/{mm}/{filename}` に置く。Slack は `slack.channel` にチャンネル **ID**（`#name` は不可）、`slack.mention` に先頭へ付ける文字列を渡す（DESIGN.md 8.2 / 8.5）。
 5. バッチが必要なら `functions/batch/handlers/` にハンドラを置き、`ScheduleV2` イベント（雛形にコメントアウトで同梱）を有効にする。処理が 15 分を超える／分割並列が要る場合は `statemachine/{name}.asl.json` と `AWS::Serverless::StateMachine`（雛形に任意で同梱）を使い、Scheduler からは判定用の `trigger` Lambda を呼んで `states:StartExecution` させる。
 6. `pytest --cov=functions --cov-fail-under=80` と `sam validate --lint`（cfn-lint 1.51.3 以上）を通す。
-7. **テストはアプリ単位で実行する**（`uv run pytest apps/{app}/tests`）。`functions/api` / `functions/batch` というモジュール名は全アプリで同じため、複数アプリのテストを 1 つの pytest セッションに混ぜると sys.path 上で別アプリのモジュールが黙って誤解決し得る。2 アプリ目の骨格作成時に per-app conftest での sys.path 分離（またはパッケージ名前空間化）を判断する。
+7. **ハンドラのモジュール名をアプリ id 由来にする**（例 `functions/admin_users/app.py`、`Handler: admin_users.app.handler`）。雛形の `functions/api/app.py` のままだと、全アプリのテストを 1 つの pytest セッション（`uv run pytest`。`pyproject.toml` の `testpaths` に `apps` が入っている）で走らせたとき、`api` という同名パッケージが sys.modules で衝突し、先に読まれた別アプリのモジュールを掴む（#1007 で実測。2 アプリ目からはパッケージ名前空間化で回避する）。`pyproject.toml` の `pythonpath` に `apps/{app}/functions` を足すこと。
 
 ### ステップ 5: dev にデプロイして直接疎通する
 
@@ -85,8 +85,9 @@ curl -s https://$API/api/{app}/health -H "Authorization: Bearer $TOKEN" -H "x-or
 ### ステップ 6: edge に origin と behavior を追加する
 
 - 雛形が出力した `apps/{app}/edge-snippet.yaml`（パラメータ 1 + origin 1 + behavior 1）を `infra/edge/template.yaml` の該当箇所に転記する。
+- **`Origins` と `CacheBehaviors` は「リストの要素ごとに `- !If`」で条件を付ける**（#1007 で既にこの形。断片も同じ形なので末尾に足すだけでよい）。リスト全体を `CacheBehaviors: !If [HasXxxApi, [...], !Ref AWS::NoValue]` にすると、後から足した behavior が先客の条件に巻き込まれ、そのアプリが未デプロイのときに一緒に消える（`/api/{app}/*` が SPA へフォールスルーする）。
 - **behavior には `FunctionAssociations`（viewer-request → `EdgeGuardFunction`）を必ず入れる。** 付け忘れるとそのアプリの API だけ社内 IP 制限を素通りする（DESIGN.md 7.1）。
-- **`scripts/deploy-edge.sh` に新アプリ分を追記する。** api-domain は samconfig ではなくこのスクリプトが SSM から読んで `parameter_overrides` で渡す方式のため、スクリプト内の saas-a-billing のブロック（`API_DOMAIN_PARAM` の取得 → `OVERRIDES` への `{App}ApiDomain=...` 連結。未登録なら渡さない）を新アプリ用に 1 組複製する。
+- **`scripts/deploy-edge.sh` に新アプリ分を追記する。** api-domain は samconfig ではなくこのスクリプトが SSM から読んで `parameter_overrides` で渡す方式のため、スクリプト内の既存アプリのブロック（`{APP}_API_DOMAIN_PARAM` の取得 → `OVERRIDES` への `{App}ApiDomain=...` 連結。未登録なら渡さない）を新アプリ用に 1 組複製する。
 - `scripts/deploy-edge.sh dev` でデプロイする。
 - `https://backoffice-dev.example-cloud.com/api/{app}/health` を ID トークン付きで呼んで 200 を確認する。
 
@@ -102,22 +103,28 @@ Resources:
     Properties:
       DistributionConfig:
         Origins:
-          - Id: api-saas-a-billing    # HasSaasABillingApi 条件付き（不成立時は AWS::NoValue）
-            DomainName: !Ref SaasABillingApiDomain
-            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
-            OriginCustomHeaders:
-              - { HeaderName: x-origin-verify, HeaderValue: !Ref OriginVerifySecret }
+          - !If                        # 要素ごとに条件を付ける（不成立なら AWS::NoValue で 1 要素だけ消える）
+            - HasSaasABillingApi
+            - Id: api-saas-a-billing
+              DomainName: !Ref SaasABillingApiDomain
+              CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
+              OriginCustomHeaders:
+                - { HeaderName: x-origin-verify, HeaderValue: !Ref OriginVerifySecret }
+            - !Ref AWS::NoValue
         CacheBehaviors:
-          - PathPattern: /api/saas-a-billing/*
-            TargetOriginId: api-saas-a-billing
-            ViewerProtocolPolicy: https-only
-            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
-            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
-            FunctionAssociations:
-              - EventType: viewer-request
-                FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
-            Compress: true
+          - !If
+            - HasSaasABillingApi
+            - PathPattern: /api/saas-a-billing/*
+              TargetOriginId: api-saas-a-billing
+              ViewerProtocolPolicy: https-only
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+              Compress: true
+            - !Ref AWS::NoValue
 ```
 
 ### ステップ 7: フロントにマニフェストを追加する
@@ -262,4 +269,4 @@ PR の説明に転記して使う。
 | 漢字が中華フォントで表示される | `index.html` の `lang` が `ja` でない、独自 CSS で font-family を上書きした | `lang="ja"`、`styles/settings.scss` の日本語フォントを使う |
 | ログの保持期間が「無期限」 | `AWS::Logs::LogGroup` を定義せず Lambda に自動作成させた | テンプレートで LogGroup を明示（365 日） |
 | コスト配分レポートにアプリが出ない | `Project` / `Name` タグ漏れ | samconfig の `tags` と各リソースの `Name` を付ける |
-| E2E がログインで止まる | dev の E2E ユーザーに TOTP を登録した | E2E ユーザーは TOTP 未登録のまま使う（dev が `ON` の場合は `otplib` で入力） |
+| E2E がログインで止まる | dev の E2E ユーザーに TOTP を登録した | MFA は任意（`OPTIONAL`）なので E2E ユーザーは TOTP 未登録のまま使う。登録済みなら `otplib` でコードを入力する |

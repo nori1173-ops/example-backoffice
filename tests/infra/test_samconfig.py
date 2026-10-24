@@ -1,9 +1,9 @@
-"""4 つの samconfig の「値」を守る（SP-09）。
+"""各スタックの samconfig の「値」を守る（SP-09）。
 
 テンプレート側の検査（`test_*_template.py`）は形を見るが、`samconfig.toml` の値は
 `test_saas_a_billing_template.py` の SSM キー名を除いて誰も見ていない。1 文字直し忘れると
 prod スタックが dev のレイヤ・ドメイン・キューを掴み、しかもデプロイは成功するため
-気づけない。ここでは 4 スタック分の `[default]` / `[production]` を突き合わせる。
+気づけない。ここでは全スタック分の `[default]` / `[production]` を突き合わせる。
 """
 
 import pathlib
@@ -17,16 +17,20 @@ PROD_CONFIG_ENV = "production"
 CONFIG_ENV_BY_ENV = {"dev": "default", "prod": PROD_CONFIG_ENV}
 
 SAMCONFIGS = {
+    "admin-users": "apps/admin-users/samconfig.toml",
     "shared": "shared/samconfig.toml",
     "core": "infra/core/samconfig.toml",
     "edge": "infra/edge/samconfig.toml",
     "saas-a-billing": "apps/saas-a-billing/samconfig.toml",
+    "daily-security-report": "apps/daily-security-report/samconfig.toml",
 }
 STACK_NAMES = {
+    "admin-users": "example-backoffice-app-admin-users",
     "shared": "example-backoffice-shared",
     "core": "example-backoffice-core",
     "edge": "example-backoffice-edge",
     "saas-a-billing": "example-backoffice-app-saas-a-billing",
+    "daily-security-report": "example-backoffice-app-daily-security-report",
 }
 
 SITE_DOMAIN = {"dev": "backoffice-dev.example-cloud.com", "prod": "backoffice.example-cloud.com"}
@@ -34,6 +38,18 @@ REGION = "ap-northeast-1"
 
 # 環境ごとに値が変わるパラメータ（app の SSM キー名は test_saas_a_billing_template.py が見る）
 EXPECTED_OVERRIDES = {
+    "admin-users": {
+        "dev": {
+            "Env": "dev",
+            "LogLevel": "DEBUG",
+            "UserPoolId": "/example-backoffice/dev/cognito/user-pool-id",
+        },
+        "prod": {
+            "Env": "prod",
+            "LogLevel": "INFO",
+            "UserPoolId": "/example-backoffice/prod/cognito/user-pool-id",
+        },
+    },
     "shared": {
         "dev": {"Env": "dev", "SlackMode": "bot"},
         "prod": {"Env": "prod", "SlackMode": "bot"},
@@ -76,6 +92,20 @@ EXPECTED_OVERRIDES = {
             "OpsTopicArn": "/example-backoffice/prod/ops/topic-arn",
         },
     },
+    "daily-security-report": {
+        "dev": {
+            "Env": "dev",
+            "LogLevel": "DEBUG",
+            "PortalUrl": f"https://{SITE_DOMAIN['dev']}/daily-security-report",
+            "OpsTopicArn": "/example-backoffice/dev/ops/topic-arn",
+        },
+        "prod": {
+            "Env": "prod",
+            "LogLevel": "INFO",
+            "PortalUrl": f"https://{SITE_DOMAIN['prod']}/daily-security-report",
+            "OpsTopicArn": "/example-backoffice/prod/ops/topic-arn",
+        },
+    },
 }
 
 
@@ -101,7 +131,7 @@ CASES = [(stack, env) for stack in STACKS for env in ("dev", "prod")]
 
 @pytest.mark.parametrize("stack", STACKS)
 def test_sections_are_default_and_production(stack):
-    """セクション名を 4 スタックで揃える（片方だけ `prod` だと一括デプロイが落ちる）。"""
+    """セクション名を全スタックで揃える（片方だけ `prod` だと一括デプロイが落ちる）。"""
     assert set(_load(stack)) - {"version"} == {"default", PROD_CONFIG_ENV}, stack
 
 

@@ -7,7 +7,7 @@ parts に無いので、`Init` が置いたテナント一覧のスナップシ�
 
 判定と集計は `billing` の純粋関数に任せ、ここは入出力の組み立てに徹する。`result.json`
 （設計 7.3）→ Excel（6.6）→ RUN=`succeeded`（6.9）→ 配布（6.8）の順に進む。添付は S3 に
-置いた Excel のキーを参照するだけで、添付バケットに同じ Excel を二重保存しない。
+置いた Excel のキーを参照し、メール添付用のシート 1 版は月の `mail/` の下に保存する。
 
 通知の投函に失敗しても RUN は `succeeded` のまま `error` に記録する（設計 11.1）。
 `api_token` / `token_expires_at` は `finish_success` が消す。
@@ -36,6 +36,7 @@ RESULT_SCHEMA = "saas-a-billing.result.v1"
 OK = "ok"
 FAILED = "failed"
 NO_DISTRIBUTION_TARGET = "配布先が無効のため送付なし"
+PARTIAL_FAILURE_NOTE = "取得失敗 {count} テナントのため配布見送り"
 
 metrics = Metrics(namespace=METRICS_NAMESPACE)
 
@@ -108,6 +109,7 @@ def _tenant_result(part: dict, tenant: dict, settings: dict, table: PriceTable, 
         "tenant_cd": part["tenant_cd"],
         "tenant_name": tenant.get("tenant_name", ""),
         "tenant_description": tenant.get("tenant_description", ""),
+        "tenant_excluded": billing.is_tenant_excluded(tenant, settings.get("exclude_keywords") or []),
         "retention_period": tenant.get("retention_period"),
         "device_count_api": int(tenant.get("device_count") or 0),
         "status": part.get("status") or OK,
@@ -203,13 +205,11 @@ def _slack(settings: dict, result: dict, closing: ClosingPeriod, portal_url: str
     return Slack(text=text, channel=settings["slack_channel_id"], mention=settings["slack_mention"] or None)
 
 
-def _email(settings: dict, result: dict, closing: ClosingPeriod, portal_url: str) -> Email:
+def _email(settings: dict, result: dict, closing: ClosingPeriod, portal_url: str, distribution_no: int) -> Email:
     return Email(
         to=settings["mail_to"],
         cc=settings["mail_cc"],
-        subject=messages.mail_subject(
-            result["month"], closing.cutoff_day, result["target_env"], result["run"]["attempt"]
-        ),
+        subject=messages.mail_subject(result["month"], closing.cutoff_day, result["target_env"], distribution_no),
         text=messages.mail_body(
             month=result["month"],
             period=closing,
@@ -222,39 +222,113 @@ def _email(settings: dict, result: dict, closing: ClosingPeriod, portal_url: str
     )
 
 
-def _send_report(settings: dict, result: dict, closing: ClosingPeriod, xlsx_key: str, channels: list[str]) -> str:
+def _send_report(
+    settings: dict, result: dict, closing: ClosingPeriod, xlsx_key: str, channels: list[str], distribution_no: int
+) -> str:
     """成功通知を 1 件投函して `message_id` を返す（設計 6.8）。"""
     month, target_env = result["month"], result["target_env"]
     attempt = result["run"]["attempt"]
     portal_url = messages.portal_url(os.environ["ENV"], target_env, month)
+    attachment_key = xlsx_key
+    if distribution.EMAIL_CHANNEL in channels:
+        selected = "all" if settings.get("mail_attachment_sheets") == "all" else "billing_only"
+        if selected != "all":
+            attachment_key = storage.put_xlsx(
+                target_env, month, excel.build_workbook(result, billing_only=True), billing_only=True
+            )
+        logger.info(
+            "mail attachment selected",
+            {"target_env": target_env, "month": month, "mail_attachment_sheets": selected, "key": attachment_key},
+        )
     attachment = Attachment(
-        key=xlsx_key,
+        key=attachment_key,
         filename=messages.attachment_filename(month, target_env),
         content_type=storage.XLSX_CONTENT_TYPE,
     )
     return send(
         app=APP,
         channels=channels,
-        email=_email(settings, result, closing, portal_url) if distribution.EMAIL_CHANNEL in channels else None,
+        email=_email(settings, result, closing, portal_url, distribution_no)
+        if distribution.EMAIL_CHANNEL in channels
+        else None,
         attachments=[attachment],
         slack=_slack(settings, result, closing, portal_url) if distribution.SLACK_CHANNEL in channels else None,
         meta={"target_env": target_env, "month": month, "attempt": attempt},
     )
 
 
-def _distribute(event: dict, settings: dict, result: dict, closing: ClosingPeriod, xlsx_key: str) -> bool:
-    """通知を投函して RUN を `distributed` にする。投函の失敗は `succeeded` のまま記録する（設計 11.1）。"""
+def _send_partial_failure(settings: dict, result: dict, channels: list[str], distribution_no: int) -> str:
+    """取得失敗の連絡を 1 件投函して `message_id` を返す（設計 6.8 / 11.1）。Excel は添付しない。"""
+    month, target_env, summary = result["month"], result["target_env"], result["summary"]
+    portal_url = messages.portal_url(os.environ["ENV"], target_env, month)
+    failed_tenants = _failed_tenants(result["tenants"])
+    text = messages.partial_failure_mail_body(
+        month=month, summary=summary, portal_url=portal_url, target_env=target_env, failed_tenants=failed_tenants
+    )
+    return send(
+        app=APP,
+        channels=channels,
+        email=Email(
+            to=settings["mail_to"],
+            cc=settings["mail_cc"],
+            subject=messages.partial_failure_mail_subject(
+                month, summary["failed_tenant_count"], target_env, distribution_no
+            ),
+            text=text,
+        )
+        if distribution.EMAIL_CHANNEL in channels
+        else None,
+        slack=Slack(
+            text=messages.partial_failure_slack_text(
+                month=month,
+                summary=summary,
+                portal_url=portal_url,
+                target_env=target_env,
+                failed_tenants=failed_tenants,
+            ),
+            channel=settings["slack_channel_id"],
+            mention=settings["slack_mention"] or None,
+        )
+        if distribution.SLACK_CHANNEL in channels
+        else None,
+        meta={"target_env": target_env, "month": month, "attempt": result["run"]["attempt"]},
+    )
+
+
+def _distribute(
+    event: dict, settings: dict, result: dict, closing: ClosingPeriod, xlsx_key: str, distribution_no: int
+) -> bool:
+    """通知を投函して RUN を `distributed` にする。投函の失敗は `succeeded` のまま記録する（設計 11.1）。
+
+    取得失敗のテナントがあると集計外になって合計金額が過少になるため、Excel は配らず
+    再実行を促す連絡だけを送る（#1006）。RUN は `succeeded` のまま理由を残す。
+
+    件名の再送表記は `distribution_no`（今回が何回目の配布か）を根拠にする。試行を重ねても
+    配っていなければ初回のままで、逆に配るたびに 1 つ進む（#1013）。
+    """
     target_env, month, attempt = repo.target_env(), event["month"], event["attempt"]
     channels = distribution.channels(settings)
     if not channels:
         logger.info(NO_DISTRIBUTION_TARGET, {"target_env": target_env, "month": month})
         repo.set_distribute_note(target_env, month, attempt, NO_DISTRIBUTION_TARGET)
         return False
+    failed_tenant_count = result["summary"]["failed_tenant_count"]
     try:
-        message_id = _send_report(settings, result, closing, xlsx_key, channels)
+        message_id = (
+            _send_partial_failure(settings, result, channels, distribution_no)
+            if failed_tenant_count
+            else _send_report(settings, result, closing, xlsx_key, channels, distribution_no)
+        )
     except Exception as error:
         logger.error("通知の投函に失敗しました", {"target_env": target_env, "month": month, "error": str(error)})
         repo.set_notify_error(target_env, month, attempt, str(error))
+        return False
+    if failed_tenant_count:
+        note = PARTIAL_FAILURE_NOTE.format(count=failed_tenant_count)
+        logger.warning(note, {"target_env": target_env, "month": month, "notify_message_id": message_id})
+        repo.set_distribute_note(
+            target_env, month, attempt, note, notify_message_id=message_id, notify_channels=channels
+        )
         return False
     repo.finish_distributed(
         target_env,
@@ -318,7 +392,11 @@ def handler(event: dict, context) -> dict:
         price_effective_from=price_item["effective_from"],
         metrics=_run_metrics(tenants, duration_sec),
     )
-    distributed = _distribute(event, settings, result, closing, xlsx_key) if event["distribute"] else False
+    distributed = (
+        _distribute(event, settings, result, closing, xlsx_key, repo.distribution_no(run))
+        if event["distribute"]
+        else False
+    )
     _emit_metrics(summary, duration_sec)
     logger.info(
         "集計を終えました",

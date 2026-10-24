@@ -8,22 +8,24 @@ import * as directives from 'vuetify/directives'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 import EnvBadge from '../components/EnvBadge.vue'
-import type { AuditEntry, PriceVersion, SettingsView, SlackMode, TargetEnv } from '../types'
+import type { PriceVersion, SettingsView, SlackDirectory, SlackMode, TargetEnv } from '../types'
 import SettingsViewComponent from '../views/SettingsView.vue'
 
 interface SettingsStoreMock {
   settings: SettingsView | null
   prices: PriceVersion[]
-  audits: AuditEntry[]
   slackMode: SlackMode | null
   targets: Partial<Record<TargetEnv, boolean>>
   saasaHost: string | null
   loading: boolean
   error: string | null
+  directory: SlackDirectory | null
+  directoryLoading: boolean
+  directoryError: string | null
   fetch: Mock
   save: Mock
   addPrice: Mock
-  fetchAudits: Mock
+  loadSlackDirectory: Mock
 }
 
 const holder = vi.hoisted(() => ({ settings: null as unknown as SettingsStoreMock }))
@@ -33,16 +35,18 @@ vi.mock('../stores/settings', async () => {
   holder.settings = reactive({
     settings: null,
     prices: [],
-    audits: [],
     slackMode: null,
     targets: { verification: false, production: false },
     saasaHost: null,
     loading: false,
     error: null,
+    directory: null,
+    directoryLoading: false,
+    directoryError: null,
     fetch: vi.fn(),
     save: vi.fn().mockResolvedValue(true),
     addPrice: vi.fn().mockResolvedValue(true),
-    fetchAudits: vi.fn(),
+    loadSlackDirectory: vi.fn().mockResolvedValue(undefined),
   }) as SettingsStoreMock
   return { useSettingsStore: () => holder.settings }
 })
@@ -52,13 +56,13 @@ function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
     target_env: 'verification',
     cutoff_day: 20,
     cutoff_time: '24:00',
-    auto_retry_days: 5,
     auto_run_enabled: false,
     auto_run_from_month: '2026-10',
     mail_enabled: false,
     slack_enabled: false,
     mail_to: ['devA@example.co.jp'],
     mail_cc: [],
+    mail_attachment_sheets: 'billing_only',
     slack_channel_id: 'C0123ABCD',
     slack_channel_label: '#proj-saas-a-billing',
     slack_mention: '',
@@ -76,6 +80,27 @@ function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
   }
 }
 
+function makeDirectory(): SlackDirectory {
+  return {
+    channels: [
+      { id: 'C0123ABCD', name: 'proj-saas-a-billing', is_private: false, is_member: false },
+      { id: 'G0999ZZZZ', name: 'secret', is_private: true, is_member: true },
+    ],
+    users: [{ id: 'U0000DEVA1', handle: 'devA', real_name: 'DevA', display_name: '開発者本人' }],
+    fetched_at: '2026-09-04T02:30:00Z',
+  }
+}
+
+function suggestOptions(): HTMLElement[] {
+  return Array.from(document.body.querySelectorAll('[data-test="suggest-option"]'))
+}
+
+/** トリガー文字から入力して候補を開く（Slack の入力欄と同じ操作）。 */
+async function typeSuggest(wrapper: VueWrapper, testId: string, text: string): Promise<void> {
+  await wrapper.find(`[data-test="${testId}"] input`).setValue(text)
+  await flushPromises()
+}
+
 function makePriceVersion(effectiveFrom: string): PriceVersion {
   return {
     effective_from: effectiveFrom,
@@ -90,17 +115,6 @@ function makePriceVersion(effectiveFrom: string): PriceVersion {
     created_at: `${effectiveFrom}T10:00:00+09:00`,
     created_by: 'sub',
     created_by_email: 'devA@example.co.jp',
-  }
-}
-
-function makeAudit(at: string, target: AuditEntry['target'] = 'settings'): AuditEntry {
-  return {
-    target,
-    actor: 'sub',
-    actor_email: 'devA@example.co.jp',
-    before: { cutoff_day: 20 },
-    after: { cutoff_day: 25 },
-    at,
   }
 }
 
@@ -140,6 +154,13 @@ function dialogEl(testId: string): HTMLElement | null {
   return document.body.querySelector(`[data-test="${testId}"]`)
 }
 
+/** 開いているツールチップの文言。 */
+function activeTooltips(): string {
+  return Array.from(document.body.querySelectorAll('.v-overlay--active'))
+    .map((overlay) => overlay.textContent ?? '')
+    .join(' ')
+}
+
 beforeEach(() => {
   document.body.innerHTML = ''
   pinia = createPinia()
@@ -147,16 +168,18 @@ beforeEach(() => {
   const store = holder.settings
   store.settings = makeSettings()
   store.prices = [makePriceVersion('2025-09-01')]
-  store.audits = []
   store.slackMode = 'bot'
   store.targets = { verification: true, production: true }
   store.saasaHost = 'example.invalid'
   store.loading = false
   store.error = null
+  store.directory = makeDirectory()
+  store.directoryLoading = false
+  store.directoryError = null
+  store.loadSlackDirectory.mockReset().mockResolvedValue(undefined)
   store.fetch.mockReset()
   store.save.mockReset().mockResolvedValue(true)
   store.addPrice.mockReset().mockResolvedValue(true)
-  store.fetchAudits.mockReset()
 })
 
 describe('SettingsView', () => {
@@ -205,15 +228,6 @@ describe('SettingsView', () => {
 
     expect(wrapper.find('[data-test="cutoff-day"]').text()).toContain('1〜28')
     expect(wrapper.find('[data-test="settings-save"]').attributes('disabled')).toBeDefined()
-  })
-
-  it('slack_channel_id が #name 形式ならエラー表示', async () => {
-    const wrapper = await mountView()
-
-    await wrapper.find('[data-test="slack-channel-id"] input').setValue('#proj-saas-a-billing')
-    await flushPromises()
-
-    expect(wrapper.find('[data-test="slack-channel-id"]').text()).toContain('C または G')
   })
 
   it('接続情報（SSM）未登録なら保存ボタンの横に理由が出る', async () => {
@@ -265,7 +279,7 @@ describe('SettingsView', () => {
     holder.settings.settings = makeSettings({ slack_channel_id: '#proj-saas-a-billing' })
     const wrapper = await mountView()
 
-    expect(wrapper.find('[data-test="slack-channel-id"]').text()).toContain('C または G')
+    expect(wrapper.find('[data-test="slack-channel-id"]').text()).toContain('古い形式')
   })
 
   it('メール配布 ON で宛先が空ならエラー表示', async () => {
@@ -288,6 +302,94 @@ describe('SettingsView', () => {
     expect(holder.settings.save).toHaveBeenCalledWith(
       expect.objectContaining({ mail_enabled: true, slack_enabled: true }),
     )
+  })
+
+  // #1011: チャンネルとメンションは候補から選ぶ。画面に ID は出さない
+  it('表示名の手入力フィールドは無い', async () => {
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="slack-channel-label"]').exists()).toBe(false)
+  })
+
+  it('候補が未取得なら画面表示で読み込む', async () => {
+    holder.settings.directory = null
+    await mountView()
+
+    expect(holder.settings.loadSlackDirectory).toHaveBeenCalled()
+  })
+
+  it('候補を取得済みなら画面に戻っても取り直さない', async () => {
+    await mountView()
+
+    expect(holder.settings.loadSlackDirectory).not.toHaveBeenCalled()
+  })
+
+  it('保存済みのチャンネルは名前のチップで出し、ID は画面に出さない', async () => {
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="slack-channel-id"]').text()).toContain('#proj-saas-a-billing')
+    expect(wrapper.html()).not.toContain('C0123ABCD')
+  })
+
+  it('候補に無いチャンネルは保存済みの表示名で出す', async () => {
+    holder.settings.directory = { ...makeDirectory(), channels: [] }
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="slack-channel-id"]').text()).toContain('#proj-saas-a-billing')
+  })
+
+  it('# で選ぶと ID と表示名の両方が更新される', async () => {
+    const wrapper = await mountView()
+
+    await typeSuggest(wrapper, 'slack-channel-id', '#sec')
+    suggestOptions()[0].click()
+    await flushPromises()
+    await wrapper.find('[data-test="settings-save"]').trigger('click')
+    await flushPromises()
+
+    expect(holder.settings.save).toHaveBeenCalledWith(
+      expect.objectContaining({ slack_channel_id: 'G0999ZZZZ', slack_channel_label: '#secret' }),
+    )
+  })
+
+  it('@ で選ぶと保存値は Slack のメンション記法になる', async () => {
+    const wrapper = await mountView()
+
+    await typeSuggest(wrapper, 'slack-mention', '@開発')
+    suggestOptions()[0].click()
+    await flushPromises()
+    await wrapper.find('[data-test="settings-save"]').trigger('click')
+    await flushPromises()
+
+    expect(holder.settings.save).toHaveBeenCalledWith(
+      expect.objectContaining({ slack_mention: '<@U0000DEVA1>' }),
+    )
+  })
+
+  it('保存済みのメンションは名前のチップで出し、ID は画面に出さない', async () => {
+    holder.settings.settings = makeSettings({ slack_mention: '<@U0000DEVA1> <!here>' })
+    const wrapper = await mountView()
+
+    const field = wrapper.find('[data-test="slack-mention"]')
+    expect(field.text()).toContain('@開発者本人')
+    expect(field.text()).toContain('@here')
+    expect(wrapper.html()).not.toContain('U0000DEVA1')
+  })
+
+  it('候補の取得に失敗しても警告と再取得ボタンを出すだけで保存はできる', async () => {
+    holder.settings.directory = null
+    holder.settings.directoryError = 'Slack の Bot token が登録されていません'
+    const wrapper = await mountView()
+
+    const alert = wrapper.find('[data-test="slack-directory-error"]')
+    expect(alert.text()).toContain('Slack の候補を取得できませんでした')
+    expect(alert.text()).toContain('Bot token')
+    expect(wrapper.find('[data-test="settings-save"]').attributes('disabled')).toBeUndefined()
+
+    holder.settings.loadSlackDirectory.mockClear()
+    await wrapper.find('[data-test="slack-directory-retry"]').trigger('click')
+
+    expect(holder.settings.loadSlackDirectory).toHaveBeenCalledWith(true)
   })
 
   // 集計対象環境はサイト固定（設計 R1 / UI-08）。画面からは変更できない
@@ -408,31 +510,13 @@ describe('SettingsView', () => {
     expect(wrapper.find('[data-test="price-add"]').attributes('disabled')).toBeDefined()
   })
 
-  it('監査履歴が表示される', async () => {
-    holder.settings.audits = [
-      makeAudit('2026-11-03T10:00:00+09:00'),
-      makeAudit('2026-11-02T10:00:00+09:00', 'price'),
-      makeAudit('2026-11-01T10:00:00+09:00'),
-    ]
-    const wrapper = await mountView()
-
-    expect(holder.settings.fetchAudits).toHaveBeenCalledTimes(1)
-    const rows = wrapper.findAll('[data-test="audit-row"]')
-    expect(rows).toHaveLength(3)
-    expect(rows[0].text()).toContain('2026-11-03')
-    expect(rows[1].text()).toContain('単価表')
-    expect(rows[2].text()).toContain('2026-11-01')
-  })
-
   // 初期状態（ストアが空）でも取りに行く。未取得を未保存と誤判定して fetch を飛ばしていた
-  it('ストアが空の初期状態でも設定と変更履歴を取りに行く', async () => {
+  it('ストアが空の初期状態でも設定を取りに行く', async () => {
     holder.settings.settings = null
     holder.settings.prices = []
-    holder.settings.audits = []
     const wrapper = await mountView()
 
     expect(holder.settings.fetch).toHaveBeenCalledTimes(1)
-    expect(holder.settings.fetchAudits).toHaveBeenCalledTimes(1)
     expect(wrapper.find('[data-test="dirty-chip"]').exists()).toBe(false)
   })
 
@@ -614,21 +698,74 @@ describe('SettingsView', () => {
     )
   })
 
-  // 監査表の生キーは非開発者に読めない（UI-17）
-  it('変更履歴の項目名が日本語になる', async () => {
-    holder.settings.audits = [makeAudit('2026-11-03T10:00:00+09:00')]
+  // 画面の語の意味が分からないという指摘への対応（#1012）
+  it('ヘルプモード ON で締め日時と除外キーワードの説明が出る', async () => {
+    useUiStore().toggleHelpMode()
     const wrapper = await mountView()
 
-    const row = wrapper.find('[data-test="audit-row"]').text()
-    expect(row).toContain('締め日')
-    expect(row).not.toContain('cutoff_day')
+    await wrapper.find('[data-test="cutoff-day"]').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('毎月この日時で締めます')
+
+    await wrapper.find('[data-test="exclude-keywords"]').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('0 円（除外）にします')
   })
 
-  it('admin 以外には変更履歴ブロックが出ない', async () => {
-    holder.settings.audits = [makeAudit('2026-11-03T10:00:00+09:00')]
-    const wrapper = await mountView([])
+  // 押せない理由を一番知りたいときに説明が出ないと困る。disabled な button はマウスイベントを受けない
+  it('ヘルプモード ON なら無効な保存ボタンでも説明が出る', async () => {
+    holder.settings.targets = {}
+    useUiStore().toggleHelpMode()
+    const wrapper = await mountView()
 
-    expect(wrapper.find('[data-test="audit-block"]').exists()).toBe(false)
-    expect(holder.settings.fetchAudits).not.toHaveBeenCalled()
+    const save = wrapper.find('[data-test="settings-save"]')
+    expect(save.attributes('disabled')).toBeDefined()
+
+    save.element.parentElement?.dispatchEvent(new MouseEvent('mouseenter'))
+    await flushPromises()
+
+    expect(activeTooltips()).toContain('入力した設定を保存します')
+  })
+})
+
+
+describe('メール添付のシート範囲', () => {
+  it('選択肢・未設定時の既定値・ヘルプを表示する', async () => {
+    Reflect.deleteProperty(holder.settings.settings!, 'mail_attachment_sheets')
+    const wrapper = await mountView()
+    const field = wrapper.findComponent<typeof components.VSelect>('[data-test="mail-attachment-sheets"]')
+    expect(field.props('label')).toBe('メールに添付する Excel')
+    expect(field.props('modelValue')).toBe('billing_only')
+    expect(field.props('items')).toEqual([
+      { title: 'シート 1（請求照合）のみ', value: 'billing_only' },
+      { title: '両方のシート（請求照合 + 全地点）', value: 'all' },
+    ])
+    const { HELP } = await import('../help')
+    expect(HELP.settings.mailAttachmentSheets).toBe('メールに添付する Excel に含めるシートを選びます。「シート 1 のみ」にすると、全地点の一覧（管理用のシート）は添付に含まれません。画面からダウンロードする Excel は、この設定に関係なく常に両方のシートが入ります。Slack には Excel を添付しません')
+    await wrapper.find('[data-test="settings-save"]').trigger('click')
+    expect(holder.settings.save).toHaveBeenCalledWith(expect.objectContaining({ mail_attachment_sheets: 'billing_only' }))
+  })
+
+  it('変更ありを検出し、選択値を保存・再表示・破棄できる', async () => {
+    const wrapper = await mountView()
+    const field = wrapper.findComponent<typeof components.VSelect>('[data-test="mail-attachment-sheets"]')
+    expect(wrapper.find('[data-test="discard-changes"]').exists()).toBe(false)
+    field.vm.$emit('update:modelValue', 'all')
+    await flushPromises()
+    expect(wrapper.find('[data-test="discard-changes"]').exists()).toBe(true)
+    await wrapper.find('[data-test="settings-save"]').trigger('click')
+    expect(holder.settings.save).toHaveBeenCalledWith(expect.objectContaining({ mail_attachment_sheets: 'all' }))
+    holder.settings.settings = makeSettings({ mail_attachment_sheets: 'all' })
+    await flushPromises()
+    expect(field.props('modelValue')).toBe('all')
+    field.vm.$emit('update:modelValue', 'billing_only')
+    await flushPromises()
+    await wrapper.find('[data-test="discard-changes"]').trigger('click')
+    expect(field.props('modelValue')).toBe('all')
+  })
+
+  it('管理者以外は変更できない', async () => {
+    const wrapper = await mountView([])
+    expect(wrapper.findComponent<typeof components.VSelect>('[data-test="mail-attachment-sheets"]').props('disabled')).toBe(true)
   })
 })

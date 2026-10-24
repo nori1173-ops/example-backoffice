@@ -5,7 +5,7 @@ moto の実テーブルに対して読み書きし、条件付き書き込みが
 """
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -26,6 +26,7 @@ SAASA_HOST = "saasa-verification.example.com"
 PREVIOUS_ATTEMPT_FIELDS = ("error", "finished_at", "execution_arn", "summary", "api_token", "token_expires_at")
 TOKEN_FIELDS = ("api_token", "token_expires_at")
 LOGGER_NAME = "example_backoffice"
+AUDIT_AT = datetime(2026, 8, 31, 10, 0, tzinfo=JST)
 
 
 def test_target_env_falls_back_to_verification_with_warning(monkeypatch, caplog):
@@ -112,7 +113,7 @@ def test_get_settings_seeds_defaults_when_absent(table):
     assert settings["target_env"] == VERIFICATION
     assert settings["cutoff_day"] == 20
     assert settings["cutoff_time"] == "24:00"
-    assert settings["auto_retry_days"] == 5
+    assert "auto_retry_days" not in settings
     assert settings["auto_run_enabled"] is False
     assert settings["auto_run_from_month"] == datetime.now(JST).strftime("%Y-%m")
     assert settings["mail_to"] == [ACTOR_EMAIL]
@@ -222,7 +223,7 @@ def test_put_settings_audit_records_actor_and_before_after(table):
     assert audit["after"]["version"] == 1
 
 
-def test_seed_defaults_creates_price_table_2355(table):
+def test_seed_defaults_creates_price_table_2001(table):
     repo.seed_defaults()
 
     prices = repo.list_prices()
@@ -303,26 +304,18 @@ def test_acquire_run_creates_new_queued_run(table):
     assert run["run_token"] == RUN_TOKEN
     assert run["trigger"] == "manual"
     assert run["distribute"] is False
-    assert run["retry_alert_sent"] is False
     assert run["requested_by"] == ACTOR
     assert repo.get_run(VERIFICATION, MONTH)["attempt"] == 1
 
 
-def test_acquire_run_scheduled_sets_auto_attempts_1(table):
-    run = acquire(trigger="scheduled")
-
-    assert run["auto_attempts"] == 1
-    assert run["attempt"] == 1
-
-
-def test_acquire_run_manual_does_not_increment_auto_attempts(table):
+def test_acquire_run_does_not_write_retired_retry_attributes(table):
+    """自動再試行の撤去に伴い `auto_attempts` / `retry_alert_sent` は書かない（#1015）。"""
     acquire(trigger="scheduled")
     repo.finish_failed(VERIFICATION, MONTH, 1, "失敗")
+    acquire(trigger="scheduled", run_token="run-token-2")
 
-    run = acquire(trigger="manual", run_token="run-token-2")
-
-    assert run["attempt"] == 2
-    assert run["auto_attempts"] == 1
+    for name in ("auto_attempts", "retry_alert_sent"):
+        assert name not in raw_run(table)
 
 
 def test_acquire_run_on_failed_increments_attempt(table):
@@ -333,7 +326,6 @@ def test_acquire_run_on_failed_increments_attempt(table):
 
     assert run["attempt"] == 2
     assert run["status"] == "queued"
-    assert run["auto_attempts"] == 1
     assert run["run_token"] == "run-token-2"
 
 
@@ -431,6 +423,59 @@ def test_acquire_run_with_force_removes_previous_attempt_fields(table):
     for name in PREVIOUS_ATTEMPT_FIELDS:
         assert name not in run
         assert name not in raw_run(table)
+
+
+def test_scheduled_force_does_not_steal_an_active_run(table):
+    """スケジュール実行の force でも stale でない running は奪わない（#1013 レビュー M2）。"""
+    acquire(trigger="manual")
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+
+    with pytest.raises(repo.RunAcquisitionError) as excinfo:
+        acquire(trigger="scheduled", force=True, guard_active=True, run_token="run-token-2")
+
+    assert excinfo.value.reason == repo.ALREADY_RUNNING
+    run = repo.get_run(VERIFICATION, MONTH)
+    assert run["attempt"] == 1
+    assert run["status"] == "running"
+
+
+def test_scheduled_force_steals_a_stale_run(table):
+    """落ちたまま running の RUN は翌日のスケジュール実行が奪う（従来どおり）。"""
+    acquire(trigger="manual")
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+
+    run = acquire(
+        trigger="scheduled",
+        force=True,
+        guard_active=True,
+        run_token="run-token-2",
+        stale_before=today_start() + timedelta(days=1),
+    )
+
+    assert run["attempt"] == 2
+    assert run["status"] == "queued"
+
+
+def test_scheduled_force_steals_a_succeeded_run(table):
+    """締め前の手動実行の成功結果は奪う（奪ってよいかは trigger の判定が決める。#1013 / #1015）。"""
+    acquire(trigger="manual")
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+
+    run = acquire(trigger="scheduled", force=True, guard_active=True, run_token="run-token-2")
+
+    assert run["attempt"] == 2
+    assert run["trigger"] == "scheduled"
+
+
+def test_manual_force_steals_an_active_run(table):
+    """手動の force は無条件のまま（刺さった RUN を取り直す運用。設計 14.3）。"""
+    acquire(trigger="manual")
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+
+    run = acquire(trigger="manual", force=True, run_token="run-token-2")
+
+    assert run["attempt"] == 2
 
 
 def test_acquire_run_keeps_only_the_latest_history_entries(table):
@@ -599,6 +644,95 @@ def test_finish_distributed_requires_succeeded(table):
     assert run["notified_at"]
 
 
+def test_finish_distributed_counts_the_distribution(table):
+    """再送表記の根拠になる配布回数を数える（#1013）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+
+    finish_distributed(1)
+
+    assert repo.get_run(VERIFICATION, MONTH)["distributed_count"] == 1
+
+
+def test_distributed_count_survives_the_next_attempt(table):
+    """配布回数は attempt を跨いで残す（`PREVIOUS_ATTEMPT_ATTRIBUTES` に入れない。#1013）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+    finish_distributed(1)
+
+    acquire(force=True, run_token="run-token-2")
+    repo.start_run(VERIFICATION, MONTH, 2, "run-token-2")
+    finish_success(2)
+    finish_distributed(2)
+
+    run = repo.get_run(VERIFICATION, MONTH)
+    assert run["attempt"] == 2
+    assert run["distributed_count"] == 2
+
+
+def test_finish_distributed_records_the_attempt_started_at(table):
+    """配布した attempt の開始時刻を `distributed_started_at` に写す（締め後の配布の判定用。#1015）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+    started_at = repo.get_run(VERIFICATION, MONTH)["started_at"]
+
+    finish_distributed(1)
+
+    assert repo.get_run(VERIFICATION, MONTH)["distributed_started_at"] == started_at
+
+
+def test_succeeded_without_distribution_has_no_distributed_started_at(table):
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+    repo.set_distribute_note(VERIFICATION, MONTH, 1, "配布先が無効のため送付なし")
+
+    assert "distributed_started_at" not in repo.get_run(VERIFICATION, MONTH)
+
+
+def test_distributed_started_at_survives_a_failed_next_attempt(table):
+    """後の attempt が失敗しても配布済みの印は残す（再取得で REMOVE しない。#1015）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+    finish_distributed(1)
+    distributed_started_at = repo.get_run(VERIFICATION, MONTH)["distributed_started_at"]
+
+    acquire(force=True, run_token="run-token-2")
+    repo.finish_failed(VERIFICATION, MONTH, 2, "失敗")
+
+    run = repo.get_run(VERIFICATION, MONTH)
+    assert run["status"] == "failed"
+    assert run["distributed_started_at"] == distributed_started_at
+
+
+def test_set_distribute_note_does_not_count_the_notification(table):
+    """配布見送りの連絡は配布回数に数えない（Excel を配っていないため。#1013）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+
+    repo.set_distribute_note(VERIFICATION, MONTH, 1, "配布先が無効のため送付なし")
+
+    assert "distributed_count" not in repo.get_run(VERIFICATION, MONTH)
+
+    repo.set_distribute_note(
+        VERIFICATION,
+        MONTH,
+        1,
+        "取得失敗 2 テナントのため配布見送り",
+        notify_message_id="message-1",
+        notify_channels=["email", "slack"],
+    )
+
+    run = repo.get_run(VERIFICATION, MONTH)
+    assert run["notify_message_id"] == "message-1"
+    assert "distributed_count" not in run
+
+
 def test_set_distribute_note_keeps_succeeded(table):
     acquire()
     repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
@@ -609,6 +743,28 @@ def test_set_distribute_note_keeps_succeeded(table):
     run = repo.get_run(VERIFICATION, MONTH)
     assert run["status"] == "succeeded"
     assert run["distribute_note"] == "配布先が無効のため送付なし"
+
+
+def test_set_distribute_note_records_the_notification(table):
+    """配布は見送っても通知は投函するため、送った証跡を残す（#1006）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+    finish_success(1)
+
+    repo.set_distribute_note(
+        VERIFICATION,
+        MONTH,
+        1,
+        "取得失敗 2 テナントのため配布見送り",
+        notify_message_id="message-1",
+        notify_channels=["email", "slack"],
+    )
+
+    run = repo.get_run(VERIFICATION, MONTH)
+    assert run["status"] == "succeeded"
+    assert run["notify_message_id"] == "message-1"
+    assert run["notify_channels"] == ["email", "slack"]
+    assert run["notified_at"]
 
 
 def test_set_distribute_note_requires_succeeded(table):
@@ -672,21 +828,6 @@ def test_set_saasa_host_records_host_with_attempt_condition(table):
     assert repo.get_run(VERIFICATION, MONTH)["saasa_host"] == SAASA_HOST
 
 
-def test_mark_retry_alert_sent_sets_flag(table):
-    acquire(trigger="scheduled")
-    repo.finish_failed(VERIFICATION, MONTH, 1, "失敗")
-
-    assert repo.get_run(VERIFICATION, MONTH)["retry_alert_sent"] is False
-
-    repo.mark_retry_alert_sent(VERIFICATION, MONTH)
-
-    assert repo.get_run(VERIFICATION, MONTH)["retry_alert_sent"] is True
-
-
-def test_mark_retry_alert_sent_requires_existing_run(table):
-    assert_condition_failed(repo.mark_retry_alert_sent, VERIFICATION, MONTH)
-
-
 def test_list_audits_returns_latest_first(table):
     repo.get_settings()
     for version, cutoff_day in enumerate((19, 18, 17)):
@@ -697,6 +838,83 @@ def test_list_audits_returns_latest_first(table):
     assert [audit["after"]["cutoff_day"] for audit in audits] == [17, 18, 19]
     assert [audit["at"] for audit in audits] == sorted((audit["at"] for audit in audits), reverse=True)
     assert len(repo.list_audits(limit=2)) == 2
+
+
+def put_audit_items(table, targets: list[str]) -> list[str]:
+    """`targets` の監査を 1 分間隔で書き、時刻を古い順に返す。"""
+    moments = [(AUDIT_AT + timedelta(minutes=index)).isoformat() for index in range(len(targets))]
+    for at, target in zip(moments, targets, strict=True):
+        table.put_item(
+            Item={
+                "PK": repo.AUDIT_PK,
+                "SK": f"{at}#{target}",
+                "target": target,
+                "actor": ACTOR,
+                "actor_email": ACTOR_EMAIL,
+                "before": {},
+                "after": {},
+                "at": at,
+            }
+        )
+    return moments
+
+
+def test_put_run_audit_records_manual_run(table):
+    """時刻は `datetime` で渡し、SK と `at` の書式は repo が決める（設定・単価と同じ整形）。"""
+    after = {"month": MONTH, "target_env": VERIFICATION, "distribute": False, "force": True, "attempt": 2}
+
+    repo.put_run_audit(ACTOR, ACTOR_EMAIL, after, AUDIT_AT)
+
+    at = AUDIT_AT.isoformat()
+    item = table.scan()["Items"][0]
+    assert item["PK"] == repo.AUDIT_PK
+    assert item["SK"].startswith(f"{at}#")
+    audit = repo.list_audits()[0]
+    assert audit["target"] == repo.AUDIT_TARGET_RUN
+    assert (audit["actor"], audit["actor_email"], audit["at"]) == (ACTOR, ACTOR_EMAIL, at)
+    assert audit["before"] is None
+    assert audit["after"] == after
+
+
+def test_put_run_audit_normalizes_utc_to_jst(table):
+    """UTC の `datetime` で呼ばれても SK は JST 表記。混ざると `since` の範囲条件が外れる。"""
+    repo.put_run_audit(ACTOR, ACTOR_EMAIL, {"month": MONTH}, AUDIT_AT.astimezone(UTC))
+
+    assert repo.list_audits()[0]["at"] == AUDIT_AT.isoformat()
+
+
+def test_list_audits_filters_by_target(table):
+    moments = put_audit_items(table, ["run", "settings", "run", "price", "run", "settings"])
+
+    audits = repo.list_audits(target=repo.AUDIT_TARGET_RUN)
+
+    assert [audit["at"] for audit in audits] == [moments[4], moments[2], moments[0]]
+
+
+def test_list_audits_limit_counts_items_after_filtering(table):
+    """Query の Limit はフィルタ前に効くため、`limit` 件そろうまでページを辿る。"""
+    moments = put_audit_items(table, ["run", "settings", "settings", "run", "settings", "run"])
+
+    audits = repo.list_audits(limit=2, target=repo.AUDIT_TARGET_RUN)
+
+    assert [audit["at"] for audit in audits] == [moments[5], moments[3]]
+
+
+def test_list_audits_since_drops_older_entries(table):
+    moments = put_audit_items(table, ["settings", "run", "price"])
+
+    audits = repo.list_audits(since=moments[1])
+
+    assert [audit["at"] for audit in audits] == [moments[2], moments[1]]
+
+
+def test_list_audits_since_accepts_utc_notation(table):
+    """`since` は保存されている JST 表記へ正規化してから SK と比べる。"""
+    moments = put_audit_items(table, ["settings", "run", "price"])
+
+    audits = repo.list_audits(since="2026-08-31T01:01:00Z")
+
+    assert [audit["at"] for audit in audits] == [moments[2], moments[1]]
 
 
 def test_list_runs_returns_month_descending(table):
@@ -739,6 +957,47 @@ def test_is_stale_false_for_today_running(table):
 
     assert repo.is_stale(run, now) is False
     assert repo.is_stale({"status": "running"}, now) is False
+
+
+def test_active_runs_returns_queued_and_running_months(table):
+    """同じ集計環境で走っている RUN を月昇順で返す（#1006 の同時実行防止）。"""
+    now = datetime.now(JST)
+    acquire(month="2026-06")
+    repo.finish_failed(VERIFICATION, "2026-06", 1, "失敗")
+    acquire(month="2026-07")
+    repo.start_run(VERIFICATION, "2026-07", 1, RUN_TOKEN)
+    acquire(month="2026-08")
+
+    assert [run["month"] for run in repo.active_runs(VERIFICATION, now)] == ["2026-07", "2026-08"]
+
+
+def test_active_runs_skips_stale_runs(table):
+    """落ちたまま running の RUN が翌日以降まで実行を塞がないようにする（設計 6.2 の stale 規則）。"""
+    acquire()
+    repo.start_run(VERIFICATION, MONTH, 1, RUN_TOKEN)
+
+    assert repo.active_runs(VERIFICATION, datetime.now(JST) + timedelta(days=1)) == []
+
+
+def test_active_runs_scans_beyond_the_display_limit(table):
+    """走査を表示上限で切ると、古い月を再集計している最中の RUN を取りこぼす（#1006）。"""
+    oldest = "2025-01"
+    acquire(month=oldest)
+    repo.start_run(VERIFICATION, oldest, 1, RUN_TOKEN)
+    for index in range(repo.RUN_LIST_LIMIT):
+        month = f"{2026 + index // 12}-{index % 12 + 1:02d}"
+        acquire(month=month)
+        repo.finish_failed(VERIFICATION, month, 1, "終わった")
+
+    assert [run["month"] for run in repo.active_runs(VERIFICATION, datetime.now(JST))] == [oldest]
+
+
+def test_active_runs_does_not_cross_target_env(table):
+    acquire(PRODUCTION, MONTH)
+    now = datetime.now(JST)
+
+    assert repo.active_runs(VERIFICATION, now) == []
+    assert [run["month"] for run in repo.active_runs(PRODUCTION, now)] == [MONTH]
 
 
 def test_decimal_values_are_returned_as_int(table):
@@ -796,3 +1055,28 @@ def finish_distributed(attempt: int) -> None:
         notify_channels=["email", "slack"],
         distribute_note="",
     )
+
+
+def test_mail_attachment_sheets_default(table):
+    assert repo.get_settings()["mail_attachment_sheets"] == "billing_only"
+
+
+def test_mail_attachment_sheets_legacy_settings(table):
+    table.put_item(Item={"PK": "SETTINGS", "SK": "current", "version": 3})
+    assert repo.get_settings()["mail_attachment_sheets"] == "billing_only"
+    assert "mail_attachment_sheets" not in table.get_item(Key={"PK": "SETTINGS", "SK": "current"})["Item"]
+
+
+@pytest.mark.parametrize("value", ["billing_only", "all"])
+def test_mail_attachment_sheets_preserves_stored_value(table, value):
+    table.put_item(Item={"PK": "SETTINGS", "SK": "current", "version": 3, "mail_attachment_sheets": value})
+    assert repo.get_settings()["mail_attachment_sheets"] == value
+
+
+def test_mail_attachment_sheets_audit(table):
+    repo.get_settings()
+    saved = repo.put_settings({"mail_attachment_sheets": "all"}, 0, ACTOR, ACTOR_EMAIL)
+    audit = repo.list_audits()[0]
+    assert saved["mail_attachment_sheets"] == "all"
+    assert audit["before"]["mail_attachment_sheets"] == "billing_only"
+    assert audit["after"]["mail_attachment_sheets"] == "all"

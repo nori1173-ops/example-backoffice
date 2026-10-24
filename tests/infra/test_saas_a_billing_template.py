@@ -50,7 +50,7 @@ LIST_BUCKET_FUNCTIONS = (API_FUNCTION, *S3_FUNCTIONS)
 # 設計 5.5 の timeout（秒）/ メモリ（MB）
 SIZING = {
     API_FUNCTION: (29, 512),
-    TRIGGER_FUNCTION: (60, 256),
+    TRIGGER_FUNCTION: (900, 256),
     "InitFunction": (900, 1024),
     "CollectTenantFunction": (900, 1024),
     "AggregateFunction": (900, 1024),
@@ -89,6 +89,7 @@ API_SSM_RESOURCES = [
     *TARGET_SSM_RESOURCES,
     {"Fn::Sub": f"{_SSM_ARN}/edge/origin-verify-secret"},
     {"Fn::Sub": f"{_SSM_ARN}/shared/slack/mode"},
+    {"Fn::Sub": f"{_SSM_ARN}/shared/slack/bot-token"},
 ]
 
 TARGET_ENVS = ["verification", "production"]
@@ -100,6 +101,11 @@ ALARMS = {
     "SchedulerDlqAlarm": "AWS/SQS",
     "TriggerFailureAlarm": "AWS/SQS",
 }
+
+# 毎日のスケジュール実行の時刻（設計 5.1）。api は手動実行の直前判定に同じ値を使う
+SCHEDULE_HOUR = "6"
+SCHEDULE_MINUTE = "0"
+SCHEDULE_TIMEZONE = "Asia/Tokyo"
 
 # 月次バッチの失敗を当日中に拾うため、評価期間は 5 分（SP-04）
 MAX_ALARM_PERIOD_SECONDS = 300
@@ -353,11 +359,13 @@ def test_sqs_permission_scoped_to_notify_queue_arn(template):
 
 
 def test_ssm_permission_scoped_to_fixed_target_env(template):
-    """api が読む SSM は固定環境の接続情報・origin-verify・slack/mode だけに限定する。
+    """api が読む SSM は固定環境の接続情報・origin-verify・Slack の 2 本だけに限定する。
 
     接続情報の登録有無は `get_parameters_by_path` の**名前**で判定し、`base-url` と
-    `shared/slack/mode` は `get_parameter` で値を読むため、両方の操作が要る。固定して
-    いない環境のパスに権限を残すと、SP-01 の取り違えが IAM では止められない。
+    `shared/slack/mode`・`shared/slack/bot-token` は `get_parameter` で値を読むため、
+    両方の操作が要る。Bot token は設定画面の候補検索（#1011）で読むだけで、投稿は
+    notifier の担当。固定していない環境のパスに権限を残すと、SP-01 の取り違えが IAM
+    では止められない。
     """
     statements = _statements_for(template, API_FUNCTION, "ssm:")
     assert len(statements) == 1
@@ -381,6 +389,12 @@ def test_dynamodb_permission_scoped_to_own_table(template):
             assert _resources(statement) == [TABLE_ARN], logical_id
             granted.add(logical_id)
     assert granted == set(FUNCTIONS)
+
+
+def test_trigger_can_query_the_table(template):
+    """実行中 RUN の判定（`active_runs`）が Query に依存する。欠けると毎朝 trigger が落ちる（#1006）。"""
+    statements = _statements_for(template, TRIGGER_FUNCTION, "dynamodb:")
+    assert any("dynamodb:Query" in _actions(statement) for statement in statements)
 
 
 def test_start_execution_scoped_to_own_state_machine(template):
@@ -423,10 +437,25 @@ def test_schedule_is_cron_0600_asia_tokyo_with_flexible_off(template):
     schedule = _properties(template, TRIGGER_FUNCTION)["Events"]["Schedule"]
     assert schedule["Type"] == "ScheduleV2"
     properties = schedule["Properties"]
-    assert properties["ScheduleExpression"] == "cron(0 6 * * ? *)"
-    assert properties["ScheduleExpressionTimezone"] == "Asia/Tokyo"
+    assert properties["ScheduleExpression"] == {"Fn::Sub": "cron(${ScheduleMinute} ${ScheduleHour} * * ? *)"}
+    assert properties["ScheduleExpressionTimezone"] == SCHEDULE_TIMEZONE
     assert properties["FlexibleTimeWindow"] == {"Mode": "OFF"}
     assert properties["RetryPolicy"] == {"MaximumRetryAttempts": 2, "MaximumEventAgeInSeconds": 3600}
+
+
+def test_schedule_time_is_a_parameter(template):
+    """api が「スケジュール直前」を判定するため、時刻はテンプレートの 1 か所に持つ（#1006）。"""
+    parameters = template["Parameters"]
+    assert parameters["ScheduleHour"]["Default"] == SCHEDULE_HOUR
+    assert parameters["ScheduleMinute"]["Default"] == SCHEDULE_MINUTE
+
+
+def test_api_knows_the_schedule_time(template):
+    """`SCHEDULE_*` が無いと手動実行がスケジュールと重なる（#1006）。"""
+    variables = _properties(template, API_FUNCTION)["Environment"]["Variables"]
+    assert variables["SCHEDULE_HOUR"] == {"Ref": "ScheduleHour"}
+    assert variables["SCHEDULE_MINUTE"] == {"Ref": "ScheduleMinute"}
+    assert variables["SCHEDULE_TIMEZONE"] == SCHEDULE_TIMEZONE
 
 
 def test_schedule_name_is_scoped_to_the_environment(template):

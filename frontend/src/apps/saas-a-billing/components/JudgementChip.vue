@@ -4,16 +4,16 @@ import type { Judgement } from '../types'
 /** 「消えた地点」は `judgement` を持たないが、同じ体裁で並べるため列挙に加える（設計 6.5）。 */
 export type ChipJudgement = Judgement | 'missing'
 
-/** excel.py の COLOR_* と同値（設計 6.6）。課金と消えた地点は塗らない。 */
+/** excel.py の COLOR_* と同値（設計 6.6）。課金だけ塗らない。 */
 export const JUDGEMENT_FILLS: Record<ChipJudgement, string> = {
   billable: 'transparent',
   no_data: '#FDF3DC',
   excluded: '#DFE9F8',
   failed: '#E0E0E0',
-  missing: 'transparent',
+  missing: '#FCE4EC',
 }
 
-export const MISSING_TEXT_COLOR = '#808080'
+export const MISSING_TEXT_COLOR = '#616161'
 export const REVIEW_TEXT_COLOR = '#C00000'
 
 export const JUDGEMENT_LABELS: Record<ChipJudgement, string> = {
@@ -33,6 +33,8 @@ export const REVIEW_REASONS: Record<string, string> = {
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import HelpTip from '@/components/HelpTip.vue'
+import { HELP } from '../help'
 
 const props = withDefaults(defineProps<{ judgement: ChipJudgement; flags?: string[] }>(), {
   flags: () => [],
@@ -55,15 +57,27 @@ const reasons = computed(() =>
 
 <template>
   <span class="judgement-chip">
-    <span
-      class="judgement-chip__label"
-      :style="chipStyle"
-    >{{ label }}</span>
-    <span
+    <HelpTip :text="HELP.judgement[judgement]">
+      <template #default="{ props: tip }">
+        <span
+          v-bind="tip"
+          class="judgement-chip__label"
+          :style="chipStyle"
+        >{{ label }}</span>
+      </template>
+    </HelpTip>
+    <HelpTip
       v-if="flags.length"
-      class="judgement-chip__review"
-      :style="reviewStyle"
-    >要確認: {{ reasons }}</span>
+      :text="reasons"
+    >
+      <template #default="{ props: tip }">
+        <span
+          v-bind="tip"
+          class="judgement-chip__review"
+          :style="reviewStyle"
+        >要確認: {{ reasons }}</span>
+      </template>
+    </HelpTip>
   </span>
 </template>
 

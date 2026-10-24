@@ -4,7 +4,7 @@ Description: example-backoffice edge - SPA バケット / OAC / CloudFront / Rou
 
 # 前提: OriginVerifySecret は scripts/init-secrets.sh が SSM に登録した値を
 # scripts/deploy-edge.sh が復号取得して --parameter-overrides で渡す（設計 5.5）。
-# SaasABillingApiDomain も同スクリプトが SSM /example-backoffice/{env}/apps/saas-a-billing/api-domain
+# 各アプリの {App}ApiDomain も同スクリプトが SSM /example-backoffice/{env}/apps/{app}/api-domain
 # から読んで渡す。未指定なら API origin / behavior を作らないので app 未デプロイでも edge は立つ。
 
 Parameters:
@@ -42,9 +42,19 @@ Parameters:
     Type: String
     Default: ""
     Description: saas-a-billing の HTTP API ドメイン（設計 4.2 の /apps/saas-a-billing/api-domain）。空なら API 経路を作らない
+  AdminUsersApiDomain:
+    Type: String
+    Default: ""
+    Description: admin-users の HTTP API ドメイン（設計 4.2 の /apps/admin-users/api-domain）。空なら API 経路を作らない
+  DailySecurityReportApiDomain:
+    Type: String
+    Default: ""
+    Description: AWS日次セキュリティレポートの HTTP API ドメイン（/apps/daily-security-report/api-domain）。空なら API 経路を作らない
 
 Conditions:
   HasSaasABillingApi: !Not [!Equals [!Ref SaasABillingApiDomain, ""]]
+  HasAdminUsersApi: !Not [!Equals [!Ref AdminUsersApiDomain, ""]]
+  HasDailySecurityReportApi: !Not [!Equals [!Ref DailySecurityReportApiDomain, ""]]
 
 Resources:
   SpaBucket:
@@ -277,6 +287,30 @@ Resources:
                 - HeaderName: x-origin-verify
                   HeaderValue: !Ref OriginVerifySecret
             - !Ref AWS::NoValue
+          - !If
+            - HasAdminUsersApi
+            - Id: api-admin-users
+              DomainName: !Ref AdminUsersApiDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: x-origin-verify
+                  HeaderValue: !Ref OriginVerifySecret
+            - !Ref AWS::NoValue
+          - !If
+            - HasDailySecurityReportApi
+            - Id: api-daily-security-report
+              DomainName: !Ref DailySecurityReportApiDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: x-origin-verify
+                  HeaderValue: !Ref OriginVerifySecret
+            - !Ref AWS::NoValue
         DefaultCacheBehavior:
           TargetOriginId: spa
           ViewerProtocolPolicy: https-only
@@ -290,11 +324,14 @@ Resources:
           FunctionAssociations:
             - EventType: viewer-request
               FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
-        # アプリを足すときはここへ behavior を 1 本追加する。
+        # アプリを足すときはここへ behavior を 1 本追加する。条件は origin と同じく
+        # 「要素ごとの - !If」で付ける（リスト全体を !If にすると、後から足した behavior が
+        # 他アプリの Condition に巻き込まれて丸ごと消える）。
         # viewer-request の FunctionAssociations を必ず付ける（付け忘れるとその API だけ IP 制限を素通りする）。
-        CacheBehaviors: !If
-          - HasSaasABillingApi
-          - - PathPattern: /api/saas-a-billing/*
+        CacheBehaviors:
+          - !If
+            - HasSaasABillingApi
+            - PathPattern: /api/saas-a-billing/*
               TargetOriginId: api-saas-a-billing
               ViewerProtocolPolicy: https-only
               AllowedMethods:
@@ -311,7 +348,47 @@ Resources:
               FunctionAssociations:
                 - EventType: viewer-request
                   FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
-          - !Ref AWS::NoValue
+            - !Ref AWS::NoValue
+          - !If
+            - HasAdminUsersApi
+            - PathPattern: /api/admin-users/*
+              TargetOriginId: api-admin-users
+              ViewerProtocolPolicy: https-only
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - PATCH
+                - POST
+                - DELETE
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              Compress: true
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+            - !Ref AWS::NoValue
+          - !If
+            - HasDailySecurityReportApi
+            - PathPattern: /api/daily-security-report/*
+              TargetOriginId: api-daily-security-report
+              ViewerProtocolPolicy: https-only
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - PATCH
+                - POST
+                - DELETE
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              Compress: true
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+            - !Ref AWS::NoValue
       Tags:
         - Key: Project
           Value: !Ref ProjectName

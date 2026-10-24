@@ -301,7 +301,7 @@ tests/infra/test_saas_a_billing_template.py   テンプレートとステート�
 - `test_select_table_same_day_is_included` — `as_of == effective_from` の版が選ばれる。
 - `test_select_table_ignores_future_versions` — 未来版は選ばれない。
 - `test_select_table_raises_when_none_effective` — 全部未来なら `PriceTableNotFoundError`。
-- `test_default_price_table_matches_2355` — 設計 2.3 の表と一致（4 帯 + カメラ）。
+- `test_default_price_table_matches_2001` — 設計 2.3 の表と一致（4 帯 + カメラ）。
 - `test_price_table_from_item_converts_decimal_to_int` — DynamoDB の `Decimal` が `int` になる。
 
 **手順:** テスト作成 → 失敗確認 → 実装 → 全 passed → CRLF 変換・確認 → `ruff check apps/` → コミット（`mod refs #1001 saas-a-billing の pricing（単価表）を追加`）。
@@ -561,7 +561,7 @@ tests/infra/test_saas_a_billing_template.py   テンプレートとステート�
 - `test_put_settings_increments_version_and_writes_audit`
 - `test_put_settings_version_mismatch_raises_conflict`
 - `test_put_settings_audit_records_actor_and_before_after`
-- `test_seed_defaults_creates_price_table_2355` — 4 帯 + カメラ、`effective_from == "2025-09-01"`。
+- `test_seed_defaults_creates_price_table_2001` — 4 帯 + カメラ、`effective_from == "2025-09-01"`。
 - `test_seed_defaults_is_idempotent`
 - `test_get_price_table_at_picks_latest_on_or_before`
 - `test_get_price_table_at_ignores_future`

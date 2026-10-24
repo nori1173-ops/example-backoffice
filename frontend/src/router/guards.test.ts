@@ -36,7 +36,7 @@ function makeRouter(): Router {
         component: Stub,
         children: [
           { path: '', name: 'home', component: Stub, meta: { title: 'ホーム' } },
-          { path: 'mfa', name: 'mfa', component: Stub },
+          { path: 'no-title', name: 'no-title', component: Stub },
           { path: 'forbidden', name: 'forbidden', component: Stub },
           { path: 'admin', name: 'admin', component: Stub, meta: { requiredGroups: ['admin'] } },
           {
@@ -82,10 +82,10 @@ describe('installGuards', () => {
     signedOut()
     const router = makeRouter()
 
-    await router.push('/mfa')
+    await router.push('/no-title')
 
     expect(router.currentRoute.value.name).toBe('login')
-    expect(router.currentRoute.value.query.redirect).toBe('/mfa')
+    expect(router.currentRoute.value.query.redirect).toBe('/no-title')
   })
 
   it('認証済みで /login へ行くと / へリダイレクトされる', async () => {
@@ -161,7 +161,7 @@ describe('installGuards', () => {
     await router.push('/')
     expect(document.title).toBe('ホーム | 社内保守管理サイト')
 
-    await router.push('/mfa')
+    await router.push('/no-title')
     expect(document.title).toBe('社内保守管理サイト')
   })
 
@@ -173,7 +173,7 @@ describe('installGuards', () => {
     await router.push('/')
     expect(document.title).toBe('[検証] ホーム | 社内保守管理サイト')
 
-    await router.push('/mfa')
+    await router.push('/no-title')
     expect(document.title).toBe('[検証] 社内保守管理サイト')
   })
 
@@ -182,7 +182,7 @@ describe('installGuards', () => {
     const router = makeRouter()
 
     await router.push('/')
-    await router.push('/mfa')
+    await router.push('/no-title')
 
     expect(getCurrentUser).toHaveBeenCalledTimes(1)
   })

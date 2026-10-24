@@ -27,6 +27,8 @@ pythonpath = [
     "shared/layers",
     "infra/core/src",
     "apps/saas-a-billing/functions",
+    "apps/admin-users/functions",
+    "apps/daily-security-report/functions",
 ]
 addopts = "-ra --strict-markers --import-mode=importlib"
 filterwarnings = ["error::DeprecationWarning:example_backoffice.*"]

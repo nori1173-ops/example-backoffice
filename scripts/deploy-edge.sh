@@ -51,7 +51,9 @@ case "${ENV_NAME}" in
 esac
 
 SECRET_PARAM="/${PROJECT}/${ENV_NAME}/edge/origin-verify-secret"
-API_DOMAIN_PARAM="/${PROJECT}/${ENV_NAME}/apps/saas-a-billing/api-domain"
+SAAS_A_BILLING_API_DOMAIN_PARAM="/${PROJECT}/${ENV_NAME}/apps/saas-a-billing/api-domain"
+DAILY_SECURITY_REPORT_API_DOMAIN_PARAM="/${PROJECT}/${ENV_NAME}/apps/daily-security-report/api-domain"
+ADMIN_USERS_API_DOMAIN_PARAM="/${PROJECT}/${ENV_NAME}/apps/admin-users/api-domain"
 
 echo "=== edge デプロイ ==="
 echo "  Env       : ${ENV_NAME} (--config-env ${CFG_ENV})"
@@ -69,14 +71,35 @@ if [ -z "${SECRET}" ] || [ "${SECRET}" = "None" ]; then
 fi
 echo "  OriginVerifySecret : SSM から取得しました（値は表示しない）"
 
-API_DOMAIN="$(aws ssm get-parameter --name "${API_DOMAIN_PARAM}" --region "${REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
-if [ "${API_DOMAIN}" = "None" ]; then
-  API_DOMAIN=""
+# アプリを足したら、この 1 組（SSM の解決と表示、下の OVERRIDES への連結）を複製する。
+SAAS_A_BILLING_API_DOMAIN="$(aws ssm get-parameter --name "${SAAS_A_BILLING_API_DOMAIN_PARAM}" --region "${REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+if [ "${SAAS_A_BILLING_API_DOMAIN}" = "None" ]; then
+  SAAS_A_BILLING_API_DOMAIN=""
 fi
-if [ -n "${API_DOMAIN}" ]; then
-  echo "  SaasABillingApiDomain : ${API_DOMAIN}"
+if [ -n "${SAAS_A_BILLING_API_DOMAIN}" ]; then
+  echo "  SaasABillingApiDomain : ${SAAS_A_BILLING_API_DOMAIN}"
 else
-  echo "  SaasABillingApiDomain : 未登録（${API_DOMAIN_PARAM}）。API 経路なしでデプロイします"
+  echo "  SaasABillingApiDomain : 未登録（${SAAS_A_BILLING_API_DOMAIN_PARAM}）。API 経路なしでデプロイします"
+fi
+
+DAILY_SECURITY_REPORT_API_DOMAIN="$(aws ssm get-parameter --name "${DAILY_SECURITY_REPORT_API_DOMAIN_PARAM}" --region "${REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+if [ "${DAILY_SECURITY_REPORT_API_DOMAIN}" = "None" ]; then
+  DAILY_SECURITY_REPORT_API_DOMAIN=""
+fi
+if [ -n "${DAILY_SECURITY_REPORT_API_DOMAIN}" ]; then
+  echo "  DailySecurityReportApiDomain : ${DAILY_SECURITY_REPORT_API_DOMAIN}"
+else
+  echo "  DailySecurityReportApiDomain : 未登録（${DAILY_SECURITY_REPORT_API_DOMAIN_PARAM}）。API 経路なしでデプロイします"
+fi
+
+ADMIN_USERS_API_DOMAIN="$(aws ssm get-parameter --name "${ADMIN_USERS_API_DOMAIN_PARAM}" --region "${REGION}" --query 'Parameter.Value' --output text 2>/dev/null || true)"
+if [ "${ADMIN_USERS_API_DOMAIN}" = "None" ]; then
+  ADMIN_USERS_API_DOMAIN=""
+fi
+if [ -n "${ADMIN_USERS_API_DOMAIN}" ]; then
+  echo "  AdminUsersApiDomain     : ${ADMIN_USERS_API_DOMAIN}"
+else
+  echo "  AdminUsersApiDomain     : 未登録（${ADMIN_USERS_API_DOMAIN_PARAM}）。API 経路なしでデプロイします"
 fi
 
 # sam deploy --parameter-overrides はコマンドラインの指定が samconfig の同名キーを
@@ -96,8 +119,14 @@ if [ -z "${BASE_OVERRIDES}" ]; then
 fi
 
 OVERRIDES="${BASE_OVERRIDES} OriginVerifySecret=${SECRET}"
-if [ -n "${API_DOMAIN}" ]; then
-  OVERRIDES="${OVERRIDES} SaasABillingApiDomain=${API_DOMAIN}"
+if [ -n "${SAAS_A_BILLING_API_DOMAIN}" ]; then
+  OVERRIDES="${OVERRIDES} SaasABillingApiDomain=${SAAS_A_BILLING_API_DOMAIN}"
+fi
+if [ -n "${DAILY_SECURITY_REPORT_API_DOMAIN}" ]; then
+  OVERRIDES="${OVERRIDES} DailySecurityReportApiDomain=${DAILY_SECURITY_REPORT_API_DOMAIN}"
+fi
+if [ -n "${ADMIN_USERS_API_DOMAIN}" ]; then
+  OVERRIDES="${OVERRIDES} AdminUsersApiDomain=${ADMIN_USERS_API_DOMAIN}"
 fi
 
 # --parameter-overrides で渡すと秘密が sam プロセスのコマンドライン（/proc/*/cmdline は

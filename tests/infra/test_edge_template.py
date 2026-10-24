@@ -15,9 +15,13 @@ EDGE_GUARD_JS_PATH = "infra/edge/functions/edge-guard.js"
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 
-API_PATH_PATTERN = "/api/saas-a-billing/*"
-API_ORIGIN_ID = "api-saas-a-billing"
-API_CONDITION = "HasSaasABillingApi"
+# アプリ id → edge のパラメータ・条件名に使う PascalCase 名。アプリを足したらここに 1 行足す。
+API_APPS = {
+    "saas-a-billing": "SaasABilling",
+    "admin-users": "AdminUsers",
+    "daily-security-report": "DailySecurityReport",
+}
+API_PATH_PREFIX = "/api/"
 
 CACHING_OPTIMIZED = "658327ea-f89d-4fab-a63d-7e88639e58f6"
 CACHING_DISABLED = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
@@ -110,15 +114,25 @@ def _default_behavior(template: dict) -> dict:
     return _distribution_config(template).get("DefaultCacheBehavior") or {}
 
 
-def _api_behavior(template: dict) -> tuple[str | None, dict]:
-    matches = [(c, b) for c, b in _cache_behaviors(template) if b.get("PathPattern") == API_PATH_PATTERN]
-    assert len(matches) == 1, f"{API_PATH_PATTERN} の behavior はちょうど 1 つであること"
+def _path_pattern(app_id: str) -> str:
+    return f"{API_PATH_PREFIX}{app_id}/*"
+
+
+def _origin_id(app_id: str) -> str:
+    return f"api-{app_id}"
+
+
+def _api_behavior(template: dict, app_id: str) -> tuple[str | None, dict]:
+    pattern = _path_pattern(app_id)
+    matches = [(c, b) for c, b in _cache_behaviors(template) if b.get("PathPattern") == pattern]
+    assert len(matches) == 1, f"{pattern} の behavior はちょうど 1 つであること"
     return matches[0]
 
 
-def _api_origin(template: dict) -> tuple[str | None, dict]:
-    matches = [(c, o) for c, o in _origins(template) if o.get("Id") == API_ORIGIN_ID]
-    assert len(matches) == 1, f"origin {API_ORIGIN_ID} はちょうど 1 つであること"
+def _api_origin(template: dict, app_id: str) -> tuple[str | None, dict]:
+    origin_id = _origin_id(app_id)
+    matches = [(c, o) for c, o in _origins(template) if o.get("Id") == origin_id]
+    assert len(matches) == 1, f"origin {origin_id} はちょうど 1 つであること"
     return matches[0]
 
 
@@ -197,28 +211,31 @@ def test_security_headers_policy_sets_a_csp(load_template):
     assert hsts["Override"] is True
 
 
-def test_api_behavior_uses_caching_disabled_and_all_viewer_except_host(load_template):
+@pytest.mark.parametrize("app_id", sorted(API_APPS))
+def test_api_behavior_uses_caching_disabled_and_all_viewer_except_host(load_template, app_id):
     """API は CachingDisabled + AllViewerExceptHostHeader（`AllViewer` だと API Gateway が 403。設計 5.2）。"""
     template = _load_or_skip(load_template)
-    _condition, behavior = _api_behavior(template)
-    assert behavior.get("TargetOriginId") == API_ORIGIN_ID
+    _condition, behavior = _api_behavior(template, app_id)
+    assert behavior.get("TargetOriginId") == _origin_id(app_id)
     assert behavior.get("CachePolicyId") == CACHING_DISABLED
     assert behavior.get("OriginRequestPolicyId") == ALL_VIEWER_EXCEPT_HOST_HEADER
     assert behavior.get("Compress") is True
 
 
-def test_api_behavior_allows_seven_methods(load_template):
+@pytest.mark.parametrize("app_id", sorted(API_APPS))
+def test_api_behavior_allows_seven_methods(load_template, app_id):
     """`AllowedMethods` を省くと GET / HEAD だけになり POST が拒否される（設計 5.2）。"""
     template = _load_or_skip(load_template)
-    _condition, behavior = _api_behavior(template)
+    _condition, behavior = _api_behavior(template, app_id)
     assert set(behavior.get("AllowedMethods") or []) == SEVEN_METHODS
 
 
-def test_api_origin_has_x_origin_verify_custom_header(load_template):
+@pytest.mark.parametrize("app_id", sorted(API_APPS))
+def test_api_origin_has_x_origin_verify_custom_header(load_template, app_id):
     """execute-api 直叩きを塞ぐ共有秘密をオリジンヘッダで渡す（設計 5.5）。"""
     template = _load_or_skip(load_template)
-    _condition, origin = _api_origin(template)
-    assert origin.get("DomainName") == {"Ref": "SaasABillingApiDomain"}
+    _condition, origin = _api_origin(template, app_id)
+    assert origin.get("DomainName") == {"Ref": f"{API_APPS[app_id]}ApiDomain"}
     assert origin.get("OriginCustomHeaders") == [
         {"HeaderName": ORIGIN_VERIFY_HEADER, "HeaderValue": {"Ref": "OriginVerifySecret"}}
     ]
@@ -296,13 +313,19 @@ def test_dns_records_have_no_aaaa(load_template):
     assert alias.get("DNSName") == {"Fn::GetAtt": "Distribution.DomainName"}
 
 
-def test_edge_guard_function_is_attached_to_both_behaviors(load_template):
-    """付け忘れるとそのアプリの API だけ IP 制限を素通りする（設計 7.1 / 12.3）。"""
+def test_edge_guard_function_is_attached_to_every_behavior(load_template):
+    """付け忘れるとそのアプリの API だけ IP 制限を素通りする（設計 7.1 / 12.3）。
+
+    default と全 `/api/{app}/*` を対象にする。アプリを足すたびに検査対象が増えるよう、
+    behavior は列挙ではなくテンプレートから拾う。
+    """
     template = _load_or_skip(load_template)
     expected = [{"EventType": "viewer-request", "FunctionARN": EDGE_GUARD_ARN}]
+    behaviors = _all_behaviors(template)
+    assert set(behaviors) == {"default", *(_path_pattern(app_id) for app_id in API_APPS)}
     offenders = {
         name: behavior.get("FunctionAssociations")
-        for name, behavior in _all_behaviors(template).items()
+        for name, behavior in behaviors.items()
         if behavior.get("FunctionAssociations") != expected
     }
     assert not offenders, f"edge-guard が付いていない behavior: {offenders}"
@@ -375,26 +398,44 @@ def test_spa_bucket_ownership_is_bucket_owner_enforced(load_template):
     assert _object_ownership(template, "SpaBucket") == "BucketOwnerEnforced"
 
 
-def test_api_domain_parameter_is_optional_string(load_template):
+@pytest.mark.parametrize("app_id", sorted(API_APPS))
+def test_api_domain_parameter_is_optional_string(load_template, app_id):
     """app 未デプロイでも edge をデプロイできるよう、API ドメインは省略可能な素の文字列にする。
 
     SSM 型（`AWS::SSM::Parameter::Value<String>`）にするとキー未作成でスタック作成自体が失敗し、
     edge → app → edge の順で回さざるを得なくなる。値は `deploy-edge.sh` が SSM
-    `/example-backoffice/{env}/apps/saas-a-billing/api-domain`（設計 4.2）から読んで渡す。
+    `/example-backoffice/{env}/apps/{app}/api-domain`（設計 4.2）から読んで渡す。
     """
     template = _load_or_skip(load_template)
-    parameter = _stack_parameter(template, "SaasABillingApiDomain")
+    parameter = _stack_parameter(template, f"{API_APPS[app_id]}ApiDomain")
     assert parameter.get("Type") == "String"
     assert parameter.get("Default") == ""
 
 
-def test_api_origin_and_behavior_are_conditional(load_template):
+@pytest.mark.parametrize("app_id", sorted(API_APPS))
+def test_api_origin_and_behavior_are_conditional(load_template, app_id):
     """API ドメイン未指定なら origin も behavior も作らない（app 未デプロイでも edge が立つ）。"""
     template = _load_or_skip(load_template)
+    pascal = API_APPS[app_id]
+    condition = f"Has{pascal}Api"
     conditions = template.get("Conditions") or {}
-    assert conditions.get(API_CONDITION) == {"Fn::Not": [{"Fn::Equals": [{"Ref": "SaasABillingApiDomain"}, ""]}]}
+    assert conditions.get(condition) == {"Fn::Not": [{"Fn::Equals": [{"Ref": f"{pascal}ApiDomain"}, ""]}]}
 
-    origin_condition, _origin = _api_origin(template)
-    behavior_condition, _behavior = _api_behavior(template)
-    assert origin_condition == API_CONDITION, "API origin が条件付きでない"
-    assert behavior_condition == API_CONDITION, "API behavior が条件付きでない"
+    origin_condition, _origin = _api_origin(template, app_id)
+    behavior_condition, _behavior = _api_behavior(template, app_id)
+    assert origin_condition == condition, "API origin が条件付きでない"
+    assert behavior_condition == condition, "API behavior が条件付きでない"
+
+
+def test_origins_and_behaviors_are_conditional_element_by_element(load_template):
+    """リスト全体を `!If` にしない（後から足した要素が他アプリの Condition に巻き込まれる）。
+
+    `CacheBehaviors: !If [HasXxxApi, [...], !Ref AWS::NoValue]` の形のまま 2 本目を足すと、
+    1 本目のアプリが未デプロイのときに 2 本目ごと消え、`/api/{app}/*` が SPA へ落ちる。
+    """
+    template = _load_or_skip(load_template)
+    config = _distribution_config(template)
+    for name in ("Origins", "CacheBehaviors"):
+        assert isinstance(config.get(name), list), f"{name} はリストであること（リスト全体の Fn::If は不可）"
+    for behavior in config["CacheBehaviors"]:
+        assert set(behavior) == {"Fn::If"}, "behavior は要素ごとに Fn::If で条件を付けること"

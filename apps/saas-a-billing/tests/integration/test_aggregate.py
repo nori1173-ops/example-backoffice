@@ -16,6 +16,7 @@ import logging
 from dataclasses import fields
 from datetime import datetime
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import boto3
 import botocore.client
@@ -131,6 +132,7 @@ TENANT_KEYS = {
     "tenant_cd",
     "tenant_name",
     "tenant_description",
+    "tenant_excluded",
     "retention_period",
     "device_count_api",
     "status",
@@ -264,6 +266,14 @@ def parts() -> list[dict]:
     ]
 
 
+def ok_parts() -> list[dict]:
+    """取得失敗が 1 件も無い parts。TNT003 を成功にし、Catch を通っていた TNT004 も置く。
+
+    取得失敗があると配布を見送るため（#1006）、配布そのものを見るテストはこちらを使う。
+    """
+    return [*({**part, "status": "ok", "error": None} for part in parts()), make_part(TNT004, [])]
+
+
 def put_settings(aws, **overrides) -> dict:
     """配布の検証が主目的なので、メール配布は既定で ON にする（`mail_enabled=False` で切れる）。"""
     settings = make_settings(**{"mail_enabled": True, **overrides})
@@ -296,13 +306,21 @@ def prepare_run(target_env: str, *, distribute: bool, attempt: int) -> None:
     repo.set_progress(target_env, MONTH, attempt, len(COLLECTED), len(COLLECTED))
 
 
-def prepare(aws, *, target_env: str = VERIFICATION, distribute: bool = True, attempt: int = ATTEMPT, **overrides):
+def prepare(
+    aws,
+    *,
+    target_env: str = VERIFICATION,
+    distribute: bool = True,
+    attempt: int = ATTEMPT,
+    all_ok: bool = False,
+    **overrides,
+):
     """設定・単価表・RUN・テナント一覧スナップショット・parts を用意する。"""
     put_settings(aws, target_env=target_env, **overrides)
     put_price(aws)
     prepare_run(target_env, distribute=distribute, attempt=attempt)
     storage.put_tenants(target_env, MONTH, tenant_rows())
-    for part in parts():
+    for part in ok_parts() if all_ok else parts():
         storage.put_part(target_env, MONTH, part["tenant_cd"], part)
 
 
@@ -342,6 +360,16 @@ def put_previous_run(
         Item={"PK": f"RUN#{target_env}", "SK": PREVIOUS_MONTH, "target_env": target_env, "status": status, "attempt": 1}
     )
     storage.put_result(target_env, PREVIOUS_MONTH, result or previous_result())
+
+
+def set_distributed_count(aws, count: int, target_env: str = VERIFICATION) -> None:
+    """過去の配布回数を持つ RUN にする（#1013）。"""
+    aws.table.update_item(
+        Key={"PK": f"RUN#{target_env}", "SK": MONTH},
+        UpdateExpression="SET #distributed_count = :count",
+        ExpressionAttributeNames={"#distributed_count": "distributed_count"},
+        ExpressionAttributeValues={":count": count},
+    )
 
 
 def make_event(**overrides) -> dict:
@@ -465,6 +493,21 @@ def test_result_json_devices_have_all_fields(aws):
     assert water["unit_price"] == WATER_PRICE
     assert water["amount"] == WATER_PRICE
     assert water["retention"] == 3
+
+
+def test_tenant_excluded_marks_tenants_whose_description_matches(aws):
+    """テナント説明が除外キーワードに一致するテナントは、地点を見ずに丸ごとデモ扱いにする。"""
+    prepare(aws)
+    rows = [
+        {**row, "tenant_description": "デモ用テナント"} if row["tenant_cd"] == TNT002 else row for row in tenant_rows()
+    ]
+    storage.put_tenants(VERIFICATION, MONTH, rows)
+
+    aggregate.handler(make_event(), None)
+
+    excluded = {tenant["tenant_cd"]: tenant["tenant_excluded"] for tenant in result_of()["tenants"]}
+    assert excluded[TNT002] is True
+    assert excluded[TNT001] is False
 
 
 def test_summary_counts_match_devices(aws):
@@ -627,7 +670,7 @@ def test_token_attributes_are_removed_from_run(aws):
 
 
 def test_distribute_true_sends_notify_with_attachment(aws):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True, mail_attachment_sheets="all")
 
     output = aggregate.handler(make_event(), None)
 
@@ -646,7 +689,7 @@ def test_distribute_true_sends_notify_with_attachment(aws):
 
 
 def test_attachment_reuses_existing_key_without_reupload(aws):
-    prepare(aws)
+    prepare(aws, all_ok=True, mail_attachment_sheets="all")
 
     aggregate.handler(make_event(), None)
 
@@ -655,7 +698,7 @@ def test_attachment_reuses_existing_key_without_reupload(aws):
 
 
 def test_slack_mention_is_sent_as_field_not_in_text(aws):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True, slack_mention=SLACK_MENTION)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True, slack_mention=SLACK_MENTION)
 
     aggregate.handler(make_event(), None)
 
@@ -663,6 +706,87 @@ def test_slack_mention_is_sent_as_field_not_in_text(aws):
     assert slack["channel"] == SLACK_CHANNEL
     assert slack["mention"] == SLACK_MENTION
     assert SLACK_MENTION not in slack["text"]
+
+
+def test_failed_tenant_skips_distribution_and_notifies(aws):
+    """取得失敗があると金額が過少になるため Excel は配らず、再実行を促す（#1006）。"""
+    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+
+    output = aggregate.handler(make_event(), None)
+
+    message = queued_messages(aws)[0]
+    assert "attachments" not in message
+    assert "配布を見送りました" in message["email"]["text"]
+    assert "再実行" in message["email"]["text"]
+    assert TNT003 in message["email"]["text"]
+    assert TNT004 in message["email"]["text"]
+    assert f"/saas-a-billing/runs/{VERIFICATION}/{MONTH}" in message["email"]["text"]
+    assert output["distributed"] is False
+
+
+def test_failed_tenant_keeps_run_succeeded_with_note(aws):
+    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+
+    aggregate.handler(make_event(), None)
+
+    run = run_of()
+    assert run["status"] == repo.SUCCEEDED
+    assert run["distribute_note"] == "取得失敗 2 テナントのため配布見送り"
+    assert run["notify_message_id"] == queued_messages(aws)[0]["message_id"]
+    assert run["notify_channels"] == ["email", "slack"]
+    assert run["notified_at"]
+    assert "error" not in run
+
+
+def test_failed_tenant_slack_does_not_use_the_template(aws):
+    """配布見送りは定型の連絡なので、設定の文面テンプレートは使わない（設計 6.8）。"""
+    prepare(
+        aws,
+        slack_channel_id=SLACK_CHANNEL,
+        slack_enabled=True,
+        slack_mention=SLACK_MENTION,
+        slack_template="配布しました {total}",
+    )
+
+    aggregate.handler(make_event(), None)
+
+    slack = queued_messages(aws)[0]["slack"]
+    assert "配布しました" not in slack["text"]
+    assert "配布を見送りました" in slack["text"]
+    assert slack["mention"] == SLACK_MENTION
+    assert SLACK_MENTION not in slack["text"]
+
+
+def test_failed_tenant_notify_failure_records_error_without_note(aws, monkeypatch):
+    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    monkeypatch.setattr(aggregate, "send", raise_send_error)
+
+    output = aggregate.handler(make_event(), None)
+
+    run = run_of()
+    assert run["status"] == repo.SUCCEEDED
+    assert "NonExistentQueue" in run["error"]
+    assert "distribute_note" not in run
+    assert output["distributed"] is False
+
+
+def test_failed_tenant_with_no_distribution_target_keeps_the_existing_note(aws):
+    """配布先が両方 OFF のときは取得失敗の有無によらず従来どおりの理由を残す。"""
+    prepare(aws, mail_enabled=False, slack_enabled=False)
+
+    aggregate.handler(make_event(), None)
+
+    assert queued_messages(aws) == []
+    assert run_of()["distribute_note"] == aggregate.NO_DISTRIBUTION_TARGET
+
+
+def test_failed_tenant_does_not_notify_when_distribute_is_false(aws):
+    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True, distribute=False)
+
+    aggregate.handler(make_event(distribute=False), None)
+
+    assert queued_messages(aws) == []
+    assert "distribute_note" not in run_of()
 
 
 def test_distribute_false_does_not_notify(aws):
@@ -676,7 +800,7 @@ def test_distribute_false_does_not_notify(aws):
 
 
 def test_run_becomes_distributed_after_notify(aws):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(), None)
 
@@ -690,7 +814,7 @@ def test_run_becomes_distributed_after_notify(aws):
 
 def test_mail_only_sends_email_channel(aws):
     """Slack 配布が OFF なら Slack は投函先から外れ、意図的な OFF なので note も出さない。"""
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=False)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=False)
 
     aggregate.handler(make_event(), None)
 
@@ -705,7 +829,7 @@ def test_mail_only_sends_email_channel(aws):
 
 def test_slack_only_sends_slack_channel(aws):
     """メール配布が OFF なら宛先が空でも Slack だけに投函する。"""
-    prepare(aws, mail_enabled=False, slack_enabled=True, slack_channel_id=SLACK_CHANNEL, mail_to=[])
+    prepare(aws, all_ok=True, mail_enabled=False, slack_enabled=True, slack_channel_id=SLACK_CHANNEL, mail_to=[])
 
     output = aggregate.handler(make_event(), None)
 
@@ -721,7 +845,7 @@ def test_slack_only_sends_slack_channel(aws):
 
 
 def test_both_channels_enabled_sends_both(aws):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(), None)
 
@@ -753,7 +877,7 @@ def test_distribute_false_does_not_record_distribute_note(aws):
 
 
 def test_verification_subject_has_suffix_and_filename_has_verification(aws):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(), None)
 
@@ -765,7 +889,7 @@ def test_verification_subject_has_suffix_and_filename_has_verification(aws):
 
 def test_production_has_no_verification_markers(aws, monkeypatch):
     monkeypatch.setenv("TARGET_ENV", PRODUCTION)
-    prepare(aws, target_env=PRODUCTION, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, target_env=PRODUCTION, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(target_env=PRODUCTION), None)
 
@@ -778,7 +902,7 @@ def test_production_has_no_verification_markers(aws, monkeypatch):
 def test_ignores_stale_target_env_in_execution_input(aws, monkeypatch):
     """実行入力に古い `target_env` が残っていても、集計は `TARGET_ENV` 側で行う（計画 R1 / SP-01）。"""
     monkeypatch.setenv("TARGET_ENV", VERIFICATION)
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
 
     aggregate.handler(make_event(target_env=PRODUCTION), None)
 
@@ -790,7 +914,7 @@ def test_ignores_stale_target_env_in_execution_input(aws, monkeypatch):
 
 
 def test_notify_failure_keeps_succeeded_and_records_error(aws, monkeypatch):
-    prepare(aws, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
+    prepare(aws, all_ok=True, slack_channel_id=SLACK_CHANNEL, slack_enabled=True)
     monkeypatch.setattr(aggregate, "send", raise_send_error)
 
     output = aggregate.handler(make_event(), None)
@@ -850,11 +974,194 @@ def test_closing_period_open_true_for_unfinished_month(aws):
     assert run_of()["closing_period"]["open"] is True
 
 
-def test_attempt_greater_than_one_marks_resend_in_subject(aws):
-    prepare(aws, attempt=2)
+def test_first_distribution_has_no_resend_note(aws):
+    """再実行でも配るのが初回なら再送ではない（根拠は attempt ではなく配布回数。#1013）。"""
+    prepare(aws, all_ok=True, attempt=2)
 
     aggregate.handler(make_event(attempt=2), None)
 
     message = queued_messages(aws)[0]
-    assert "再送（第 2 回）" in message["email"]["subject"]
+    assert "再送" not in message["email"]["subject"]
     assert result_of()["run"]["attempt"] == 2
+    assert run_of()["distributed_count"] == 1
+
+
+def test_second_distribution_marks_resend_in_subject(aws):
+    """2 回目の配布から件名に再送表記を付ける（#1013）。"""
+    prepare(aws, all_ok=True, attempt=2)
+    set_distributed_count(aws, 1)
+
+    aggregate.handler(make_event(attempt=2), None)
+
+    assert "再送（第 2 回）" in queued_messages(aws)[0]["email"]["subject"]
+    assert run_of()["distributed_count"] == 2
+
+
+def test_partial_failure_subject_uses_the_distribution_count(aws):
+    """配布見送りの連絡も同じ根拠で再送表記を付ける。ただし配布回数は進めない（#1013）。"""
+    prepare(aws, attempt=2)
+    set_distributed_count(aws, 1)
+
+    aggregate.handler(make_event(attempt=2), None)
+
+    assert "再送（第 2 回）" in queued_messages(aws)[0]["email"]["subject"]
+    assert run_of()["distributed_count"] == 1
+
+
+def test_distribute_false_does_not_count_the_distribution(aws):
+    """配らなかった実行は配布回数を進めない（#1013）。"""
+    prepare(aws, all_ok=True, distribute=False)
+
+    aggregate.handler(make_event(distribute=False), None)
+
+    assert "distributed_count" not in run_of()
+
+
+def _prepare_attachment_run(aws, *, distribute=True, failed=False, **settings):
+    prepare(aws, distribute=distribute, all_ok=not failed, **settings)
+
+
+def _attachment_book(aws, key):
+    obj = boto3.client("s3").get_object(Bucket=aws.bucket, Key=key)
+    return openpyxl.load_workbook(io.BytesIO(obj["Body"].read()))
+
+
+def _month_xlsx_keys(aws):
+    objects = boto3.client("s3").list_objects_v2(Bucket=aws.bucket, Prefix=storage.prefix(VERIFICATION, MONTH))
+    return {obj["Key"] for obj in objects.get("Contents", []) if obj["Key"].endswith(".xlsx")}
+
+
+@pytest.mark.parametrize("value", [None, "billing_only", "all"])
+def test_mail_attachment_sheets_selects_contents_without_changing_download(aws, caplog, value):
+    _prepare_attachment_run(aws, **({"mail_attachment_sheets": value} if value else {}))
+    with caplog.at_level(logging.INFO, logger="example_backoffice"):
+        aggregate.handler(make_event(distribute=True), None)
+    run = run_of()
+    full_key = run["s3_xlsx_key"]
+    attachment = queued_messages(aws)[0]["attachments"][0]
+    assert full_key == storage.xlsx_key(VERIFICATION, MONTH)
+    assert _attachment_book(aws, full_key).sheetnames == ["請求照合", "全地点（管理用）"]
+    assert attachment["filename"] == full_key.rsplit("/", 1)[1]
+    selected = value or "billing_only"
+    if selected == "all":
+        assert attachment["key"] == full_key
+        assert _month_xlsx_keys(aws) == {full_key}
+    else:
+        assert attachment["key"] == f"{storage.prefix(VERIFICATION, MONTH)}/mail/{attachment['filename']}"
+        assert _attachment_book(aws, attachment["key"]).sheetnames == ["請求照合"]
+        assert _month_xlsx_keys(aws) == {full_key, attachment["key"]}
+    assert "mail_attachment_sheets" not in run
+    assert "mail_attachment_sheets" not in result_of()
+    record = next(record for record in caplog.records if record.getMessage().startswith("mail attachment selected "))
+    details = json.loads(record.getMessage().removeprefix("mail attachment selected "))
+    assert details["mail_attachment_sheets"] == selected
+    assert details["key"] == attachment["key"]
+
+
+@pytest.mark.parametrize("value", [None, "", "billing-only", "BILLING_ONLY", 123])
+def test_invalid_mail_attachment_sheets_falls_back_to_billing_only(aws, caplog, value):
+    _prepare_attachment_run(aws, mail_attachment_sheets=value)
+    with caplog.at_level(logging.INFO, logger="example_backoffice"):
+        aggregate.handler(make_event(distribute=True), None)
+
+    full_key = run_of()["s3_xlsx_key"]
+    message = queued_messages(aws)[0]
+    attachment = message["attachments"][0]
+    assert attachment["key"] == f"{storage.prefix(VERIFICATION, MONTH)}/mail/{attachment['filename']}"
+    assert attachment["key"] != full_key
+    assert _attachment_book(aws, attachment["key"]).sheetnames == ["請求照合"]
+    assert len(_attachment_book(aws, full_key).sheetnames) == 2
+    assert _month_xlsx_keys(aws) == {full_key, attachment["key"]}
+    record = next(record for record in caplog.records if record.getMessage().startswith("mail attachment selected "))
+    details = json.loads(record.getMessage().removeprefix("mail attachment selected "))
+    assert details["mail_attachment_sheets"] == "billing_only"
+    assert details["key"] == attachment["key"]
+
+
+@pytest.mark.parametrize("stage", ["build", "save"])
+def test_billing_only_attachment_failure_keeps_succeeded_without_sending(aws, monkeypatch, stage):
+    _prepare_attachment_run(aws, mail_attachment_sheets="billing_only")
+    send = Mock(wraps=aggregate.send)
+    monkeypatch.setattr(aggregate, "send", send)
+    owner, name = (aggregate.excel, "build_workbook") if stage == "build" else (storage, "put_xlsx")
+    original = getattr(owner, name)
+    calls = []
+    error_message = f"billing-only workbook {stage} failed"
+
+    def fail_billing_only(*args, billing_only=False):
+        calls.append(billing_only)
+        if billing_only:
+            raise RuntimeError(error_message)
+        return original(*args, billing_only=billing_only)
+
+    monkeypatch.setattr(owner, name, fail_billing_only)
+    output = aggregate.handler(make_event(distribute=True), None)
+
+    run = run_of()
+    assert calls == [False, True]
+    send.assert_not_called()
+    assert queued_messages(aws) == []
+    assert output["distributed"] is False
+    assert run["status"] == repo.SUCCEEDED
+    assert error_message in run["error"]
+    assert "notify_message_id" not in run
+    assert "distributed_count" not in run
+    full_key = storage.xlsx_key(VERIFICATION, MONTH)
+    assert run["s3_xlsx_key"] == full_key
+    assert len(_attachment_book(aws, full_key).sheetnames) == 2
+    assert _month_xlsx_keys(aws) == {full_key}
+
+
+@pytest.mark.parametrize("scenario", ["no_distribution", "no_targets", "partial_failure", "slack_only"])
+def test_mail_attachment_sheets_does_not_build_unused_version(aws, monkeypatch, scenario):
+    _prepare_attachment_run(
+        aws,
+        distribute=scenario != "no_distribution",
+        failed=scenario == "partial_failure",
+        mail_enabled=scenario not in ("no_targets", "slack_only"),
+        slack_enabled=scenario == "slack_only",
+        slack_channel_id="C0123456789",
+        mail_attachment_sheets="billing_only",
+    )
+    builds = []
+    original = aggregate.excel.build_workbook
+
+    def record(result, **kwargs):
+        builds.append(kwargs)
+        return original(result, **kwargs)
+
+    monkeypatch.setattr(aggregate.excel, "build_workbook", record)
+    aggregate.handler(make_event(distribute=scenario != "no_distribution"), None)
+    assert builds == [{}]
+    assert _month_xlsx_keys(aws) == {storage.xlsx_key(VERIFICATION, MONTH)}
+    messages = queued_messages(aws)
+    if scenario in ("no_distribution", "no_targets"):
+        assert messages == []
+    elif scenario == "partial_failure":
+        assert not messages[0].get("attachments")
+    else:
+        assert messages[0]["channels"] == ["slack"]
+        assert messages[0]["attachments"][0]["key"] == storage.xlsx_key(VERIFICATION, MONTH)
+
+
+def test_mail_attachment_sheets_does_not_change_slack_payload(aws, monkeypatch):
+    _prepare_attachment_run(aws, slack_enabled=True, slack_channel_id="C0123456789", slack_mention="<!here>")
+    aggregate.handler(make_event(distribute=False), None)
+    result = result_of()
+    closing = aggregate._closing_period(make_event())
+    settings = repo.get_settings()
+    captured = []
+    monkeypatch.setattr(aggregate, "send", lambda **payload: captured.append(payload) or "message-id")
+    for selected in ("billing_only", "all"):
+        aggregate._send_report(
+            {**settings, "mail_attachment_sheets": selected},
+            result,
+            closing,
+            run_of()["s3_xlsx_key"],
+            ["email", "slack"],
+            1,
+        )
+    assert captured[0]["slack"] == captured[1]["slack"]
+    assert captured[0]["email"] == captured[1]["email"]
+    assert captured[0]["meta"] == captured[1]["meta"]
+    assert captured[0]["channels"] == captured[1]["channels"]

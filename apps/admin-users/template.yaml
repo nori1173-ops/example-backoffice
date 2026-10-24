@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice app admin-users - HTTP API / api Lambda と apps/admin-users の SSM 契約パラメータ
+
+# 前提: shared → core の順にデプロイ済みであること（設計 3.3）。
+# SSM 型パラメータの Default は dev のキー名。prod は samconfig の [production.deploy.parameters] で
+# キー名（値ではない）を上書きする（設計 4.4）。
+#
+# このアプリは Cognito User Pool を直接操作するだけで、自前の DynamoDB テーブル・バッチ・
+# ステートマシン・通知は持たない（雛形から削除済み）。操作の証跡は Lambda の構造化ログに残す。
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  LogLevel:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Default: INFO
+  ExamplePowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86
+    Description: 社内レイヤ ExamplePowertoolsPython の ARN。LambdaLogger のために参照する
+  PowertoolsLayerArn:
+    Type: String
+    Description: AWS 提供の Powertools for AWS Lambda (Python) レイヤ ARN。samconfig で環境ごとに指定する
+  UserPoolIssuer:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/issuer
+    Description: JWT authorizer が検証する issuer（設計 4.2）
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/client-id
+    Description: JWT authorizer の audience（設計 4.2）
+  UserPoolId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/user-pool-id
+    Description: 操作対象の User Pool ID（設計 4.2）。IAM の Resource と環境変数 USER_POOL_ID に使う
+  SharedLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/shared/layer-arn
+    Description: 共通レイヤ example_backoffice のバージョン付き ARN
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    MemorySize: 256
+    Timeout: 30
+    PropagateTags: true
+    Environment:
+      Variables:
+        ENV: !Ref Env
+        LOG_LEVEL: !Ref LogLevel
+        USER_POOL_ID: !Ref UserPoolId
+
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref UserPoolIssuer
+              audience:
+                - !Ref UserPoolClientId
+        DefaultAuthorizer: CognitoJwtAuthorizer
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","sub":"$context.authorizer.claims.sub","latency":"$context.responseLatency"}'
+      Tags:
+        Project: !Ref ProjectName
+        Name: Api
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${ProjectName}-admin-users-${Env}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-admin-users-api-${Env}
+      Description: ユーザー管理の HTTP API ハンドラ
+      CodeUri: functions/
+      Handler: admin_users.app.handler
+      Layers:
+        - !Ref SharedLayerArn
+        - !Ref ExamplePowertoolsLayerArn
+        - !Ref PowertoolsLayerArn
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: admin-users-api
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /api/admin-users/{proxy+}
+            Method: ANY
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            # 自環境の User Pool 1 つに限定する（ワイルドカードを使わない。設計 12.2）。
+            - Sid: ManageUsersInOwnUserPool
+              Effect: Allow
+              Action:
+                - cognito-idp:ListUsers
+                - cognito-idp:ListUsersInGroup
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminListGroupsForUser
+                - cognito-idp:AdminAddUserToGroup
+                - cognito-idp:AdminRemoveUserFromGroup
+                - cognito-idp:AdminEnableUser
+                - cognito-idp:AdminDisableUser
+                - cognito-idp:AdminResetUserPassword
+                - cognito-idp:AdminDeleteUser
+              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}
+            - Sid: ReadOriginVerifyParameter
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+                - ssm:GetParameters
+              Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret
+            - Sid: DecryptSecureStringParameters
+              Effect: Allow
+              Action: kms:Decrypt
+              Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+                ForAnyValue:StringEquals:
+                  kms:ResourceAliases: alias/aws/ssm
+      Tags:
+        Project: !Ref ProjectName
+        Name: Function
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Name
+          Value: LogGroup
+
+  ApiDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /${ProjectName}/${Env}/apps/admin-users/api-domain
+      Type: String
+      Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+      Description: HTTP API のドメイン。edge が origin の DomainName として読む（設計 4.2）
+
+Outputs:
+  ApiDomain:
+    Description: HTTP API のドメイン（edge の origin DomainName）
+    Value: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com

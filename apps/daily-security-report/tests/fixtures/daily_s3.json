@@ -1,0 +1,235 @@
+{
+  "schema": "daily-security-report.daily.v2",
+  "date": "2026-10-18",
+  "range": {
+    "from": "2026-10-18T00:00:00+09:00",
+    "to": "2026-10-19T00:00:00+09:00"
+  },
+  "sources": {
+    "guardduty": {
+      "status": "ok"
+    },
+    "cloudtrail": {
+      "status": "ok"
+    },
+    "metrics": {
+      "status": "ok"
+    },
+    "insights": {
+      "status": "ok"
+    },
+    "instances": {
+      "status": "ok"
+    },
+    "s3": {
+      "status": "ok",
+      "regions": [
+        "ap-northeast-1",
+        "us-east-1",
+        "us-west-2"
+      ],
+      "buckets": 3,
+      "metrics_buckets": 1,
+      "truncated": false
+    }
+  },
+  "counters": {
+    "s3.buckets": 3,
+    "s3.objects": 46400,
+    "s3.bytes_downloaded": 13207024435,
+    "s3.delete_requests": 20,
+    "s3.get_requests": 4800
+  },
+  "seen": {},
+  "top": {
+    "s3_buckets": [
+      {
+        "bucket": "example-camera-s3",
+        "region": "ap-northeast-1",
+        "objects": 40000,
+        "objects_prev": 100000,
+        "objects_diff": -60000,
+        "objects_pct": -60,
+        "size": 21474836480,
+        "size_prev": 53687091200,
+        "size_pct": -60,
+        "metrics": false,
+        "get_requests": null,
+        "put_requests": null,
+        "delete_requests": null,
+        "bytes_downloaded": null,
+        "errors_4xx": null,
+        "download_baseline": null,
+        "delete_baseline": null,
+        "key": "s3.bucket.example-camera-s3",
+        "measured_at": "2026-10-18T00:00:00+00:00",
+        "first_at": "2026-10-18T09:00:00+09:00",
+        "last_at": "2026-10-19T09:00:00+09:00",
+        "where": "CloudWatch メトリクス AWS/S3 (ap-northeast-1)",
+        "link": "https://ap-northeast-1.console.aws.amazon.com/s3/buckets/example-camera-s3?region=ap-northeast-1&tab=metrics",
+        "level": "critical"
+      },
+      {
+        "bucket": "example-weather-s3",
+        "region": "ap-northeast-1",
+        "objects": 5200,
+        "objects_prev": 5150,
+        "objects_diff": 50,
+        "objects_pct": 1,
+        "size": 8589934592,
+        "size_prev": 8537505792,
+        "size_pct": 0.6,
+        "metrics": true,
+        "get_requests": 4800,
+        "put_requests": 120,
+        "delete_requests": 20,
+        "bytes_downloaded": 13207024435,
+        "errors_4xx": 3,
+        "download_baseline": 3221225472,
+        "delete_baseline": 15,
+        "key": "s3.bucket.example-weather-s3",
+        "measured_at": "2026-10-18T00:00:00+00:00",
+        "first_at": "2026-10-18T09:00:00+09:00",
+        "last_at": "2026-10-19T09:00:00+09:00",
+        "where": "CloudWatch メトリクス AWS/S3 (ap-northeast-1)",
+        "link": "https://ap-northeast-1.console.aws.amazon.com/s3/buckets/example-weather-s3?region=ap-northeast-1&tab=metrics",
+        "level": "warning"
+      },
+      {
+        "bucket": "example-archive-s3",
+        "region": "us-east-1",
+        "objects": 1200,
+        "objects_prev": 1200,
+        "objects_diff": 0,
+        "objects_pct": 0,
+        "size": 2147483648,
+        "size_prev": 2147483648,
+        "size_pct": 0,
+        "metrics": false,
+        "get_requests": null,
+        "put_requests": null,
+        "delete_requests": null,
+        "bytes_downloaded": null,
+        "errors_4xx": null,
+        "download_baseline": null,
+        "delete_baseline": null,
+        "key": "s3.bucket.example-archive-s3",
+        "measured_at": "2026-10-18T00:00:00+00:00",
+        "first_at": "2026-10-18T09:00:00+09:00",
+        "last_at": "2026-10-19T09:00:00+09:00",
+        "where": "CloudWatch メトリクス AWS/S3 (us-east-1)",
+        "link": "https://us-east-1.console.aws.amazon.com/s3/buckets/example-archive-s3?region=us-east-1&tab=metrics",
+        "level": "ok"
+      }
+    ]
+  },
+  "excluded": {},
+  "instances": {
+    "ec2": [],
+    "lightsail": []
+  },
+  "duration_sec": 84,
+  "findings": [
+    {
+      "section": "s3",
+      "code": "S3_MASS_DELETE",
+      "level": "critical",
+      "text": "S3 バケット example-camera-s3 のオブジェクト数が前日から 60.0% 減",
+      "count": 60000,
+      "key": "s3.bucket.example-camera-s3",
+      "first_at": "2026-10-18T09:00:00+09:00",
+      "last_at": "2026-10-19T09:00:00+09:00",
+      "where": "CloudWatch メトリクス AWS/S3 (ap-northeast-1)",
+      "link": "https://ap-northeast-1.console.aws.amazon.com/s3/buckets/example-camera-s3?region=ap-northeast-1&tab=metrics"
+    },
+    {
+      "section": "s3",
+      "code": "RATIO",
+      "level": "warning",
+      "text": "s3.bytes_downloaded: 12.3 GB（基準 3.0 GB の 3 倍超）",
+      "count": 1,
+      "key": "s3.bytes_downloaded",
+      "where": "CloudWatch メトリクス AWS/S3"
+    },
+    {
+      "section": "s3",
+      "code": "RATIO",
+      "level": "warning",
+      "text": "s3.get_requests（基準 1,500 の 3 倍超）",
+      "count": 4800,
+      "key": "s3.get_requests",
+      "where": "CloudWatch メトリクス AWS/S3"
+    },
+    {
+      "section": "s3",
+      "code": "S3_DOWNLOAD_SPIKE",
+      "level": "warning",
+      "text": "S3 バケット example-weather-s3 のダウンロード量が基準の 4.1 倍（12.3 GB）",
+      "count": 1,
+      "key": "s3.bucket.example-weather-s3",
+      "first_at": "2026-10-18T00:00:00+09:00",
+      "last_at": "2026-10-19T00:00:00+09:00",
+      "where": "CloudWatch メトリクス AWS/S3 (ap-northeast-1)",
+      "link": "https://ap-northeast-1.console.aws.amazon.com/s3/buckets/example-weather-s3?region=ap-northeast-1&tab=metrics"
+    }
+  ],
+  "finding_counts": {
+    "critical": 1,
+    "warning": 3
+  },
+  "findings_truncated": {},
+  "ai": {
+    "status": "skipped"
+  },
+  "actors": {
+    "status": "ok",
+    "dormant": [],
+    "new": [],
+    "external": []
+  },
+  "comparisons": {
+    "s3.bytes_downloaded": {
+      "value": 13207024435,
+      "baseline": 3221225472.0,
+      "days": 3,
+      "exceeded": true,
+      "ratio": 4.0999999999379115,
+      "label": ""
+    },
+    "s3.delete_requests": {
+      "value": 20,
+      "baseline": 15.0,
+      "days": 3,
+      "exceeded": false,
+      "ratio": 1.3333333333333333,
+      "label": ""
+    },
+    "s3.get_requests": {
+      "value": 4800,
+      "baseline": 1500.0,
+      "days": 3,
+      "exceeded": true,
+      "ratio": 3.2,
+      "label": ""
+    }
+  },
+  "no_baseline": [],
+  "baseline_missing": [],
+  "rule_levels": {
+    "guardduty": "ok",
+    "cloudtrail": "ok",
+    "metrics": "ok",
+    "insights": "ok",
+    "instances": "ok",
+    "s3": "critical"
+  },
+  "levels": {
+    "guardduty": "ok",
+    "cloudtrail": "ok",
+    "metrics": "ok",
+    "insights": "ok",
+    "instances": "ok",
+    "s3": "critical"
+  },
+  "level": "critical"
+}

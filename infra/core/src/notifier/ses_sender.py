@@ -3,6 +3,7 @@
 `Content.Simple` + `Attachments[]` を使い、MIME の組み立ては SES に任せる。
 添付の実体は添付バケットから `GetObject` して `RawContent` に渡す
 （`Attachments` 対応は boto3 1.37.27 以降。`requirements.txt` で固定）。
+`ContentTransferEncoding` は `BASE64` を指定する。省略すると 7bit で組み立てられバイナリが壊れる（#1014）。
 送信元アドレスは環境変数 `SES_FROM_ADDRESS` から取る。
 """
 
@@ -68,6 +69,7 @@ def _attachment(attachment: dict, s3_client) -> dict:
         "RawContent": fetch_attachment(attachment["bucket"], attachment["key"], s3_client=s3_client),
         "FileName": attachment["filename"],
         "ContentType": attachment.get("content_type") or DEFAULT_CONTENT_TYPE,
+        "ContentTransferEncoding": "BASE64",
     }
 
 

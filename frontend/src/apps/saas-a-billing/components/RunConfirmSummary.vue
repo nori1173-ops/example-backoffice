@@ -14,6 +14,9 @@ const ENV_LABELS: Record<TargetEnv, string> = { verification: '検証環境', pr
 const mailEnabled = computed(() => props.settings?.mail_enabled ?? false)
 const mailTo = computed(() => props.settings?.mail_to ?? [])
 const mailCc = computed(() => props.settings?.mail_cc ?? [])
+const mailAttachmentLabel = computed(() =>
+  props.settings?.mail_attachment_sheets === 'all' ? '両方のシート' : 'シート 1 のみ',
+)
 
 /** Slack は配布トグルが OFF か チャンネル ID が空なら投函先から外れる（設計 6.8）。 */
 const slackTarget = computed(() => {
@@ -47,6 +50,9 @@ const slackTarget = computed(() => {
         </li>
         <li v-if="mailEnabled && mailCc.length">
           メール Cc: {{ mailCc.join(', ') }}
+        </li>
+        <li v-if="mailEnabled">
+          添付: {{ mailAttachmentLabel }}
         </li>
         <li v-if="slackTarget">
           Slack: {{ slackTarget }}

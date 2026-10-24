@@ -54,7 +54,7 @@ esac
 case "${KIND}" in
   bot)
     PARAM_NAME="/${PROJECT}/${ENV_NAME}/shared/slack/bot-token"
-    PARAM_DESC="Slack Bot token（chat:write / chat:write.public）"
+    PARAM_DESC="Slack Bot token（chat:write / chat:write.public / channels:read / groups:read / users:read / usergroups:read）"
     PROMPT="Slack bot token (xoxb-...): "
     ;;
   webhook)

@@ -5,13 +5,13 @@ export type TenantStatus = 'ok' | 'failed'
 export type Judgement = 'billable' | 'no_data' | 'excluded' | 'failed'
 export type CameraSource = 'export' | 'settings'
 export type SlackMode = 'bot' | 'webhook'
+export type MailAttachmentSheets = 'billing_only' | 'all'
 
 /** `SETTINGS#current` の保存属性（設計 7.1） */
 export interface Settings {
   target_env: TargetEnv
   cutoff_day: number
   cutoff_time: string
-  auto_retry_days: number
   auto_run_enabled: boolean
   auto_run_from_month: string
   /** メール配布の有効・無効（既定は無効）。Slack とは独立に切り替える */
@@ -20,6 +20,7 @@ export interface Settings {
   slack_enabled: boolean
   mail_to: string[]
   mail_cc: string[]
+  mail_attachment_sheets: MailAttachmentSheets
   slack_channel_id: string
   slack_channel_label: string
   slack_mention: string
@@ -46,6 +47,30 @@ export interface SettingsView extends Settings {
   /** SSM に接続情報がある環境。集計対象環境はサイト固定なので固定環境のキーだけ届く（設計 R1） */
   targets: Partial<Record<TargetEnv, boolean>>
   slack_mode: SlackMode | null
+}
+
+/** `GET /slack/directory` のチャンネル候補（#1011）。ID は画面に出さない */
+export interface SlackChannel {
+  id: string
+  name: string
+  is_private: boolean
+  is_member: boolean
+}
+
+/** `GET /slack/directory` のユーザー候補（#1011） */
+export interface SlackUser {
+  id: string
+  handle: string
+  real_name: string
+  /** 未設定なら空。空のときは `real_name` を表示に使う */
+  display_name: string
+}
+
+/** `GET /slack/directory` の応答。サーバ側で 300 秒キャッシュされる（#1011） */
+export interface SlackDirectory {
+  channels: SlackChannel[]
+  users: SlackUser[]
+  fetched_at: string
 }
 
 export interface Band {
@@ -116,7 +141,6 @@ export interface RunSummary {
   status: RunStatus
   trigger: RunTrigger
   attempt: number
-  auto_attempts?: number
   execution_arn?: string
   tenants_total?: number
   tenants_done?: number
@@ -175,6 +199,8 @@ export interface TenantResult {
   tenant_cd: string
   tenant_name: string
   tenant_description: string
+  /** テナント説明が除外キーワードに一致（デモ）。古い result.json には無い（設計 7.3） */
+  tenant_excluded?: boolean
   retention_period: number | null
   device_count_api: number
   status: TenantStatus
@@ -186,7 +212,7 @@ export interface TenantResult {
   devices: DeviceJudgement[]
 }
 
-/** 前回 RUN にあり今回の地点一覧に無い地点（設計 7.3） */
+/** 前月分の結果にあり今回の地点一覧に無い地点（設計 7.3） */
 export interface MissingDevice {
   tenant_cd: string
   tenant_name: string
@@ -255,12 +281,15 @@ export interface DownloadUrl {
   expires_at: string
 }
 
-/** `AUDIT#{ISO時刻}` の属性（設計 7.1） */
+/** 監査の対象。`run` は受理した手動実行（設計 7.1） */
+export type AuditTarget = 'settings' | 'price' | 'run'
+
+/** `AUDIT#{ISO時刻}` の属性（設計 7.1）。`run` は変更前が無いので `before` は null */
 export interface AuditEntry {
-  target: 'settings' | 'price'
+  target: AuditTarget
   actor: string
   actor_email: string
-  before: Record<string, unknown>
+  before: Record<string, unknown> | null
   after: Record<string, unknown>
   at: string
 }

@@ -10,19 +10,23 @@ moto の DynamoDB / S3 / SSM / Step Functions に実際に読み書きし、ハ�
 
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import boto3
 import pytest
+import requests
+import responses
 from api import app as api_app
 from botocore.exceptions import ClientError
-from saas_a_billing import repo, storage
+from saas_a_billing import repo, slack_directory, storage
 from saas_a_billing.messages import DEFAULT_SLACK_TEMPLATE
 from saas_a_billing.period import JST
+from responses import registries
 
 from example_backoffice import origin_verify as origin_verify_module
 from tests.conftest import (
+    ENV,
     ORIGIN_VERIFY_SECRET,
     REGION,
     SSM_PREFIX,
@@ -35,6 +39,9 @@ from tests.conftest import (
 VERIFICATION = "verification"
 PRODUCTION = "production"
 SLACK_CHANNEL = "C0123ABCD"
+SLACK_USER = "U0000DEVA1"
+SLACK_BOT_TOKEN_PARAMETER = f"/example-backoffice/{ENV}/shared/slack/bot-token"
+SLACK_BOT_TOKEN = "xoxb-dummy-token-for-test"
 ADMIN = ["admin"]
 ACTOR_EMAIL = "devA@example.co.jp"
 
@@ -42,8 +49,9 @@ NOW = datetime(2026, 8, 31, 10, 0, tzinfo=JST)
 CLOSED_MONTH = "2026-08"
 OPEN_MONTH = "2026-09"
 FUTURE_MONTH = "2026-10"
+OTHER_MONTH = "2026-07"
 
-SENSITIVE_RUN_FIELDS = ("api_token", "token_expires_at", "run_token", "retry_alert_sent")
+SENSITIVE_RUN_FIELDS = ("api_token", "token_expires_at", "run_token")
 SAASA_TOKEN = "live-saasa-bearer-token"
 INTERNAL_RUN_TOKEN = "internal-run-token"
 TOKEN_EXPIRES_AT = "2026-08-31T11:00:00+09:00"
@@ -102,12 +110,10 @@ def put_run_item(api, target_env: str = VERIFICATION, month: str = CLOSED_MONTH,
         "status": repo.SUCCEEDED,
         "trigger": "manual",
         "attempt": 1,
-        "auto_attempts": 0,
         "run_token": "previous-token",
         "distribute": True,
         "force": False,
         "started_at": NOW.isoformat(),
-        "retry_alert_sent": False,
     }
     run.update(overrides)
     api.table.put_item(Item={**run, "PK": f"RUN#{target_env}", "SK": month})
@@ -120,12 +126,12 @@ def put_price_item(api, effective_from: str) -> dict:
     return price
 
 
-def put_audit_item(api, at: str, index: int) -> None:
+def put_audit_item(api, at: str, index: int, target: str = "settings") -> None:
     api.table.put_item(
         Item={
             "PK": "AUDIT",
             "SK": f"{at}#{index:04d}",
-            "target": "settings",
+            "target": target,
             "actor": "test-sub",
             "actor_email": ACTOR_EMAIL,
             "before": {},
@@ -145,7 +151,6 @@ def settings_payload(**overrides) -> dict:
         "target_env": VERIFICATION,
         "cutoff_day": 20,
         "cutoff_time": "24:00",
-        "auto_retry_days": 5,
         "auto_run_enabled": True,
         "auto_run_from_month": "2026-08",
         "mail_to": [ACTOR_EMAIL],
@@ -180,6 +185,10 @@ def run_payload(**overrides) -> dict:
     payload = {"month": CLOSED_MONTH, "distribute": True, "force": False}
     payload.update(overrides)
     return payload
+
+
+def raise_audit_error(*args, **kwargs) -> None:
+    raise ClientError({"Error": {"Code": "InternalServerError"}}, "PutItem")
 
 
 def start_run_with_token(api, month: str = CLOSED_MONTH) -> None:
@@ -277,6 +286,22 @@ def test_put_settings_version_conflict_returns_409(api):
 
     assert result["statusCode"] == 409
     assert error_code(result) == "VERSION_CONFLICT"
+
+
+def test_settings_tolerate_retired_auto_retry_days(api):
+    """自動再試行の撤去後も、旧属性が残った SETTINGS / RUN で API が壊れない（#1015）。"""
+    put_settings_item(api, auto_retry_days=0)
+    put_run_item(api, auto_attempts=3, retry_alert_sent=True)
+
+    got = call("GET", "/settings")
+    put = call("PUT", "/settings", body=settings_payload(auto_retry_days=99, cutoff_day=15), groups=ADMIN)
+    run = call("GET", f"/runs/{CLOSED_MONTH}")
+
+    assert got["statusCode"] == 200
+    assert put["statusCode"] == 200
+    assert data(put)["cutoff_day"] == 15
+    assert data(put)["auto_retry_days"] == 0
+    assert run["statusCode"] == 200
 
 
 def test_put_settings_rejects_target_env_change(api):
@@ -740,6 +765,16 @@ def test_get_run_detail_defaults_to_false(api):
     assert data(result)["result"] is None
 
 
+def test_get_runs_rejects_non_decimal_limit(api):
+    """`"\u00b2".isdigit()` は True だが `int()` は落ちる。500 にせず 400 で返す。"""
+    put_settings_item(api)
+
+    result = call("GET", "/runs", groups=ADMIN, query={"limit": "\u00b2"})
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "VALIDATION_ERROR"
+
+
 def test_get_run_not_found_returns_404(api):
     put_settings_item(api)
 
@@ -776,6 +811,46 @@ def test_post_runs_allowed_for_non_admin(api):
     assert result["statusCode"] == 202
 
 
+def test_post_runs_writes_run_audit(api):
+    put_settings_item(api)
+
+    call("POST", "/runs", body=run_payload(force=True))
+
+    result = call("GET", "/audits", groups=ADMIN, query={"target": "run"})
+    entries = data(result)
+    assert len(entries) == 1
+    assert entries[0]["actor_email"] == ACTOR_EMAIL
+    assert entries[0]["before"] is None
+    assert entries[0]["after"]["month"] == CLOSED_MONTH
+    assert entries[0]["after"]["target_env"] == VERIFICATION
+    assert entries[0]["after"]["distribute"] is True
+    assert entries[0]["after"]["force"] is True
+    assert entries[0]["after"]["attempt"] == 1
+    assert EXECUTION_NAME_PATTERN.match(entries[0]["after"]["execution_name"])
+
+
+def test_post_runs_conflict_is_not_recorded(api):
+    """受理しなかった試行は残さない（409 は「実行した」ことにならない）。"""
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 409
+    assert repo.list_audits() == []
+
+
+def test_post_runs_returns_202_even_if_audit_write_fails(api, monkeypatch):
+    """監査は best-effort。RUN は既に始まっているため 202 を返す。"""
+    put_settings_item(api)
+    monkeypatch.setattr(repo, "put_run_audit", raise_audit_error)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 202
+    assert repo.list_audits() == []
+
+
 def test_post_runs_conflict_when_already_running(api):
     put_settings_item(api)
     put_run_item(api, status=repo.RUNNING)
@@ -784,6 +859,99 @@ def test_post_runs_conflict_when_already_running(api):
 
     assert result["statusCode"] == 409
     assert error_code(result) == "ALREADY_RUNNING"
+
+
+def test_post_runs_conflict_just_before_the_schedule(api, monkeypatch):
+    """06:00 のスケジュール実行と重ならないよう直前 1 分は断る（#1006）。"""
+    monkeypatch.setattr(api_app, "_now", lambda: NOW.replace(hour=5, minute=59, second=30))
+    put_settings_item(api)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 409
+    assert error_code(result) == "SCHEDULE_IMMINENT"
+    message = body(result)["error"]["message"]
+    assert "06:00" in message
+    assert "06:01 以降" in message
+    assert repo.get_run(VERIFICATION, CLOSED_MONTH) is None
+
+
+def test_post_runs_allowed_just_outside_the_schedule_window(api, monkeypatch):
+    monkeypatch.setattr(api_app, "_now", lambda: NOW.replace(hour=5, minute=58, second=59))
+    put_settings_item(api)
+
+    assert call("POST", "/runs", body=run_payload())["statusCode"] == 202
+
+
+def test_post_runs_schedule_window_follows_the_environment(api, monkeypatch):
+    """スケジュール時刻はテンプレートのパラメータが正（`SCHEDULE_HOUR` / `SCHEDULE_MINUTE`）。"""
+    monkeypatch.setenv("SCHEDULE_HOUR", "23")
+    monkeypatch.setenv("SCHEDULE_MINUTE", "45")
+    monkeypatch.setattr(api_app, "_now", lambda: NOW.replace(hour=23, minute=44, second=30))
+    put_settings_item(api)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert error_code(result) == "SCHEDULE_IMMINENT"
+    assert "23:45" in body(result)["error"]["message"]
+
+
+def test_post_runs_schedule_check_precedes_other_running_month(api, monkeypatch):
+    """直前判定が先。実行中の月があっても「06:01 以降に」と案内する。"""
+    monkeypatch.setattr(api_app, "_now", lambda: NOW.replace(hour=5, minute=59, second=30))
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING, month=OPEN_MONTH)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert error_code(result) == "SCHEDULE_IMMINENT"
+
+
+def test_post_runs_conflict_when_other_month_is_running(api):
+    """SaaS_A の管理 API は 1 ユーザー 1 トークン。別月と重ねると先発が 401 で全滅する（#1006）。"""
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING, month=OPEN_MONTH)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 409
+    assert error_code(result) == "OTHER_RUN_RUNNING"
+    assert OPEN_MONTH in body(result)["error"]["message"]
+    assert repo.get_run(VERIFICATION, CLOSED_MONTH) is None
+
+
+def test_post_runs_conflict_lists_every_running_month(api):
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING, month=OPEN_MONTH)
+    put_run_item(api, status=repo.QUEUED, month=OTHER_MONTH)
+
+    result = call("POST", "/runs", body=run_payload())
+
+    message = body(result)["error"]["message"]
+    assert error_code(result) == "OTHER_RUN_RUNNING"
+    assert OTHER_MONTH in message
+    assert OPEN_MONTH in message
+
+
+def test_post_runs_force_does_not_bypass_other_running_month(api):
+    """強制再実行でも他の月のトークンは奪えるため、`force` では抜けられない（#1006）。"""
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING, month=OPEN_MONTH)
+
+    result = call("POST", "/runs", body=run_payload(force=True))
+
+    assert result["statusCode"] == 409
+    assert error_code(result) == "OTHER_RUN_RUNNING"
+
+
+def test_post_runs_ignores_stale_run_of_other_month(api):
+    """落ちたまま running の RUN は翌日以降ブロックしない（設計 6.2 の stale 規則）。"""
+    put_settings_item(api)
+    put_run_item(api, status=repo.RUNNING, month=OPEN_MONTH, started_at=(NOW - timedelta(days=1)).isoformat())
+
+    result = call("POST", "/runs", body=run_payload())
+
+    assert result["statusCode"] == 202
 
 
 def test_post_runs_conflict_when_succeeded_without_force(api):
@@ -985,14 +1153,53 @@ def test_get_audits_requires_admin(api):
     assert error_code(result) == "FORBIDDEN"
 
 
-def test_get_audits_returns_latest_fifty_descending(api):
-    moments = [(NOW - timedelta(minutes=index)).isoformat() for index in range(55)]
+def test_get_audits_returns_latest_hundred_descending(api):
+    moments = [(NOW - timedelta(minutes=index)).isoformat() for index in range(105)]
     for index, at in enumerate(moments):
         put_audit_item(api, at, index)
 
     result = call("GET", "/audits", groups=ADMIN)
 
-    assert [audit["at"] for audit in data(result)] == moments[:50]
+    assert [audit["at"] for audit in data(result)] == moments[:100]
+
+
+def test_get_audits_filters_by_target(api):
+    moments = [(NOW - timedelta(minutes=index)).isoformat() for index in range(4)]
+    for index, at in enumerate(moments):
+        put_audit_item(api, at, index, "run" if index % 2 == 0 else "settings")
+
+    result = call("GET", "/audits", groups=ADMIN, query={"target": "run", "limit": "1"})
+
+    assert [audit["at"] for audit in data(result)] == [moments[0]]
+
+
+def test_get_audits_since_drops_older_entries(api):
+    moments = [(NOW - timedelta(days=index)).isoformat() for index in range(3)]
+    for index, at in enumerate(moments):
+        put_audit_item(api, at, index)
+
+    since = (NOW - timedelta(days=1)).astimezone(UTC).isoformat().replace("+00:00", "Z")
+    result = call("GET", "/audits", groups=ADMIN, query={"since": since})
+
+    assert [audit["at"] for audit in data(result)] == moments[:2]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        {"limit": "0"},
+        {"limit": "201"},
+        {"limit": "abc"},
+        {"limit": "\u00b2"},
+        {"target": "foo"},
+        {"since": "abc"},
+    ],
+)
+def test_get_audits_rejects_invalid_query(api, query):
+    result = call("GET", "/audits", groups=ADMIN, query=query)
+
+    assert result["statusCode"] == 400
+    assert error_code(result) == "VALIDATION_ERROR"
 
 
 def test_get_audits_includes_actor_email_and_before_after(api):
@@ -1004,6 +1211,119 @@ def test_get_audits_includes_actor_email_and_before_after(api):
     assert data(result)[0]["actor_email"] == ACTOR_EMAIL
     assert data(result)[0]["before"]["cutoff_day"] == 20
     assert data(result)[0]["after"]["cutoff_day"] == 15
+
+
+def put_slack_bot_token(api) -> None:
+    api.ssm.put_parameter(Name=SLACK_BOT_TOKEN_PARAMETER, Value=SLACK_BOT_TOKEN, Type="SecureString")
+
+
+def add_slack_directory(channel_name: str = "proj-saas-a-billing") -> None:
+    """`conversations.list` / `users.list` の 1 ページ応答を順番に積む。"""
+    responses.get(
+        slack_directory.CONVERSATIONS_LIST_URL,
+        json={
+            "ok": True,
+            "channels": [{"id": SLACK_CHANNEL, "name": channel_name, "is_private": False, "is_member": False}],
+            "response_metadata": {"next_cursor": ""},
+        },
+    )
+    responses.get(
+        slack_directory.USERS_LIST_URL,
+        json={
+            "ok": True,
+            "members": [
+                {
+                    "id": SLACK_USER,
+                    "name": "devA",
+                    "deleted": False,
+                    "is_bot": False,
+                    "real_name": "DevA",
+                    "profile": {"real_name": "DevA", "display_name": "開発者本人"},
+                }
+            ],
+            "response_metadata": {"next_cursor": ""},
+        },
+    )
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_get_slack_directory_returns_channels_and_users(api):
+    put_slack_bot_token(api)
+    add_slack_directory()
+
+    result = call("GET", "/slack/directory", groups=ADMIN)
+
+    assert result["statusCode"] == 200
+    assert data(result)["channels"] == [
+        {"id": SLACK_CHANNEL, "name": "proj-saas-a-billing", "is_private": False, "is_member": False}
+    ]
+    assert data(result)["users"] == [
+        {"id": SLACK_USER, "handle": "devA", "real_name": "DevA", "display_name": "開発者本人"}
+    ]
+    assert data(result)["fetched_at"].endswith("Z")
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_get_slack_directory_does_not_leak_bot_token(api):
+    put_slack_bot_token(api)
+    add_slack_directory()
+
+    result = call("GET", "/slack/directory", groups=ADMIN)
+
+    assert result["statusCode"] == 200
+    assert SLACK_BOT_TOKEN not in result["body"]
+
+
+def test_get_slack_directory_requires_admin(api):
+    """非 admin は Slack を叩く前に 403 で弾く（登録していない応答を使わない）。"""
+    result = call("GET", "/slack/directory")
+
+    assert result["statusCode"] == 403
+    assert error_code(result) == "FORBIDDEN"
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_get_slack_directory_serves_cache_until_refresh(api):
+    put_slack_bot_token(api)
+    add_slack_directory()
+    add_slack_directory(channel_name="renamed")
+
+    call("GET", "/slack/directory", groups=ADMIN)
+    cached = call("GET", "/slack/directory", groups=ADMIN)
+    refreshed = call("GET", "/slack/directory", groups=ADMIN, query={"refresh": "1"})
+
+    assert data(cached)["channels"][0]["name"] == "proj-saas-a-billing"
+    assert data(refreshed)["channels"][0]["name"] == "renamed"
+
+
+def test_get_slack_directory_returns_503_without_bot_token(api):
+    result = call("GET", "/slack/directory", groups=ADMIN)
+
+    assert result["statusCode"] == 503
+    assert error_code(result) == "SLACK_NOT_CONFIGURED"
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_get_slack_directory_returns_502_with_slack_error(api):
+    put_slack_bot_token(api)
+    responses.get(slack_directory.CONVERSATIONS_LIST_URL, json={"ok": False, "error": "missing_scope"})
+
+    result = call("GET", "/slack/directory", groups=ADMIN)
+
+    assert result["statusCode"] == 502
+    assert error_code(result) == "SLACK_API_ERROR"
+    assert "missing_scope" in body(result)["error"]["message"]
+
+
+@responses.activate(registry=registries.OrderedRegistry)
+def test_get_slack_directory_returns_502_when_slack_unreachable(api):
+    put_slack_bot_token(api)
+    responses.get(slack_directory.CONVERSATIONS_LIST_URL, body=requests.ConnectionError("boom"))
+
+    result = call("GET", "/slack/directory", groups=ADMIN)
+
+    assert result["statusCode"] == 502
+    assert error_code(result) == "SLACK_UNAVAILABLE"
 
 
 def test_unauthenticated_event_returns_401(api):
@@ -1045,3 +1365,43 @@ def _raising_states():
         raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "denied"}}, "StartExecution")
 
     return SimpleNamespace(start_execution=start_execution)
+
+
+@pytest.mark.parametrize("value", ["billing_only", "all"])
+def test_mail_attachment_sheets_put_and_audit(api, value):
+    current = put_settings_item(api)
+    result = call(
+        "PUT", "/settings", body={"version": current["version"], "mail_attachment_sheets": value}, groups=ADMIN
+    )
+    assert result["statusCode"] == 200
+    assert data(result)["mail_attachment_sheets"] == value
+    assert data(call("GET", "/settings"))["mail_attachment_sheets"] == value
+    audit = repo.list_audits()[0]
+    assert audit["before"]["mail_attachment_sheets"] == "billing_only"
+    assert audit["after"]["mail_attachment_sheets"] == value
+
+
+@pytest.mark.parametrize("value", [None, "", "invalid", 1, True, [], {}])
+def test_mail_attachment_sheets_rejects_invalid_value(api, value):
+    current = put_settings_item(api)
+    result = call(
+        "PUT", "/settings", body={"version": current["version"], "mail_attachment_sheets": value}, groups=ADMIN
+    )
+    assert result["statusCode"] == 400
+    assert error_code(result) == "VALIDATION_ERROR"
+    assert "mail_attachment_sheets" in body(result)["error"]["message"]
+    assert repo.get_settings()["version"] == current["version"]
+    assert repo.list_audits() == []
+
+
+@pytest.mark.parametrize("stored", [None, "billing_only", "all"])
+def test_mail_attachment_sheets_omitted_put_keeps_current_value(api, stored):
+    current = put_settings_item(api, **({"mail_attachment_sheets": stored} if stored else {}))
+    result = call("PUT", "/settings", body={"version": current["version"], "cutoff_day": 15}, groups=ADMIN)
+    assert result["statusCode"] == 200
+    expected = stored or "billing_only"
+    assert data(result)["mail_attachment_sheets"] == expected
+    assert repo.get_settings()["mail_attachment_sheets"] == expected
+    audit = repo.list_audits()[0]
+    assert audit["before"]["mail_attachment_sheets"] == expected
+    assert audit["after"]["mail_attachment_sheets"] == expected

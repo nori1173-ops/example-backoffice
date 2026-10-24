@@ -19,4 +19,10 @@ export const routes: RouteRecordRaw[] = [
     component: () => import('./views/SettingsView.vue'),
     meta: { title: '設定', requiredGroups: ['admin'] },
   },
+  {
+    path: 'logs',
+    name: 'saas-a-billing.logs',
+    component: () => import('./views/LogsView.vue'),
+    meta: { title: 'ログ', requiredGroups: ['admin'] },
+  },
 ]

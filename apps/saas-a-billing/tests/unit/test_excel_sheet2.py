@@ -10,6 +10,7 @@ from openpyxl.utils.cell import range_boundaries
 from saas_a_billing.excel import (
     COLOR_EXCLUDED,
     COLOR_FAILED,
+    COLOR_MISSING,
     COLOR_MISSING_TEXT,
     COLOR_NO_DATA,
     COLOR_REVIEW_TEXT,
@@ -22,6 +23,7 @@ from saas_a_billing.excel import (
     SHEET1_NAME,
     SHEET2_NAME,
     SUMMARY_COLUMNS,
+    SUMMARY_DEMO_NOTE,
     TOTAL_FONT_SIZE,
     TOTAL_LABEL,
     build_workbook,
@@ -45,6 +47,8 @@ ALL_DEVICE_CDS = (
     "10000009-01-LoggerA-400",
 )
 DEVICE_CD_COLUMN = 4
+RETENTION_COLUMN = 2
+DESCRIPTION_COLUMN = 10
 AMOUNT_COLUMN = 12
 HOSTILE_DEVICE_CD = "90000001-01-LoggerA-400"
 
@@ -85,6 +89,10 @@ def font_color(cell) -> str | None:
 
 def fill_color(cell) -> str | None:
     return cell.fill.start_color.rgb if cell.fill.patternType else None
+
+
+def column_widths(worksheet) -> dict[str, float]:
+    return {letter: dimension.width for letter, dimension in worksheet.column_dimensions.items()}
 
 
 def detail_table(worksheet):
@@ -149,6 +157,7 @@ def test_tenant_summary_columns(sheet2):
         "要確認",
         "取得失敗",
         "小計",
+        "説明",
     )
     header = find_row(sheet2, "テナントCD")
     assert [at(sheet2, header, col).value for col in range(len(SUMMARY_COLUMNS))] == list(SUMMARY_COLUMNS)
@@ -193,6 +202,49 @@ def test_tenant_summary_ends_with_total_row(sheet2):
     assert amount.number_format == CURRENCY_FORMAT
     assert fill_color(amount) == argb(COLOR_TOTAL_HIGHLIGHT)
     assert fill_color(at(sheet2, total_row, 8)) == argb(COLOR_TOTAL_HIGHLIGHT)
+
+
+# テナントがデモかどうかを一目で読ませる（#1010）
+def test_tenant_summary_shows_tenant_description(sheet2):
+    assert at(sheet2, find_row(sheet2, "TNT003"), DESCRIPTION_COLUMN).value == "デモ用テナント"
+    assert at(sheet2, find_row(sheet2, "TNT001"), DESCRIPTION_COLUMN).value is None
+
+
+# 明細テーブルと物理列を共有するため、既存の列位置は動かさず説明は最終列に置く
+def test_tenant_summary_keeps_subtotal_in_column_j(sheet2):
+    header = find_row(sheet2, "テナントCD")
+    subtotal = at(sheet2, header, 9)
+    assert (subtotal.value, subtotal.column_letter) == ("小計", "J")
+    assert at(sheet2, header, DESCRIPTION_COLUMN).value == SUMMARY_COLUMNS[-1] == "説明"
+
+
+def test_long_tenant_description_does_not_change_column_widths(result):
+    described = make_result()
+    described["tenants"][0] = {**described["tenants"][0], "tenant_description": "あ" * 200}
+    assert column_widths(load(described)[SHEET2_NAME]) == column_widths(load(result)[SHEET2_NAME])
+
+
+def test_demo_tenant_summary_row_is_filled(sheet2):
+    demo = find_row(sheet2, "TNT003")
+    fills = [fill_color(at(sheet2, demo, col)) for col in range(len(SUMMARY_COLUMNS)) if col != RETENTION_COLUMN]
+    assert set(fills) == {argb(COLOR_EXCLUDED)}
+    assert fill_color(at(sheet2, demo, RETENTION_COLUMN)) == argb(RETENTION_3Y[0])
+
+
+def test_non_demo_tenant_summary_row_is_not_filled(sheet2):
+    row = find_row(sheet2, "TNT001")
+    fills = [fill_color(at(sheet2, row, col)) for col in range(len(SUMMARY_COLUMNS)) if col != RETENTION_COLUMN]
+    assert set(fills) == {None}
+
+
+def test_tenant_summary_has_demo_legend(sheet2):
+    heading = find_row(sheet2, "テナント別サマリ")
+    assert "デモ" in at(sheet2, heading + 1, 0).value
+
+
+def test_tenant_summary_has_demo_legend_only_on_sheet2(result):
+    book = load(result)
+    assert SUMMARY_DEMO_NOTE not in [row[0] for row in values(book[SHEET1_NAME])]
 
 
 def test_detail_table_has_fifteen_columns(sheet2):
@@ -255,13 +307,15 @@ def test_failed_row_is_gray(sheet2):
         assert fill_color(at(sheet2, row, col)) == argb(COLOR_FAILED)
 
 
-def test_missing_devices_are_listed_in_gray_text(sheet2):
+def test_missing_devices_are_listed_in_pink(sheet2):
     row = device_row(sheet2, "10000009-01-LoggerA-400")
     assert detail_rows(sheet2)[-1][DEVICE_CD_COLUMN] == "10000009-01-LoggerA-400"
     assert at(sheet2, row, 10).value == "消えた地点"
     assert at(sheet2, row, AMOUNT_COLUMN).value is None
+    assert at(sheet2, row, 14).value == "前月分（2026-09）に存在"
     for col in (0, 5, 10):
         assert font_color(at(sheet2, row, col)) == argb(COLOR_MISSING_TEXT)
+        assert fill_color(at(sheet2, row, col)) == argb(COLOR_MISSING)
 
 
 def test_review_flags_are_red_text_with_reason(sheet2):

@@ -164,7 +164,6 @@ def make_settings(**overrides) -> dict:
         "target_env": "verification",
         "cutoff_day": 20,
         "cutoff_time": "24:00",
-        "auto_retry_days": 5,
         "auto_run_enabled": False,
         "auto_run_from_month": "2026-08",
         "mail_enabled": False,
@@ -274,6 +273,7 @@ def make_result_tenant(**overrides) -> dict:
         "tenant_cd": "TNT001",
         "tenant_name": "サンプル建設",
         "tenant_description": "",
+        "tenant_excluded": False,
         "retention_period": 3,
         "device_count_api": 1,
         "status": "ok",
@@ -429,6 +429,7 @@ def _sample_result_tenants() -> list[dict]:
             tenant_cd="TNT003",
             tenant_name="デモ商会",
             tenant_description="デモ用テナント",
+            tenant_excluded=True,
             counts={"billable": 0, "no_data": 0, "excluded": 1, "review": 0},
             devices=[
                 make_result_device(

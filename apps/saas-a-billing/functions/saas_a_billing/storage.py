@@ -145,9 +145,11 @@ def get_tenants(target_env: str, month: str) -> list[dict]:
     return [] if data is None else data.get("tenants") or []
 
 
-def put_xlsx(target_env: str, month: str, data: bytes) -> str:
-    """Excel を置き、キーを返す。"""
+def put_xlsx(target_env: str, month: str, data: bytes, *, billing_only: bool = False) -> str:
+    """Excel を置く。メールのシート1 版は同じ月の mail/ に分け、通常版と同じ保持条件にする。"""
     key = xlsx_key(target_env, month)
+    if billing_only:
+        key = f"{prefix(target_env, month)}/mail/{attachment_filename(month, target_env)}"
     _client().put_object(Bucket=_bucket(), Key=key, Body=data, ContentType=XLSX_CONTENT_TYPE)
     return key
 

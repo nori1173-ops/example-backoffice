@@ -1,0 +1,70 @@
+# infra/edge/template.yaml に転記する断片（ADD-APP-GUIDE 2 章ステップ 6 / 設計 5.2・7.1）。
+# 転記後に scripts/deploy-edge.sh へこのアプリの SSM 解決を足し、scripts/deploy-edge.sh {env}
+# でデプロイする。saas-a-billing の 2 行（API_DOMAIN_PARAM の定義と OVERRIDES への連結。
+# scripts/deploy-edge.sh:53 / :99 付近）が参照例。
+#
+#   /example-backoffice/{env}/apps/daily-security-report/api-domain を aws ssm get-parameter で読み、
+#   値があれば DailySecurityReportApiDomain=<読んだ値>
+#   を parameter_overrides に足す。
+#
+# samconfig.toml に SSM のキーパスを書くのは誤り。下のパラメータは Type: String なので、
+# キーパスの文字列がそのまま origin の DomainName になり、API 経路が壊れる
+#（SSM から解決されるのは Type: AWS::SSM::Parameter::Value<String> のパラメータだけ）。
+#
+# origin も behavior も「リストの要素ごとに !If」で書く。edge テンプレートの Origins /
+# CacheBehaviors は既にこの形（#1007 で書き換え済み）なので、下をそのまま末尾に足せばよい。
+#     CacheBehaviors: !If [HasXxxApi, [<behavior>], !Ref AWS::NoValue]
+# のようにリスト全体を !If にすると、後から足した behavior が他アプリの Condition に
+# 巻き込まれる。origin だけ消えて behavior が残ればデプロイが失敗し、CacheBehaviors ごと
+# 消えれば /api/{app}/* が SPA へフォールスルーする。この形へ戻さないこと。
+
+# --- Parameters に追加 -------------------------------------------------------
+Parameters:
+  DailySecurityReportApiDomain:
+    Type: String
+    Default: ""
+    Description: AWS日次セキュリティレポートの HTTP API ドメイン（/apps/daily-security-report/api-domain）。空なら API 経路を作らない
+
+# --- Conditions に追加 -------------------------------------------------------
+Conditions:
+  HasDailySecurityReportApi: !Not [!Equals [!Ref DailySecurityReportApiDomain, ""]]
+
+# --- Distribution の Origins に追加 -----------------------------------------
+          - !If
+            - HasDailySecurityReportApi
+            - Id: api-daily-security-report
+              DomainName: !Ref DailySecurityReportApiDomain
+              CustomOriginConfig:
+                OriginProtocolPolicy: https-only
+                OriginSSLProtocols:
+                  - TLSv1.2
+              OriginCustomHeaders:
+                - HeaderName: x-origin-verify
+                  HeaderValue: !Ref OriginVerifySecret
+            - !Ref AWS::NoValue
+
+# --- Distribution の CacheBehaviors に追加 ----------------------------------
+# origin と同じ Condition を要素ごとに付ける（上の「2 アプリ目以降の注意」を参照）。
+# FunctionAssociations（viewer-request → EdgeGuardFunction）を必ず付ける。
+# 付け忘れるとこのアプリの API だけ社内 IP 制限を素通りする（設計 7.1）。
+# AllowedMethods は 7 メソッドを明示する（省略すると GET / HEAD だけになり POST が 403）。
+          - !If
+            - HasDailySecurityReportApi
+            - PathPattern: /api/daily-security-report/*
+              TargetOriginId: api-daily-security-report
+              ViewerProtocolPolicy: https-only
+              AllowedMethods:
+                - GET
+                - HEAD
+                - OPTIONS
+                - PUT
+                - PATCH
+                - POST
+                - DELETE
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+              Compress: true
+              FunctionAssociations:
+                - EventType: viewer-request
+                  FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
+            - !Ref AWS::NoValue

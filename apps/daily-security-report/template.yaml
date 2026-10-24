@@ -1,0 +1,707 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: example-backoffice daily-security-report - read-only account report and GuardDuty alerts
+Parameters:
+  ProjectName:
+    Type: String
+    Default: example-backoffice
+  Env:
+    Type: String
+    AllowedValues:
+      - dev
+      - prod
+    Default: dev
+  LogLevel:
+    Type: String
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Default: INFO
+  ExamplePowertoolsLayerArn:
+    Type: String
+    Default: arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86
+    Description: 社内レイヤ ExamplePowertoolsPython の ARN。LambdaLogger のために参照する
+  PowertoolsLayerArn:
+    Type: String
+    Description: AWS 提供の Powertools for AWS Lambda (Python) レイヤ ARN。samconfig で環境ごとに指定する
+  UserPoolIssuer:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/issuer
+    Description: JWT authorizer が検証する issuer（設計 4.2）
+  UserPoolClientId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/cognito/client-id
+    Description: JWT authorizer の audience（設計 4.2）
+  NotifyQueueUrl:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-url
+    Description: 通知キュー URL。shared notify.py が環境変数 NOTIFY_QUEUE_URL から読む
+  NotifyQueueArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/notify/queue-arn
+    Description: 通知キュー ARN。sqs:SendMessage の Resource に使う
+  AttachmentsBucket:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/attachments/bucket
+    Description: 共通契約の添付バケット名。daily-security-report は書き込まない
+  SharedLayerArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/shared/layer-arn
+    Description: 共通レイヤ example_backoffice のバージョン付き ARN
+  PortalUrl:
+    Type: String
+    Default: https://backoffice-dev.example-cloud.com/daily-security-report
+  OpsTopicArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /example-backoffice/dev/ops/topic-arn
+  CloudTrailBucket:
+    Type: String
+    Default: cloudtrail-example
+  CloudTrailPrefix:
+    Type: String
+    Default: AWSLogs/210000000001/CloudTrail/
+  AlarmhubAResolverLogGroup:
+    Type: String
+    Default: /aws/lambda/AlarmHubA-Backend-Resolver-XXXXXXXXXXXX1-Function-XXXXXXXXXXX2
+  GpsReceiverLogGroup:
+    Type: String
+    Default: /aws/lambda/GpsUnitAMock-Receiver-XXXXXXXXXXX3-Function-XXXXXXXXXXX4
+Conditions:
+  IsProd: !Equals
+    - !Ref 'Env'
+    - prod
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    PropagateTags: true
+    Layers:
+      - !Ref 'SharedLayerArn'
+      - !Ref 'ExamplePowertoolsLayerArn'
+      - !Ref 'PowertoolsLayerArn'
+    Environment:
+      Variables:
+        ENV: !Ref 'Env'
+        LOG_LEVEL: !Ref 'LogLevel'
+        APP_NAME: daily-security-report
+        TABLE_NAME: !Ref 'DataTable'
+        NOTIFY_QUEUE_URL: !Ref 'NotifyQueueUrl'
+        ATTACHMENTS_BUCKET: !Ref 'AttachmentsBucket'
+        ACCOUNT_ID: !Ref 'AWS::AccountId'
+        GUARDDUTY_DETECTORS: !Sub
+          - ap-northeast-1=${Detector0},us-east-1=${Detector1},us-west-2=${Detector2}
+          - Detector0: !FindInMap
+              - GuardDutyDetectors
+              - ap-northeast-1
+              - Id
+            Detector1: !FindInMap
+              - GuardDutyDetectors
+              - us-east-1
+              - Id
+            Detector2: !FindInMap
+              - GuardDutyDetectors
+              - us-west-2
+              - Id
+        CLOUDTRAIL_BUCKET: !Ref 'CloudTrailBucket'
+        CLOUDTRAIL_PREFIX: !Ref 'CloudTrailPrefix'
+        INSIGHTS_LOG_GROUPS: !Sub '{"alarmhuba":"${AlarmhubAResolverLogGroup}","gps":"${GpsReceiverLogGroup}"}'
+        POWERTOOLS_SERVICE_NAME: daily-security-report
+        SSM_PREFIX: !Sub '/${ProjectName}/${Env}'
+        PORTAL_URL: !Ref 'PortalUrl'
+    Tags:
+      Project: !Ref 'ProjectName'
+      Name: Function
+Resources:
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      Auth:
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Ref 'UserPoolIssuer'
+              audience:
+                - !Ref 'UserPoolClientId'
+        DefaultAuthorizer: CognitoJwtAuthorizer
+      AccessLogSettings:
+        DestinationArn: !GetAtt 'ApiAccessLogGroup.Arn'
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","sub":"$context.authorizer.claims.sub","latency":"$context.responseLatency"}'
+      Tags:
+        Project: !Ref 'ProjectName'
+        Name: Api
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+        DetailedMetricsEnabled: true
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${ProjectName}-daily-security-report-${Env}'
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: LogGroup
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-daily-security-report-data-${Env}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: !If
+          - IsProd
+          - true
+          - false
+      DeletionProtectionEnabled: !If
+        - IsProd
+        - true
+        - false
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Table
+  ApiDomainParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Env}/apps/daily-security-report/api-domain'
+      Type: String
+      Value: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+      Description: HTTP API のドメイン。edge が origin の DomainName として読む（設計 4.2）
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DailySecurityReportPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AccessOwnTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:TransactWriteItems
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt 'DataTable.Arn'
+              - Sid: InvokeReportPreview
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt 'ReportFunction.Arn'
+              - Sid: ReadApiParameters
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/edge/origin-verify-secret'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/mode'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/${Env}/shared/slack/bot-token'
+              - Sid: DecryptSecureStringParameters
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub 'ssm.${AWS::Region}.amazonaws.com'
+                  ForAnyValue:StringEquals:
+                    kms:ResourceAliases: alias/aws/ssm
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-daily-security-report-api-${Env}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Role
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-daily-security-report-api-${Env}'
+      CodeUri: functions/
+      Handler: daily_security_report_api.app.handler
+      Timeout: 29
+      MemorySize: 512
+      Role: !GetAtt 'ApiRole.Arn'
+      Environment:
+        Variables:
+          REPORT_FUNCTION_NAME: !Ref 'ReportFunction'
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref 'HttpApi'
+            Path: /api/daily-security-report/{proxy+}
+            Method: ANY
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-daily-security-report-api-${Env}'
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: LogGroup
+  ReportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DailySecurityReportPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeClaude
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:aws:bedrock:ap-northeast-1:${AWS::AccountId}:inference-profile/*.anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/anthropic.claude-*'
+              - Sid: ListInferenceProfiles
+                Effect: Allow
+                Action: bedrock:ListInferenceProfiles
+                Resource: '*'
+              - Sid: ReadFindings
+                Effect: Allow
+                Action:
+                  - guardduty:ListFindings
+                  - guardduty:GetFindings
+                Resource:
+                  - !Sub
+                    - arn:aws:guardduty:ap-northeast-1:${AWS::AccountId}:detector/${Detector}/findings
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - ap-northeast-1
+                        - Id
+                  - !Sub
+                    - arn:aws:guardduty:us-east-1:${AWS::AccountId}:detector/${Detector}/findings
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - us-east-1
+                        - Id
+                  - !Sub
+                    - arn:aws:guardduty:us-west-2:${AWS::AccountId}:detector/${Detector}/findings
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - us-west-2
+                        - Id
+                  - !Sub
+                    - arn:aws:guardduty:ap-northeast-1:${AWS::AccountId}:detector/${Detector}/findings/get
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - ap-northeast-1
+                        - Id
+                  - !Sub
+                    - arn:aws:guardduty:us-east-1:${AWS::AccountId}:detector/${Detector}/findings/get
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - us-east-1
+                        - Id
+                  - !Sub
+                    - arn:aws:guardduty:us-west-2:${AWS::AccountId}:detector/${Detector}/findings/get
+                    - Detector: !FindInMap
+                        - GuardDutyDetectors
+                        - us-west-2
+                        - Id
+              - Sid: ListCloudTrail
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${CloudTrailBucket}'
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - !Sub '${CloudTrailPrefix}*'
+              - Sid: ReadCloudTrail
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${CloudTrailBucket}/${CloudTrailPrefix}*'
+              - Sid: ReadMetricsAndInstances
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                  - ec2:DescribeInstances
+                  - lightsail:GetInstances
+                  - lightsail:GetInstanceMetricData
+                Resource: '*'
+              - Sid: ReadIamCredentialReport
+                Effect: Allow
+                # 認証情報レポートとロール列挙はリソースを限定できない。
+                Action:
+                  - iam:GenerateCredentialReport
+                  - iam:GetCredentialReport
+                  - iam:ListRoles
+                Resource: '*'
+              - Sid: ReadIamRoleLastUsed
+                Effect: Allow
+                Action: iam:GetRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+              - Sid: StartInsights
+                Effect: Allow
+                Action: logs:StartQuery
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${AlarmhubAResolverLogGroup}:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${GpsReceiverLogGroup}:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:*'
+              - Sid: LookupCloudTrailEvents
+                Effect: Allow
+                # イベント履歴（90 日）の検索。Resource を限定できないアクション
+                Action: cloudtrail:LookupEvents
+                Resource: '*'
+              - Sid: AccessOwnTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt 'DataTable.Arn'
+              - Sid: SendNotificationsAndFailures
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !Ref 'NotifyQueueArn'
+                  - !GetAtt 'FailureQueue.Arn'
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-daily-security-report-report-${Env}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Role
+  ReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-daily-security-report-report-${Env}'
+      CodeUri: functions/
+      Handler: daily_security_report_batch.handlers.report.handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt 'ReportRole.Arn'
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt 'FailureQueue.Arn'
+      Events:
+        Daily:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub '${ProjectName}-daily-security-report-daily-${Env}'
+            ScheduleExpression: cron(0 7 * * ? *)
+            ScheduleExpressionTimezone: Asia/Tokyo
+            FlexibleTimeWindow:
+              Mode: 'OFF'
+            Input: '{"trigger":"scheduled"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 3600
+            DeadLetterConfig:
+              Arn: !GetAtt 'SchedulerDlq.Arn'
+  ReportLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-daily-security-report-report-${Env}'
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: LogGroup
+  GuardDutyAlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DailySecurityReportPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AccessOwnTable
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt 'DataTable.Arn'
+              - Sid: SendNotificationsAndFailures
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource:
+                  - !Ref 'NotifyQueueArn'
+                  - !GetAtt 'FailureQueue.Arn'
+              - Sid: WriteOwnLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-daily-security-report-guardduty-alert-${Env}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Role
+  GuardDutyAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-daily-security-report-guardduty-alert-${Env}'
+      CodeUri: functions/
+      Handler: daily_security_report_batch.handlers.guardduty_alert.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt 'GuardDutyAlertRole.Arn'
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt 'FailureQueue.Arn'
+  GuardDutyAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-daily-security-report-guardduty-alert-${Env}'
+      RetentionInDays: 365
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: LogGroup
+  SchedulerDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-daily-security-report-scheduler-dlq-${Env}'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Queue
+  FailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-daily-security-report-failure-${Env}'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Queue
+  GuardDutyAlertRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-daily-security-report-guardduty-alert-${Env}'
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - numeric:
+                - '>='
+                - 7
+      Targets:
+        - Id: guardduty-alert
+          Arn: !GetAtt 'GuardDutyAlertFunction.Arn'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Rule
+  GuardDutyAlertPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref 'GuardDutyAlertFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 'GuardDutyAlertRule.Arn'
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref 'OpsTopicArn'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Alarm
+      AlarmName: !Sub '${ProjectName}-daily-security-report-lambda-errors-${Env}'
+      Metrics:
+        - Id: api
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref 'ApiFunction'
+            Period: 300
+            Stat: Sum
+        - Id: report
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref 'ReportFunction'
+            Period: 300
+            Stat: Sum
+        - Id: alert
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref 'GuardDutyAlertFunction'
+            Period: 300
+            Stat: Sum
+        - Id: errors
+          Expression: api + report + alert
+          Label: daily-security-report Lambda Errors
+          ReturnData: true
+  SchedulerDlqAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref 'OpsTopicArn'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Alarm
+      AlarmName: !Sub '${ProjectName}-daily-security-report-scheduler-dlq-${Env}'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt 'SchedulerDlq.QueueName'
+      Statistic: Maximum
+      Period: 300
+  FailureQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref 'OpsTopicArn'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Alarm
+      AlarmName: !Sub '${ProjectName}-daily-security-report-failure-${Env}'
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt 'FailureQueue.QueueName'
+      Statistic: Maximum
+      Period: 300
+  GuardDutyFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref 'OpsTopicArn'
+      Tags:
+        - Key: Project
+          Value: !Ref 'ProjectName'
+        - Key: Name
+          Value: Alarm
+      AlarmName: !Sub '${ProjectName}-daily-security-report-event-delivery-${Env}'
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - Name: RuleName
+          Value: !Ref 'GuardDutyAlertRule'
+      Statistic: Sum
+      Period: 300
+Outputs:
+  ApiDomain:
+    Description: HTTP API のドメイン（edge の origin DomainName）
+    Value: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  DataTableName:
+    Description: アプリの単一テーブル名
+    Value: !Ref 'DataTable'
+Mappings:
+  GuardDutyDetectors:
+    ap-northeast-1:
+      Id: '00000000000000000000000000000001'
+    us-east-1:
+      Id: '00000000000000000000000000000002'
+    us-west-2:
+      Id: '00000000000000000000000000000003'

@@ -149,6 +149,32 @@ describe('runs ストア', () => {
     expect(store.error).not.toContain(code)
   })
 
+  // 実行中の月がわからないと待てないため、API が組み立てた日本語をそのまま出す（#1006）
+  it('createRun の 409 OTHER_RUN_RUNNING は API の message をそのまま出す', async () => {
+    const message = '2026-09 が実行中です。終わってから実行してください。'
+    vi.mocked(billingApi.createRun).mockRejectedValue({
+      response: { data: { data: null, error: { code: 'OTHER_RUN_RUNNING', message } } },
+    })
+    const store = useRunsStore()
+
+    const accepted = await store.createRun({ month: MONTH, distribute: false, force: false })
+
+    expect(accepted).toBeNull()
+    expect(store.error).toBe(message)
+  })
+
+  it('createRun の 409 SCHEDULE_IMMINENT は API の message をそのまま出す', async () => {
+    const message = '06:00 のスケジュール実行の直前です。06:01 以降に実行してください。'
+    vi.mocked(billingApi.createRun).mockRejectedValue({
+      response: { data: { data: null, error: { code: 'SCHEDULE_IMMINENT', message } } },
+    })
+    const store = useRunsStore()
+
+    await store.createRun({ month: MONTH, distribute: false, force: false })
+
+    expect(store.error).toBe(message)
+  })
+
   it('createRun 後に pollRun が開始される', async () => {
     vi.useFakeTimers()
     vi.mocked(billingApi.createRun).mockResolvedValue({

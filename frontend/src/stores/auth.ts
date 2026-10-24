@@ -35,7 +35,7 @@ const AMPLIFY_ERROR_MESSAGES: Record<string, string> = {
   CodeDeliveryFailureException: '確認コードを送信できませんでした。メールアドレスを確認してください',
   EnableSoftwareTokenMFAException: '認証コードが正しくありません。認証アプリの表示を確認してください',
   SoftwareTokenMFANotFoundException:
-    '認証アプリが登録されていません。サインインし直して登録してください',
+    '認証アプリが登録されていません。情報システム担当へ連絡してください',
   InvalidPasswordException: PASSWORD_POLICY_MESSAGE,
   InvalidParameterException: '入力内容が正しくありません',
   UsernameExistsException: 'このメールアドレスは既に登録されています',

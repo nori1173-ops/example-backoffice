@@ -2,6 +2,7 @@ import { createAppApi } from '@/services/http'
 import type { ApiEnvelope } from '@/types'
 import type {
   AuditEntry,
+  AuditTarget,
   DownloadUrl,
   PriceList,
   PriceTable,
@@ -13,6 +14,7 @@ import type {
   Settings,
   SettingsUpdate,
   SettingsView,
+  SlackDirectory,
   TargetEnv,
 } from './types'
 
@@ -27,6 +29,12 @@ export interface RunListParams {
 export interface RunDetailParams {
   targetEnv?: TargetEnv
   detail?: boolean
+}
+
+export interface AuditListParams {
+  limit?: number
+  target?: AuditTarget
+  since?: string
 }
 
 export const billingApi = {
@@ -85,9 +93,19 @@ export const billingApi = {
     return response.data.data
   },
 
-  /** admin のみ（設計 12.1）。 */
-  async listAudits(): Promise<AuditEntry[] | null> {
-    const response = await api.get<ApiEnvelope<AuditEntry[]>>('/audits')
+  /** admin のみ（#1011）。`refresh` はサーバのキャッシュ（300 秒）を捨てて取り直す。 */
+  async getSlackDirectory(refresh = false): Promise<SlackDirectory | null> {
+    const response = await api.get<ApiEnvelope<SlackDirectory>>('/slack/directory', {
+      params: refresh ? { refresh: 1 } : {},
+    })
+    return response.data.data
+  },
+
+  /** admin のみ（設計 12.1）。`since` は ISO 8601（`Z` 付きでよい）。 */
+  async listAudits(params: AuditListParams = {}): Promise<AuditEntry[] | null> {
+    const response = await api.get<ApiEnvelope<AuditEntry[]>>('/audits', {
+      params: { limit: params.limit, target: params.target, since: params.since },
+    })
     return response.data.data
   },
 }

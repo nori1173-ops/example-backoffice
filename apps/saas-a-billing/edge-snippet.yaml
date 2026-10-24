@@ -10,9 +10,9 @@
 # キーパスの文字列がそのまま origin の DomainName になり、API 経路が壊れる
 #（SSM から解決されるのは Type: AWS::SSM::Parameter::Value<String> のパラメータだけ）。
 #
-# 【2 アプリ目を足すときの注意】CacheBehaviors は今「リスト全体を !If」の形。その形のまま
-# 2 本目の behavior を足すと HasSaasABillingApi に巻き込まれ、saas-a-billing 未デプロイのときに
-# 2 本目ごと消える。先に origin と同じ「- !If」（要素ごとの条件）へ書き換えてから追記する。
+# origin も behavior も「リストの要素ごとに !If」で書く（#1007 で書き換え済み）。リスト全体を
+# !If にすると、後から足した behavior が saas-a-billing の Condition に巻き込まれ、
+# saas-a-billing 未デプロイのときに他アプリの経路ごと消える。
 
 # --- Parameters に追加 -------------------------------------------------------
 Parameters:
@@ -44,9 +44,9 @@ Conditions:
 # 付け忘れるとこのアプリの API だけ社内 IP 制限を素通りする（プラットフォーム設計 7.1）。
 # AllowedMethods は 7 メソッドを明示する（省略すると GET / HEAD だけになり POST が 403）。
 # CachePolicyId は CachingDisabled、OriginRequestPolicyId は AllViewerExceptHostHeader。
-        CacheBehaviors: !If
-          - HasSaasABillingApi
-          - - PathPattern: /api/saas-a-billing/*
+          - !If
+            - HasSaasABillingApi
+            - PathPattern: /api/saas-a-billing/*
               TargetOriginId: api-saas-a-billing
               ViewerProtocolPolicy: https-only
               AllowedMethods:
@@ -63,4 +63,4 @@ Conditions:
               FunctionAssociations:
                 - EventType: viewer-request
                   FunctionARN: !GetAtt EdgeGuardFunction.FunctionARN
-          - !Ref AWS::NoValue
+            - !Ref AWS::NoValue

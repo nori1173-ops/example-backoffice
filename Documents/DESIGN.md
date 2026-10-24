@@ -1,9 +1,9 @@
 # example-backoffice プラットフォーム設計書
 
 作成日: 2026-08-27
-ステータス: 実装済み（2026-09-02 本番リリース前ブラッシュアップ #1005 を反映）
+ステータス: 実装済み（2026-09-02 本番リリース。以後の改修 #1006〜#1010 と Slack の候補入力 #1011 まで反映）
 対象: 社内保守管理サイト `example-backoffice`（基盤部分）
-関連: [アプリ追加手順](ADD-APP-GUIDE.md) / [第一弾アプリ設計書 saas-a-billing](apps/saas-a-billing/DESIGN.md)
+関連: [アプリ追加手順](ADD-APP-GUIDE.md) / [第一弾アプリ設計書 saas-a-billing](apps/saas-a-billing/DESIGN.md) / [ユーザー管理 admin-users](apps/admin-users/DESIGN.md)
 
 ---
 
@@ -24,16 +24,19 @@
 | 基盤担当 | 1〜2 人 | core / edge / shared スタックの保守、SSM 契約の管理 |
 | アプリ担当 | アプリ毎に 1〜2 人 | `apps/{app}` と `frontend/src/apps/{app}` の開発・デプロイ |
 
-### 1.3 第一弾アプリ
+### 1.3 アプリ一覧
 
-| 項目 | 値 |
-| --- | --- |
-| アプリ id | `saas-a-billing` |
-| 内容 | SaaS_A（外部 SaaS）の月額課金レポート。月次バッチ → Excel 生成 → メール添付 + Slack 通知。設定画面あり |
-| SPA ルート | `/saas-a-billing` |
-| API | `/api/saas-a-billing/*` |
-| スタック | `example-backoffice-app-saas-a-billing-{env}` |
-| 設計書 | `Documents/apps/saas-a-billing/DESIGN.md` |
+| 項目 | 第一弾 | ユーザー管理 |
+| --- | --- | --- |
+| アプリ id | `saas-a-billing` | `admin-users` |
+| 内容 | SaaS_A（外部 SaaS）の月額課金レポート。月次バッチ → Excel 生成 → メール添付 + Slack 通知。設定画面と操作ログ画面あり | ユーザー管理。Cognito の登録ユーザー一覧、admin 付与/解除、無効化/有効化、パスワードリセット、削除 |
+| 利用できる人 | 全ログインユーザー（設定画面のみ `admin`） | `admin` のみ（メニューも出ない。URL 直打ちは `/forbidden`） |
+| SPA ルート | `/saas-a-billing` | `/admin-users` |
+| API | `/api/saas-a-billing/*` | `/api/admin-users/*` |
+| スタック | `example-backoffice-app-saas-a-billing-{env}` | `example-backoffice-app-admin-users-{env}` |
+| 設計書 | `Documents/apps/saas-a-billing/DESIGN.md` | `Documents/apps/admin-users/DESIGN.md` |
+
+daily-security-report（`Documents/apps/daily-security-report/DESIGN.md`）: 本番 AWS アカウント全体を読み取り専用で点検し、レポートと GuardDuty 重大検出を通知する。全ユーザーのレポート一覧 `/daily-security-report` と admin 限定の設定画面を持ち、API は `/api/daily-security-report/*`、スタックは `example-backoffice-app-daily-security-report-{env}`。
 
 ### 1.4 前提技術
 
@@ -44,7 +47,7 @@
 | API | API Gateway HTTP API + Cognito JWT authorizer |
 | データ | DynamoDB（アプリ毎の単一テーブル）、S3 |
 | フロント | Vue 3.5 / Vuetify 4 / Vue Router 5 / Pinia 4 / Vite 8 / TypeScript 6 / Amplify v6 (auth) |
-| 認証 | Cognito User Pool（TOTP MFA） |
+| 認証 | Cognito User Pool（TOTP MFA は任意） |
 | 通知 | SQS → notifier Lambda → SES v2 / Slack（Bot token の `chat.postMessage`。未登録時は Incoming Webhook） |
 | 入口 | CloudFront + S3(OAC) + CloudFront Function（IP 制限） |
 | リージョン | ap-northeast-1（全スタック。CloudFront 用 ACM 証明書だけは us-east-1 の既存証明書を再利用する） |
@@ -63,8 +66,8 @@
 | アプリ境界 | バックエンドは `apps/{app}`（独立 SAM スタック）、フロントは `frontend/src/apps/{app}`（マニフェスト）。アプリ追加で基盤側に触るのは edge の origin + behavior 追記のみ |
 | スタック間契約 | SSM Parameter Store `/example-backoffice/{env}/...` を契約レジストリとする。ID や ARN を人がコピーしない |
 | 通知 | アプリは SQS にメッセージを投げるだけ。SES / Slack の資格情報と送信処理は core の notifier に集約 |
-| 認証 | Cognito User Pool 1 つ。`@example.co.jp` 限定セルフサインアップ、TOTP MFA **必須**（`MfaConfiguration: "ON"`） |
-| IP 制限 | CloudFront Function（viewer-request）の IPv4 allowlist。WAF は使わない（7 章）。MFA 必須化後に解除できる構成にしておく |
+| 認証 | Cognito User Pool 1 つ。`@example.co.jp` 限定セルフサインアップ、TOTP MFA は**任意**（`MfaConfiguration: OPTIONAL`） |
+| IP 制限 | CloudFront Function（viewer-request）の IPv4 allowlist。WAF は使わない（7 章）。MFA が任意のため、当面は外さない（7.2） |
 
 ---
 
@@ -128,7 +131,7 @@
 
 | キー（`/example-backoffice/{env}` 配下） | 型 | 書き手 | 読み手 | 値の内容 |
 | --- | --- | --- | --- | --- |
-| `/cognito/user-pool-id` | String | core | frontend（ビルド時）、運用スクリプト | User Pool ID |
+| `/cognito/user-pool-id` | String | core | frontend（ビルド時）、運用スクリプト、app-admin-users（IAM の Resource と環境変数 `USER_POOL_ID`） | User Pool ID |
 | `/cognito/client-id` | String | core | app（JWT audience）、frontend（ビルド時） | SPA 用 App Client ID |
 | `/cognito/issuer` | String | core | app（JWT issuer） | `https://cognito-idp.ap-northeast-1.amazonaws.com/{poolId}` |
 | `/notify/queue-url` | String | core | app（Lambda 環境変数）、shared `notify.py` | 通知キュー URL |
@@ -138,14 +141,14 @@
 | `/shared/layer-arn` | String | shared | core（notifier の `Layers`）、app（`Layers`） | 共通レイヤのバージョン付き ARN |
 | `/shared/slack/mode` | String | shared **のみ**（`SlackMode` パラメータ = samconfig の値。スクリプトからは書かない） | app（api が `GET /settings` で返す `slack_mode`） | `bot` / `webhook`。notifier の投稿方式を人が読める形で公開するための非秘密パラメータ。CloudFormation 管理なので手で `put-parameter` すると shared の作成が `AlreadyExists` で失敗する |
 | `/ops/topic-arn` | String | core | app（アラームの `AlarmActions` を SSM 型パラメータ `OpsTopicArn` で受ける） | 運用通知 SNS トピック（`example-backoffice-ops-{env}`）の ARN。基盤担当のメールが購読する（購読は手動作成。13.4） |
-| `/apps/{app}/api-domain` | String | app-{app} | edge（origin の DomainName） | `{apiId}.execute-api.ap-northeast-1.amazonaws.com` |
+| `/apps/{app}/api-domain` | String | app-{app} | edge（origin の DomainName） | `{apiId}.execute-api.ap-northeast-1.amazonaws.com`。書き手は各アプリスタック（`saas-a-billing` / `admin-users` / `daily-security-report`） |
 | `/apps/saas-a-billing/targets/{target_env}/base-url` / `user-id` / `password` | SecureString | 手動登録 | app-saas-a-billing（`init` / `api`） | SaaS_A API の接続情報。`target_env` ∈ {`verification`, `production`} |
 
 ### 4.3 レジストリ外のパラメータ（規約）
 
 | 種類 | 置き場 | 例 |
 | --- | --- | --- |
-| notifier 専用の秘密 | `/example-backoffice/{env}/shared/slack/bot-token`、`/example-backoffice/{env}/shared/slack/webhook-url`（いずれも SecureString、手動登録） | Slack Bot token（第一方式）と Incoming Webhook URL（フォールバック）。notifier 以外は読めない |
+| notifier 専用の秘密 | `/example-backoffice/{env}/shared/slack/bot-token`、`/example-backoffice/{env}/shared/slack/webhook-url`（いずれも SecureString、手動登録） | Slack Bot token（第一方式）と Incoming Webhook URL（フォールバック）。`bot-token` は notifier（投稿）と課金アプリの api（設定画面の候補検索。読み取りのみ）が読む。`webhook-url` は notifier 以外は読めない |
 | アプリ固有の秘密 | `/example-backoffice/{env}/apps/{app}/...`（SecureString、手動登録） | 外部 API の認証情報。当該アプリの Lambda ロールだけに `ssm:GetParameter` を許可 |
 | 環境固有の非共有値 | 各スタックの `samconfig.toml` `parameter_overrides` | `LogLevel`、社内レイヤ ExamplePowertoolsPython の ARN（`arn:aws:lambda:ap-northeast-1:210000000001:layer:ExamplePowertoolsPython:86`）、AWS 公開レイヤ AWSLambdaPowertoolsPythonV3 の ARN（`arn:aws:lambda:ap-northeast-1:017000801446:layer:AWSLambdaPowertoolsPythonV3-python313-x86_64:37`。社内レイヤに aws_lambda_powertools が同梱されていないため併用する。テンプレートの `Default` に書かず samconfig で渡す）、Route53 HostedZoneId（`Z0EXAMPLEZONE0`）、ACM 証明書 ARN |
 
@@ -199,8 +202,10 @@ Parameters:
 | --- | --- | --- | --- | --- | --- |
 | default (`*`) | S3 SPA バケット（OAC） | `CachingOptimized`（マネージド） | なし | GET, HEAD, OPTIONS | CloudFront Function `edge-guard`（viewer-request、IP 判定 + SPA フォールバック。7.1）、Response headers policy `SecurityHeadersPolicy`（**自前**。CSP + HSTS ほか。12.3） |
 | `/api/saas-a-billing/*` | HTTP API (saas-a-billing) | `CachingDisabled`（`4135ea2d-6df8-44a3-9df3-4b5a84be39ad`） | `AllViewerExceptHostHeader`（`b689b0a8-53d0-40ab-baf2-68738e2966ac`） | GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE | CloudFront Function `edge-guard`（viewer-request、IP 判定）、`Compress: true` |
+| `/api/admin-users/*` | HTTP API (admin-users) | 同上 | 同上 | 同上 | 同上 |
 | `/api/{app}/*` | HTTP API ({app}) | 同上 | 同上 | 同上 | 同上 |
 
+- **origin も behavior もリストの要素ごとに `!If` で条件を付ける。** リスト全体を `!If` にすると、後から足した behavior が他アプリの条件に巻き込まれ、そのアプリが未デプロイのときに一緒に消える（`tests/infra/test_edge_template.py` が形を検査する）。
 - **viewer-request の CloudFront Function は全 behavior に付ける。** CloudFront はビヘイビアごとに viewer-request 関数を 1 つしか関連付けられないため、IP 判定と SPA フォールバックは同一関数にまとめてある（5.4 / 7.1）。behavior を足して関数を付け忘れると、そのアプリの API だけ IP 制限を素通りする。
 - `AllViewerExceptHostHeader` は `Authorization` を含む全ヘッダ・Cookie・クエリを転送し、`Host` だけをオリジンのものに付け替える。`AllViewer`（Host 込み）にすると API Gateway が 403 を返す。
 - `AllowedMethods` を省略すると GET / HEAD だけになり POST が拒否される。必ず 7 メソッドを明示する。
@@ -242,7 +247,7 @@ return req;
 | edge への注入 | edge テンプレートは `OriginVerifySecret`（`Type: String`、`NoEcho: true`）パラメータを持つ。`scripts/deploy-edge.sh {env}` が SSM から復号取得して `parameter_overrides` で渡し、各 API origin の `OriginCustomHeaders` に `x-origin-verify: {値}` を設定する（`{{resolve:ssm-secure}}` は CloudFront リソースで使えない） |
 | Lambda 側の検証 | shared レイヤ `origin_verify.py`（Powertools ミドルウェア）が `event.headers["x-origin-verify"]` と SSM の値（`max_age=300` でキャッシュ）を定数時間比較し、不一致は 403 を返す。全 API Lambda に付ける |
 | ローテーション | (1) 新しい値を SSM に書く、(2) edge を再デプロイ。Lambda 側キャッシュ（最大 5 分）と CloudFront 伝播（数分）の間は不一致で 403 になり得るため業務時間外に行う |
-| Cognito エンドポイント | `cognito-idp.*.amazonaws.com` は CloudFront を経由しないため社外からトークン取得は可能。MFA を必須（6.1）にしてあるためパスワードだけでは認証が完了しない。さらに厳密に閉じる場合は User Pool にリージョナル WebACL を関連付ける（追加費用 $5 + $1/月） |
+| Cognito エンドポイント | MFA は任意（6.4）とし、サイトと API は社内 IP 制限（7.1）、利用登録は Pre sign-up による `@example.co.jp` 限定で入口を絞る（`PreventUserExistenceErrors: ENABLED` で利用者の存在も隠す。ref-project-a と同等）。User Pool 自体も閉じる場合はリージョナル WebACL を関連付ける（追加費用 $5 + $1/月） |
 
 ---
 
@@ -257,7 +262,7 @@ return req;
 | 自動検証 | `AutoVerifiedAttributes: [email]`（確認コードをメール送信） | `autoConfirmUser` は使わない |
 | セルフサインアップ | 許可（`AllowAdminCreateUserOnly: false`） | PreSignUp Lambda で `@example.co.jp` 以外を拒否 |
 | パスワードポリシー | 8 文字以上、英大小・数字（記号は要求しない） | 2026-09-01 のユーザー決定で 12 文字・記号必須から緩和。SPA の入力ヒントも同じ文言 |
-| MFA | `MfaConfiguration: "ON"`（**必須**）、`EnabledMfas: [SOFTWARE_TOKEN_MFA]` | dev / prod とも必須。TOTP 未登録の利用者は次回サインインで登録を強制される（6.4）。SMS は構成しない（一度有効化すると無効化できない）。YAML 1.1 が `ON` を真偽値に解釈するためテンプレートでは引用符を付ける |
+| MFA | `MfaConfiguration: OPTIONAL`（**任意**）、`EnabledMfas: [SOFTWARE_TOKEN_MFA]` | dev / prod とも任意。TOTP 未登録でもパスワードだけでサインインできる（6.4）。`EnabledMfas` は登録済みユーザーの受け皿と、将来 `ON` へ戻すために残す。SMS は構成しない（一度有効化すると無効化できない） |
 | アカウント復旧 | 検証済みメールのみ | `resetPassword` → `confirmResetPassword` の画面フローを SPA が持つ（9.9） |
 | メール送信 | パラメータ `CognitoEmailSendingAccount`（`COGNITO_DEFAULT` / `DEVELOPER`）で切り替える | samconfig は dev / prod とも `DEVELOPER`（送信元 `noreply@{MailDomain}`、`SourceArn` = 自環境の SES Identity、ConfigurationSet 付き）。prod の初回だけ SES Identity の DNS 検証が終わるまで `--parameter-overrides CognitoEmailSendingAccount=COGNITO_DEFAULT` で立てる（13.4） |
 | 削除保護 | prod は `DeletionProtection: ACTIVE` | |
@@ -279,16 +284,17 @@ return req;
 | グループ | 権限 | 付与方法 |
 | --- | --- | --- |
 | （所属なし = 一般） | 全アプリの閲覧・実行 | サインアップ完了で自動的にこの状態 |
-| `admin` | 一般の権限 + ユーザー管理（グループ付与・無効化・TOTP リセット）+ アプリ設定の編集 | `scripts/add-admin.sh {env} {email}`（SSM から User Pool ID を引いて `admin-add-user-to-group`）。以降は Cognito コンソール / CLI でも可 |
+| `admin` | 一般の権限 + ユーザー管理（グループ付与・無効化・パスワードリセット・削除・TOTP リセット）+ アプリ設定の編集 | 通常は**ユーザー管理画面**（`/admin-users`）から付ける。最初の 1 人と、画面が使えないときの退路は `scripts/add-admin.sh {env} {email}`（SSM から User Pool ID を引いて `admin-add-user-to-group`） |
 
-ユーザー管理 runbook（SPA に管理画面は無い。17 章 #1）:
+ユーザー管理 runbook（通常は `admin` の「ユーザー管理」画面（`/admin-users`）で完結する。アプリ設計書は [apps/admin-users/DESIGN.md](apps/admin-users/DESIGN.md)）:
 
 | 操作 | 手順 |
 | --- | --- |
-| 最初の管理者を作る | 本人がサインアップして確認を終えてから `scripts/add-admin.sh {env} {email}`。admin が 1 人も居ないとアプリの設定画面が全員読み取り専用のままになる |
-| 管理者を増やす / 外す | `scripts/add-admin.sh` / `aws cognito-idp admin-remove-user-from-group`。反映は次回サインイン（ID トークンの再取得）から |
-| 退職者の無効化・削除 | Cognito コンソール、または `admin-disable-user` / `admin-delete-user`。削除しても実行履歴の `requested_by`（Cognito の `sub`）は残る |
-| 認証アプリ（TOTP）を失った | **ユーザーを削除して作り直す**: 管理者が `admin-delete-user` → 本人が同じメールで再サインアップ（確認コード → 初回サインインで TOTP 再登録）→ 必要なら `scripts/add-admin.sh` で `admin` を付け直す。`MfaConfiguration: "ON"` のプールでは `admin-set-user-mfa-preference` による TOTP 解除が AWS 仕様上できないため、この経路しかない（プールを一時的に `OPTIONAL` へ落とす方式は採らない） |
+| 最初の管理者を作る | 本人がサインアップして確認を終えてから `scripts/add-admin.sh {env} {email}`。admin が 1 人も居ないとユーザー管理画面もアプリの設定画面も開けない（画面から最初の 1 人は作れない） |
+| 管理者を増やす / 外す | ユーザー管理画面の権限列で切り替える（サーバ側で自分自身の解除と最後の 1 人の解除を拒む）。反映は本人の次回サインイン（ID トークンの再取得）から |
+| 退職者の無効化・削除 | ユーザー管理画面の操作列（無効化 / 削除。削除は取り消せない）。削除しても実行履歴の `requested_by`（Cognito の `sub`）は残る |
+| パスワードを忘れた | 本人がサインイン画面の「パスワードを忘れた場合」から再設定する。反応が無いときは管理者がユーザー管理画面からリセットコードを送る（新しいパスワードは本人が決める） |
+| 認証アプリ（TOTP）を失った | `MfaConfiguration: OPTIONAL` なので管理者が TOTP だけを解除できる: `aws cognito-idp admin-set-user-mfa-preference --user-pool-id {pool} --username {email} --software-token-mfa-settings Enabled=false,PreferredMfa=false`。以降はパスワードだけでサインインできる（サイトに TOTP 登録画面は無い） |
 | 登録状況の確認 | `scripts/list-mfa-status.sh {env}`（TOTP 未登録者を一覧する） |
 
 コマンドの実体は [scripts/README.md](../scripts/README.md) に置く。
@@ -300,18 +306,19 @@ return req;
 | SPA | マニフェストとルート meta の `requiredGroups` でメニュー表示とルート遷移を制御（UX のみ。権限の実体はバックエンド） |
 
 - SPA が送るトークン: **ID トークン**（`Authorization: Bearer`）。`email` と `cognito:groups` を含み、監査記録（更新者）にそのまま使える。JWT authorizer の `audience` には App Client ID を設定し、`aud` で検証する。
-- 管理者向けのユーザー管理画面は初期リリースに含めない。将来 `admin` アプリ（`/admin`）として追加できる構造にしておく。
+- 管理者向けのユーザー管理は `admin-users` アプリ（`/admin-users`、#1007）が担う。画面のメニュー非表示とボタンの `disabled` は UX で、権限の実体は全 API の `require_group("admin")` と自己保護（自分の admin 付与・解除・無効化・削除を 403）にある。**このアプリだけは毎リクエストで Cognito の現在状態（有効・`admin` 所属）も確認する**ので、剥奪・無効化された本人は即座に使えなくなる（他アプリはクレームのみの判定なので最大 60 分遅れる）。
 
-### 6.4 MFA（必須）
+### 6.4 MFA（任意）
 
-TOTP（認証アプリ）のみ。SMS・メール MFA は使わない。**dev / prod とも `MfaConfiguration: "ON"` で作る**（猶予・免除なし）。段階導入（`OPTIONAL` から始めて後で `ON` にする）は採らない。prod は新規 User Pool のため移行対象の利用者が存在せず、dev も利用者が少ないうちに揃えたほうが安全なためである。
+TOTP（認証アプリ）のみ。SMS・メール MFA は使わない。**dev / prod とも `MfaConfiguration: OPTIONAL` で作る**。社内保守管理サイトで認証アプリを必須にすると導入の負担が使われない理由になるため、ref-project-a と同等の認証（パスワード + CloudFront の社内 IP 制限 + `@example.co.jp` 限定サインアップ）に合わせ、認証アプリの登録は利用者の任意とした。`EnabledMfas` は `SOFTWARE_TOKEN_MFA` のまま残すので、必要になれば `ON` へ戻せる。
+
+**サイトから TOTP を登録する画面は提供しない**（#1008。任意の登録画面は使われる見込みが無いため撤去した）。過去に登録済みのユーザーはサインイン時にコード入力を求められる。解除は `scripts/list-mfa-status.sh {env}` で登録状況を確かめてから `aws cognito-idp admin-set-user-mfa-preference` で行う（6.3）。
 
 | 場面 | 利用者の体験 | SPA の処理 |
 | --- | --- | --- |
-| TOTP 未登録でサインイン | パスワード入力の直後に QR + シークレットが出て、その場で登録して完了する | `CONTINUE_SIGN_IN_WITH_TOTP_SETUP` |
+| TOTP 未登録でサインイン | パスワードだけで完了する（登録を促されない） | `DONE`。サイトに登録画面は無い |
 | TOTP 登録済みでサインイン | 6 桁コードを求められる | `CONFIRM_SIGN_IN_WITH_TOTP_CODE` |
-| 端末を替える（旧端末が使える） | サインインしてから `/mfa` で自分で再登録する | `fetchMFAPreference` → 再登録の確認 → `setUpTOTP` |
-| 端末を失った（サインインできない） | 管理者がユーザーを削除し、本人が同じメールで再サインアップする（6.3 の runbook）。`ON` のプールでは管理者が TOTP だけを解除できない | 通常のサインアップ → 初回サインインで `CONTINUE_SIGN_IN_WITH_TOTP_SETUP` |
+| 端末を替える / 失った | 管理者が `admin-set-user-mfa-preference` で TOTP を解除する（6.3 の runbook）。ユーザーの作り直しは要らない | 解除後はパスワードだけで `DONE` |
 
 SPA 側の実装
 
@@ -320,13 +327,12 @@ SPA 側の実装
 | `stores/auth.ts` `login()` | `signIn()` の戻り値 `nextStep.signInStep` で分岐する。`DONE` / `CONFIRM_SIGN_IN_WITH_TOTP_CODE` / `CONTINUE_SIGN_IN_WITH_TOTP_SETUP` / `CONFIRM_SIGN_IN_WITH_NEW_PASSWORD_REQUIRED` / `CONFIRM_SIGN_UP` / `CONTINUE_SIGN_IN_WITH_MFA_SELECTION`（TOTP を選択）を扱う |
 | `stores/auth.ts` `submitChallenge()` | `confirmSignIn({ challengeResponse })` を呼び、戻り値を再度同じ分岐にかける |
 | `views/LoginView.vue` | パスワード → (TOTP コード / TOTP 登録 QR / 新パスワード / メール確認) → 完了 を `v-window` のステップとして同一ページ内で表示する。`signIn` と `confirmSignIn` はページのメモリ状態で繋がるため、別ルートへ遷移しない |
-| `views/MfaSetupView.vue`（`/mfa`） | 開くとまず `fetchMFAPreference()` で現在の登録状態を読む。登録済みなら QR を出さず「認証アプリは登録済みです」+ 再登録ボタン（確認を挟んでから `setUpTOTP()`）にする。未登録なら `setUpTOTP()` → QR（`otpauth://` URI）と手入力用シークレット（コピーボタン付き）→ `verifyTOTPSetup({ code })` → `updateMFAPreference({ totp: 'PREFERRED' })`。`fetchMFAPreference()` が失敗したときは登録を開始しない（登録済みの利用者のエントリを壊さないため） |
 | テスト | `vi.mock('aws-amplify/auth')` で各 `signInStep` を返し、`pending` 状態の遷移を検証する |
 
 ### 6.5 E2E テスト用ユーザー
 
-- dev の User Pool に E2E 専用ユーザーを置く。`MfaConfiguration: "ON"` のため TOTP は必須で、Playwright 側で `otplib` により TOTP を生成して入力する（`scripts/get_id_token.py` も `--totp-code` を受ける）。
-- TOTP を登録しないユーザーは E2E でも使えない。`scripts/list-mfa-status.sh dev` で未登録者を洗い出す。
+- dev の User Pool に E2E 専用ユーザーを置く。`MfaConfiguration: OPTIONAL` なので **E2E ユーザーは TOTP を登録しない**まま運用し、パスワードだけでサインインする。
+- TOTP を登録済みのユーザーで E2E を回す場合だけ `otplib` でコードを生成する（`scripts/get_id_token.py` の `--totp-code` も登録済みユーザー用）。登録状況は `scripts/list-mfa-status.sh dev` で確認できる。
 
 ---
 
@@ -410,9 +416,11 @@ function handler(event) {
 
 **WAF を採らない代償（判断の記録）:** WAF のサンプルリクエスト・ブロック件数メトリクス・WAF ログによる監査性と、IP set をデプロイ無しで即時更新できる運用性を失う（IP 変更に `sam deploy` が要る）。監査が必要になったら、us-east-1 に `AWS::WAFv2::WebACL` + `IPSet` を作って `DistributionConfig.WebACLId` に関連付けるだけで戻せる（関数側の IP 判定はそのとき外す）。
 
-### 7.2 解除手順（MFA 必須化後）
+### 7.2 解除手順（当面は解除しない）
 
-1. 6.4 の MFA 必須（`MfaConfiguration: "ON"`）が有効で、`scripts/list-mfa-status.sh {env}` の未登録者がゼロであることを確認する。
+MFA を任意（6.4）としているため、社内 IP 制限は入口を絞る主要な手段であり、**現時点で解除する予定は無い。** 将来どうしても社外から使う必要が出たときは、次の順で段階的に外す。
+
+1. 先に MFA を必須へ戻す（`MfaConfiguration: "ON"`。YAML 1.1 が `ON` を真偽値に解釈するため引用符を付ける）。`scripts/list-mfa-status.sh {env}` の未登録者がゼロであることを確認してから切り替える。
 2. `infra/edge/samconfig.toml` の `AllowedIpAddresses` に `0.0.0.0/0` を足して `scripts/deploy-edge.sh {env}`（全許可）。1〜2 週間、CloudFront の標準ログ（12.4）で社外アクセスの実態を確認する。
 3. 問題が無ければ `edge-guard.js` から IP 判定を外して SPA フォールバックだけの関数に戻し、`AllowedIpAddresses` パラメータを削除する。
 4. 5.5 の `x-origin-verify` は残す（IP 制限とは独立に「CloudFront 経由のみ」を保証する）。
@@ -499,7 +507,7 @@ notify.send(
 | 送信元 | prod `noreply@backoffice.example-cloud.com` / dev `noreply@backoffice-dev.example-cloud.com`（表示名 `example-backoffice`） |
 | Identity | `AWS::SES::EmailIdentity` を環境ごとに登録する（prod `backoffice.example-cloud.com` / dev `backoffice-dev.example-cloud.com`）。Easy DKIM（RSA 2048）、カスタム MAIL FROM `bounce.{ドメイン}`。ref-project-a の `stacks/ses/template.yaml` と同じ方式 |
 | DNS（core が Route53 に登録） | DKIM CNAME × 3、MAIL FROM の MX（`feedback-smtp.ap-northeast-1.amazonses.com`）と TXT（SPF）、`_dmarc.{ドメイン}` TXT（`p=quarantine`） |
-| API | SES v2 `SendEmail`、`Content.Simple` + `Attachments[]`（`RawContent` に S3 から取得したバイト列、`FileName`、`ContentType`）。合計 40 MB 上限。MIME 組立不要 |
+| API | SES v2 `SendEmail`、`Content.Simple` + `Attachments[]`（`RawContent` に S3 から取得したバイト列、`FileName`、`ContentType`、`ContentTransferEncoding=BASE64`）。合計 40 MB 上限。MIME 組立不要。`ContentTransferEncoding` を省略すると 7bit で組み立てられバイナリが壊れる（#1014） |
 | boto3 | `Simple + Attachments` は boto3 / botocore 1.37.27（2025-04-03）以降が必要。ランタイム同梱版に依存せず notifier の `requirements.txt` で `boto3>=1.37.27` を固定する |
 | 本番アクセス | 東京リージョンは取得済み（50,000 通/日、14 通/秒）。申請は不要 |
 | バウンス / 苦情 | ConfigurationSet + EventDestination（SNS）。基盤担当へ通知 |
@@ -514,16 +522,17 @@ notify.send(
 | メンション | `slack.mention` を本文先頭に付ける（`<!here>` / `<@U0123>` / `<!subteam^S0123>`） | 同左 |
 | ファイル添付 | 添付しない（メールに添付済みである旨とポータル URL を投稿する） | 同左 |
 | 秘密 | `/example-backoffice/{env}/shared/slack/bot-token`（SecureString） | `/example-backoffice/{env}/shared/slack/webhook-url`（SecureString） |
-| スコープ | `chat:write` + `chat:write.public`（Bot が未参加の公開チャンネルへ投稿するため） | — |
+| スコープ | `chat:write` + `chat:write.public`（Bot が未参加の公開チャンネルへ投稿するため）+ `channels:read` / `groups:read` / `users:read` / `usergroups:read`（設定画面の `#` / `@` 候補検索。#1011） | — |
 | 依存 | `urllib`（`chat.postMessage` への JSON POST） | `urllib` |
 
 - notifier は `bot-token` が登録されていれば `chat.postMessage`、未登録（パラメータ不在）なら Webhook を使う。初回リリースは Webhook で始めてよく、Bot token を SSM に登録した時点で自動的に切り替わる。
-- 現在どちらで動いているかは非秘密の SSM String `/example-backoffice/{env}/shared/slack/mode`（`bot` / `webhook`、既定 `webhook`）で公開する。app の api はこのパラメータだけを読んで画面に表示し、Bot token 本体は読まない。このパラメータを書くのは **shared スタックだけ**（`Value` はパラメータ `SlackMode` = samconfig の値）で、`scripts/register-slack.sh` は `bot-token` / `webhook-url`（SecureString）の登録だけを行い `mode` は書かない。スクリプトが先に手で作ると、shared スタックの作成時に同名パラメータが `AlreadyExists` で失敗する（prod 初回で実際に発生）。方式を変えるときは samconfig の `SlackMode` を直して shared を再デプロイする。運用状況（2026-09-02 時点）: dev / prod とも Bot token 方式（samconfig の `SlackMode` は両環境 `bot`）。
-- 既定チャンネルは `#proj-saas-a-billing`（dev / prod 共通の初期値）。チャンネル ID は初期セットアップ（13.4）で Slack から取得してアプリの設定画面に登録する。
+- 現在どちらで動いているかは非秘密の SSM String `/example-backoffice/{env}/shared/slack/mode`（`bot` / `webhook`、既定 `webhook`）で公開する。app の api はこのパラメータを読んで投稿方式を画面に表示する（Bot token を投稿に使うのは notifier だけで、課金アプリの api は #1011 の候補検索のために読み取りだけ行う）。このパラメータを書くのは **shared スタックだけ**（`Value` はパラメータ `SlackMode` = samconfig の値）で、`scripts/register-slack.sh` は `bot-token` / `webhook-url`（SecureString）の登録だけを行い `mode` は書かない。スクリプトが先に手で作ると、shared スタックの作成時に同名パラメータが `AlreadyExists` で失敗する（prod 初回で実際に発生）。方式を変えるときは samconfig の `SlackMode` を直して shared を再デプロイする。運用状況（2026-09-02 時点）: dev / prod とも Bot token 方式（samconfig の `SlackMode` は両環境 `bot`）。
+- 既定の通知先は `#proj-saas-a-billing`（dev / prod 共通の初期値）。**チャンネル ID を Slack で調べる作業は無い。**アプリの設定画面で `#` を打って候補から選ぶと、画面には名前が出たまま ID が保存される（#1011。13.4 の手順 12）。
+- **設定画面の候補入力（#1011）**: 課金アプリの api が `bot-token` を読み取り専用で使い、`conversations.list` / `users.list` の結果を `GET /api/saas-a-billing/slack/directory` で画面に返す（詳細は[課金アプリ設計書](apps/saas-a-billing/DESIGN.md) 3.3 / 8 章）。投稿は従来どおり notifier だけが行う。`usergroups:read` はユーザーグループ（`<!subteam^…>`）を候補に出す将来の拡張のために付けてあり、現在の候補はチャンネルとユーザー（+ `@here` / `@channel`）だけである。
 - チャンネルは**名前ではなく ID** で保持する。非公開チャンネルへ投稿する場合は `chat:write.public` では足りず、Bot をそのチャンネルに招待する必要がある。
 - Slack にファイル（Excel 等）は添付しない。テキスト + サマリ + ポータル URL のみを投稿する。ポータル URL は Cognito 認証が必要なため、権限の無い閲覧者には認証画面が出る（許容する）。
 - 将来ファイルを添付する場合は `files:write` を追加し、`files.getUploadURLExternal` → アップロード → `files.completeUploadExternal`（`channel_id` はチャンネル ID のみ）の 3 ステップで行う。旧 `files.upload` は 2025-11-12 に廃止済み。
-- Webhook フォールバックで動作している間は、アプリの設定画面のチャンネル ID が無視される旨を UI に表示する。
+- Webhook フォールバックで動作している間は、アプリの設定画面で選んだチャンネルが無視される（投稿先は Webhook に固定される）旨を UI に表示する。
 - S3 の署名付き URL を Slack に貼らない。Lambda ロールの一時クレデンシャルで署名した URL はクレデンシャル失効時に無効になる。恒久リンクは SPA の画面 URL（Cognito 認証あり）にする。
 
 ### 8.6 失敗時の挙動
@@ -547,7 +556,7 @@ notify.send(
 | 形態 | 単一 SPA（1 ビルド・1 バケット・1 ディストリビューション）。Module Federation は採用しない |
 | アプリ境界 | `frontend/src/apps/{app}/index.ts` のマニフェストを `import.meta.glob` で自動登録。画面はルート単位で遅延ロード |
 | SPA ルート | `/{app}/...`（例 `/saas-a-billing/settings`）。API は `/api/{app}/...` |
-| 予約パス | `/login` `/signup` `/forgot-password` `/mfa` `/forbidden` `/api` `/assets`。アプリ id にこれらは使えない |
+| 予約パス | `/login` `/signup` `/forgot-password` `/forbidden` `/api` `/assets`。アプリ id にこれらは使えない |
 | 言語 | `<html lang="ja">`。Vuetify ロケール `ja` |
 | フォント | `font-family` に日本語フォントを明示: `"Yu Gothic UI", Meiryo, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif`。SimSun / SimHei / Microsoft YaHei / PingFang SC / Noto Sans SC はスタックに入れない |
 | テーマ | `defaultTheme: 'light'` を明示（Vuetify 4 の既定は OS 追従） |
@@ -595,14 +604,15 @@ frontend/
     ├── stores/{auth.ts,ui.ts}
     ├── services/http.ts        createAppApi(appId)
     ├── layouts/{ShellLayout.vue,AuthLayout.vue}
-    ├── components/             共通部品
-    ├── views/                  Login / Signup / MfaSetup / Home / Forbidden / NotFound
+    ├── components/             共通部品（`TriggerSuggestField.vue` = `#` / `@` の候補入力。`HelpTip.vue` = ヘルプモードの説明ツールチップ）
+    ├── views/                  Login / Signup / ForgotPassword / Home / Forbidden / NotFound
     └── apps/
         ├── types.ts            AppManifest 型
         ├── registry.ts         import.meta.glob 自動登録
         ├── registry.test.ts
         ├── _template/          コピー元（先頭 _ はレジストリから除外）
-        └── saas-a-billing/    index.ts, routes.ts, api.ts, stores/, views/, components/, __tests__/
+        ├── saas-a-billing/    index.ts, routes.ts, api.ts, stores/, views/, components/, __tests__/
+        └── admin-users/        index.ts, routes.ts, api.ts, types.ts, stores/, views/, __tests__/
 ```
 
 ### 9.4 アプリマニフェストの型定義
@@ -625,6 +635,7 @@ export interface AppManifest {
   description?: string        // ホーム画面のカード説明
   order?: number              // サイドバー並び順（小さいほど上、既定 50）
   requiredGroups?: string[]   // 空なら全ログインユーザー。設定画面などは nav / route の meta で ['admin']
+  helpMode?: boolean          // true のときだけアプリバーに「？」トグルを出す（9.5 のヘルプモードに対応したアプリ）
   routes: RouteRecordRaw[]    // /{id} 配下の子ルート。path は相対、component は () => import()
   nav: AppNavItem[]           // アプリ内サブナビ（app-bar のタブに描画）
 }
@@ -640,13 +651,15 @@ export function defineApp(manifest: AppManifest): AppManifest { return manifest 
 
 | 領域 | コンポーネント | 内容 |
 | --- | --- | --- |
-| サイドバー | `v-navigation-drawer`。既定の開閉・`temporary` / `permanent` / `rail` はすべて `useDisplay().mdAndUp`（960px）で決める。狭い画面は「閉じた一時ドロワー」から始まり、ナビを選ぶと自動で閉じる | ホーム、アプリ一覧（`requiredGroups` で表示制御）、末尾にセキュリティ（`/mfa`）とログアウト |
-| ヘッダ | `v-app-bar` | ナビアイコンの直後に**サイト環境チップ**（9.8 の `VITE_SITE_ENV`。dev=「検証環境」オレンジ / prod=「本番」緑）を常時表示。続いて現在のアプリ名、ユーザーのメール。`#extension` にマニフェストの `nav` を `v-tabs` で描画 |
+| サイドバー | `v-navigation-drawer`。既定の開閉・`temporary` / `permanent` / `rail` はすべて `useDisplay().mdAndUp`（960px）で決める。狭い画面は「閉じた一時ドロワー」から始まり、ナビを選ぶと自動で閉じる | ホーム、アプリ一覧（`requiredGroups` で表示制御）、末尾にログアウト |
+| ヘッダ | `v-app-bar` | ナビアイコンの直後に**サイト環境チップ**（9.8 の `VITE_SITE_ENV`。dev=「検証環境」オレンジ / prod=「本番」緑）を常時表示。続いて現在のアプリ名、右端に**ヘルプモードの「？」トグル**とユーザーのメール。`#extension` にマニフェストの `nav` を `v-tabs` で描画 |
 | 本体 | `v-main` > `v-container` > `<router-view>` | `keep-alive`（`max: 5`）で一覧画面の状態を保持。キャッシュから復帰する画面は `onActivated` + ルート params の監視で再取得する（`:key` でキャッシュ自体を壊さない） |
 | 認証系 | `AuthLayout.vue` | ログイン / サインアップ / 確認コード / TOTP / パスワード再設定を中央寄せカードで表示 |
 | 通知 | `stores/ui.ts` のスナックバー | 業務画面の保存・実行結果はスナックバーに統一する（成功は自動で消え、エラーは `timeout: -1` で閉じるまで残す）。認証画面だけは `AuthLayout` 内の `v-alert` を使う |
 
 `v-navigation-drawer` の基準を Vuetify の `mobile`（既定は `lg` = 1280px 未満）ではなく `mdAndUp` にするのは、1024px 級の端末で「開いた状態の一時ドロワー」が画面を覆うのを避けるためである。
+
+**ヘルプモード（`components/HelpTip.vue` + `stores/ui.ts` の `helpMode`）**: アプリバー右端の「？」（`mdi-help-circle-outline`、`aria-label="操作説明の表示切替"`、`aria-pressed` を状態に連動）で画面全体の説明表示をまとめて切り替える（ON は color `primary` + variant `tonal`）。`HelpTip` は `v-tooltip`（location `bottom` / max-width 320 / content-class `help-tip`）の activator props を既定スロットへ渡すだけの薄い部品で、`helpMode` が OFF のときは `disabled` にする。`helpMode` は**保存しない**（セッション内のみ。常時 ON のまま忘れられるのを避ける）。トグル自身の説明だけはヘルプモードに関わらず常時出す。文言は各アプリ側に集約する（課金アプリは `apps/saas-a-billing/help.ts`）。トグルは**マニフェストで `helpMode: true` を宣言したアプリの画面でだけ描く**（対応していないアプリで ON にしても何も起きない「死んだトグル」を避ける）。`v-tooltip` は `:eager="false"` にして、初回ホバーまでオーバーレイを作らない（既定の eager では閉じていても要素ごとにオーバーレイと document リスナが積み上がる）。無効化されうるボタンは `<span v-bind="props">` でラップして activator をラッパ側に置く（`disabled` な button はマウスイベントを受け取らないため）。用語の意味が画面から読み取れないという指摘への対応（#1012）。
 
 ### 9.6 ルーターガード
 
@@ -683,8 +696,8 @@ export function defineApp(manifest: AppManifest): AppManifest { return manifest 
 | 未確認ユーザーのサインイン | `/login` | `UserNotConfirmedException` のときは画面内の確認コード入力ステップへ戻す（`/signup` へは飛ばさない。入力済みのパスワードを引き継いでそのままサインインまで進めるため） |
 | 確認コードの再送 | `/login`・`/signup` の確認ステップ | `resendSignUpCode`。押下と同時に **30 秒**のカウントダウンで再送ボタンを無効化する（送信の成否に関わらず開始し、連打による `LimitExceededException` を避ける）。「迷惑メールフォルダも確認」の注記を添える |
 | パスワード再設定 | `/forgot-password` | `resetPassword`（メール入力）→ `confirmResetPassword`（確認コード + 新パスワード。パスワードポリシーは Cognito と同一）→ 完了（サインインへの導線）。`/login` のパスワード欄の下から入る |
-| セキュリティ（MFA） | `/mfa` | 6.4 の表のとおり。`fetchMFAPreference` で登録状態を出し、登録済みは確認を挟んでから再登録する |
 
+- 認証アプリ（TOTP）の登録画面は提供しない（6.4）。登録済みユーザーのコード入力ステップは `/login` に残る。
 - Cognito の例外は日本語辞書（19 件）で置き換える。辞書に無い例外は `予期しないエラーが発生しました（<例外名>）` として例外名を添える。`UserLambdaValidationException` は PreSignUp（6.2）の拒否として「社内メールアドレス（@example.co.jp）でのみ登録できます」に対応付ける。
 - タブでサイトを見分けられるように `frontend/public/favicon.svg`（単色の簡素なアイコン）と `<meta name="description">` / `<meta name="theme-color">` を置く。
 
@@ -797,7 +810,7 @@ def handler(event, context):
 | 対象 | 規約 |
 | --- | --- |
 | Lambda ロール | 関数ごとに作る（共有ロール禁止）。SAM ポリシーテンプレートまたはインラインで Resource を限定 |
-| SSM | `ssm:GetParameter` は `arn:aws:ssm:{region}:{account}:parameter/example-backoffice/{env}/apps/{app}/*` と `/edge/origin-verify-secret` に限定 |
+| SSM | `ssm:GetParameter` は `arn:aws:ssm:{region}:{account}:parameter/example-backoffice/{env}/apps/{app}/*` と `/edge/origin-verify-secret` に限定。共通領域のパラメータが要るときはキー単位で個別に足す（例: 課金アプリの api が読む `/shared/slack/mode` と候補検索用の `/shared/slack/bot-token`。#1011） |
 | S3 | attachments は `{app}/*` プレフィックスに `PutObject` のみ |
 | SQS | `sqs:SendMessage` を `/notify/queue-arn` に限定 |
 | DynamoDB | 自アプリのテーブル ARN（と GSI）に限定 |
@@ -854,7 +867,7 @@ def handler(event, context):
 | スタック接尾辞 | `-dev` | `-prod` |
 | SSM 接頭辞 | `/example-backoffice/dev/` | `/example-backoffice/prod/` |
 | Cognito | dev 用 User Pool（E2E ユーザーあり） | prod 用 User Pool |
-| MFA | `ON`（必須） | 同左 |
+| MFA | `OPTIONAL`（任意） | 同左 |
 | Cognito のメール送信 | `CognitoEmailSendingAccount=DEVELOPER` | samconfig は `DEVELOPER`。初回だけ `--parameter-overrides CognitoEmailSendingAccount=COGNITO_DEFAULT` で立て、SES Identity の検証後に上書きなしで再デプロイ |
 | SES 送信 | 専用 Identity `backoffice-dev.example-cloud.com` | 専用 Identity `backoffice.example-cloud.com` |
 | Slack | Bot token 方式（`SlackMode=bot`）。既定チャンネル `#proj-saas-a-billing`（アプリの設定画面で変更可） | 同左 |
@@ -906,7 +919,7 @@ parameter_overrides = "Env=prod LogLevel=INFO UserPoolIssuer=/example-backoffice
 | # | 手順 | 内容 |
 | --- | --- | --- |
 | 1 | origin-verify の秘密を登録 | `scripts/init-secrets.sh {env}`。`/edge/origin-verify-secret` を SecureString で登録する。**dev と prod で別の値**にする |
-| 2 | Slack の Bot token を登録 | Slack App を作成してワークスペースにインストールし、Bot に `chat:write` + `chat:write.public` を付与する。通知先チャンネル（既定 `#proj-saas-a-billing`）の ID を控え、`scripts/register-slack.sh {env} bot` で `/shared/slack/bot-token`（SecureString）を登録する。**shared のデプロイの前後どちらでもよい**（notifier は実行時に読む）。投稿方式 `/shared/slack/mode` は shared が samconfig の `SlackMode`（dev / prod とも `bot`）から作るため、スクリプトも人も手では書かない |
+| 2 | Slack の Bot token を登録 | Slack App を作成してワークスペースにインストールし、Bot に `chat:write` + `chat:write.public`（投稿）と `channels:read` / `groups:read` / `users:read` / `usergroups:read`（設定画面の候補検索。#1011）を付与する。`scripts/register-slack.sh {env} bot` で `/shared/slack/bot-token`（SecureString）を登録する。**通知先チャンネルの ID を Slack で控える必要は無い**（設定画面で `#` を打って候補から選ぶ。手順 12）。**shared のデプロイの前後どちらでもよい**（notifier は実行時に読む）。投稿方式 `/shared/slack/mode` は shared が samconfig の `SlackMode`（dev / prod とも `bot`）から作るため、スクリプトも人も手では書かない |
 | 3 | アプリ固有の秘密を登録 | 例: saas-a-billing なら `/apps/saas-a-billing/targets/{target_env}/{base-url,user-id,password}` の 3 本（prod は `targets/production` のみ。アプリ設計書 14.1） |
 | 4 | `shared` をデプロイ | レイヤを公開し `/shared/layer-arn` を書く |
 | 5 | `core` をデプロイ | `/shared/layer-arn` を読む。SES の DKIM / MAIL FROM / DMARC レコードが Route53 に登録される（東京は本番アクセス済みのため申請不要）。**prod の初回だけ `sam deploy ... --parameter-overrides CognitoEmailSendingAccount=COGNITO_DEFAULT` で上書きして立てる**（samconfig の値は `DEVELOPER` だが、SES Identity が未検証のうちは作成に失敗する。手順 10 で上書きを外す）。`/ops/topic-arn` と `/notify/*`、`/attachments/bucket`、`/cognito/*` がこの時点で揃う |
@@ -915,8 +928,8 @@ parameter_overrides = "Env=prod LogLevel=INFO UserPoolIssuer=/example-backoffice
 | 8 | `edge` をデプロイ | `scripts/deploy-edge.sh {env}`。ACM 証明書は既存の `*.example-cloud.com`（us-east-1）を ARN で参照するため発行作業は不要 |
 | 9 | `frontend` をデプロイ | `scripts/deploy-frontend.sh {env}`（`VITE_SITE_ENV={env}` を渡す） |
 | 10 | （prod のみ）Cognito のメールを SES へ | SES Identity が `Success` になったら、手順 5 の `--parameter-overrides` を**付けずに** core を再デプロイする（samconfig の `CognitoEmailSendingAccount=DEVELOPER` がそのまま効き、送信元が `noreply@backoffice.example-cloud.com` になる） |
-| 11 | 最初の管理者を作る | 本人がサインアップ（`@example.co.jp`、確認コード、TOTP 登録）→ `scripts/add-admin.sh {env} {email}`。admin が居ないとアプリの設定画面が全員読み取り専用のままになる |
-| 12 | アプリの初期設定 | 各アプリの設定画面で通知先（メール宛先・Slack チャンネル ID）などを登録する |
+| 11 | 最初の管理者を作る | 本人がサインアップ（`@example.co.jp`、確認コード）→ `scripts/add-admin.sh {env} {email}`。admin が居ないとユーザー管理画面もアプリの設定画面も開けない。2 人目以降はこの管理者が `/admin-users` から付ける |
+| 12 | アプリの初期設定 | 各アプリの設定画面で通知先などを登録する。Slack のチャンネル・メンションは欄に `#` / `@` を打って候補から選ぶ（#1011。ID の手入力は無い） |
 
 手順 4〜9 は `scripts/deploy-all.sh {env}` で一括に流せる（`shared` → `core` → `apps/*` → `edge` → `frontend`）。ただし手順 6 は core と app の間に入れる。
 
@@ -963,7 +976,7 @@ aws cloudwatch set-alarm-state --alarm-name example-backoffice-saas-a-billing-la
 | タグ | 値 | 付与先 |
 | --- | --- | --- |
 | `Project` | `example-backoffice`（必須） | 全リソース（samconfig の `tags` でスタック全体に付与） |
-| `Name` | リソースの役割（必須）: `Function` / `Api` / `Bucket` / `Distribution` / `EdgeFunction`（`AWS::CloudFront::Function`）/ `Queue` / `Table` / `LogGroup` / `Role` / `UserPool` / `Layer` / `StateMachine` / `Schedule` / `Topic`（`AWS::SNS::Topic`）/ `Alarm`（`AWS::CloudWatch::Alarm`）/ `ConfigurationSet`（`AWS::SES::ConfigurationSet`）/ `EventSourceMapping`（`AWS::Lambda::EventSourceMapping`）/ `EmailIdentity`（`AWS::SES::EmailIdentity`） | 各リソースの `Tags` |
+| `Name` | リソースの役割（必須）: `Function` / `Api` / `Bucket` / `Distribution` / `EdgeFunction`（`AWS::CloudFront::Function`）/ `Queue` / `Table` / `LogGroup` / `Role` / `UserPool` / `Layer` / `StateMachine` / `Schedule` / `Topic`（`AWS::SNS::Topic`）/ `Alarm`（`AWS::CloudWatch::Alarm`）/ `ConfigurationSet`（`AWS::SES::ConfigurationSet`）/ `EventSourceMapping`（`AWS::Lambda::EventSourceMapping`）/ `EmailIdentity`（`AWS::SES::EmailIdentity`）/ `Rule`（`AWS::Events::Rule`） | 各リソースの `Tags` |
 | `App` | アプリ id（app スタック）、`core` / `shared` / `edge`（基盤） | スタック全体 |
 | `Env` | `dev` / `prod` | スタック全体 |
 
@@ -1021,9 +1034,9 @@ aws cloudwatch set-alarm-state --alarm-name example-backoffice-saas-a-billing-la
 
 | # | 事項 | 現状 |
 | --- | --- | --- |
-| 1 | ユーザー管理 UI | 初期は `scripts/add-admin.sh` + Cognito コンソール運用（6.3 の runbook）。SPA 内の `admin` アプリは未着手 |
+| 1 | ユーザー管理 UI | `admin-users` アプリとして実装済み（#1007。6.3 の runbook）。`scripts/add-admin.sh` は最初の 1 人と画面が使えないときの退路として残す。操作ログの画面表示は未着手 |
 | 2 | CI/CD | 初期は手動デプロイ（スクリプト）。GitHub Actions / CodePipeline の導入時期は未定 |
-| 3 | MFA `ON` 時の TOTP 解除 | `ON` のプールでは `AdminSetUserMFAPreference` による TOTP 解除ができない。端末紛失時は「ユーザー削除 → 再サインアップ」で復旧する運用にした（6.3）。この手順を dev で実測していない |
+| 3 | 端末紛失時の TOTP 解除 | `MfaConfiguration: OPTIONAL` にしたため `AdminSetUserMFAPreference` で解除できる（6.3）。この手順を dev で実測していない |
 | 4 | `x-origin-verify` のローテーション | 現方式は伝播中に最大 5 分程度の 403 が発生し得る。無停止化（新旧 2 値の受理）は未実装 |
 | 5 | CloudFront ログバケットのバージョニング | 監査ログの改ざん検知は未対応（添付バケットのみバージョニング有効。11.2） |
 | 6 | `cognito:groups` の受け渡し形式 | dev で実測済み: 文字列 `"[admin]"` 形式で渡る。`auth.py` が配列へ正規化する（両形式を受理） |

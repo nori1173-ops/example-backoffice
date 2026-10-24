@@ -8,7 +8,10 @@ const POLL_INTERVAL_MS = 5_000
 const POLL_TIMEOUT_MS = 10 * 60 * 1_000
 const TERMINAL_STATUSES: readonly RunStatus[] = ['succeeded', 'distributed', 'failed']
 
-/** 409 の本文はコード名がそのまま入るため、画面向けの文言に置き換える（設計 8 章）。 */
+/**
+ * 409 の本文はコード名がそのまま入るため、画面向けの文言に置き換える（設計 8 章）。
+ * 実行中の月を含む `OTHER_RUN_RUNNING` は API 側で日本語を組むので、ここには載せない。
+ */
 const CONFLICT_MESSAGES: Record<string, string> = {
   ALREADY_SUCCEEDED:
     'この月は既に集計済みです。結果を作り直すには「強制再実行」にチェックを入れてください。',

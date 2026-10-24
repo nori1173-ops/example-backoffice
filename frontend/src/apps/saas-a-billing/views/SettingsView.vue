@@ -4,21 +4,25 @@ import { onBeforeRouteLeave } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useUiStore } from '@/stores/ui'
 import { formatDateTime } from '@/utils/format'
+import HelpTip from '@/components/HelpTip.vue'
+import TriggerSuggestField, { type SuggestItem } from '@/components/TriggerSuggestField.vue'
 import EnvBadge from '../components/EnvBadge.vue'
 import PriceTableEditor from '../components/PriceTableEditor.vue'
+import { HELP } from '../help'
 import { useSettingsStore } from '../stores/settings'
-import type { AuditEntry, PriceTable, SettingsView, TargetEnv } from '../types'
+import type { MailAttachmentSheets, PriceTable, SettingsView, TargetEnv } from '../types'
+import { joinMentions, mentionFallbackLabel, parseMentions } from '../utils/slackMention'
 
 interface SettingsForm {
   cutoff_day: string
   cutoff_time: string
-  auto_retry_days: string
   auto_run_enabled: boolean
   auto_run_from_month: string
   mail_enabled: boolean
   slack_enabled: boolean
   mail_to: string[]
   mail_cc: string[]
+  mail_attachment_sheets: MailAttachmentSheets
   slack_channel_id: string
   slack_channel_label: string
   slack_mention: string
@@ -29,8 +33,6 @@ interface SettingsForm {
 
 const CUTOFF_DAY_MIN = 1
 const CUTOFF_DAY_MAX = 28
-const AUTO_RETRY_DAYS_MIN = 1
-const AUTO_RETRY_DAYS_MAX = 31
 const INTEGER_PATTERN = /^\d+$/
 const TIME_PATTERN = /^(?:[01]\d|2[0-3]):[0-5]\d$/
 const END_OF_DAY = '24:00'
@@ -51,35 +53,11 @@ const ALLOWED_PLACEHOLDERS = [
   '{total}',
   '{url}',
 ]
-const AUDIT_TARGET_LABELS: Record<AuditEntry['target'], string> = {
-  settings: '設定',
-  price: '単価表',
-}
-
-/** 監査表はフォームと同じ語で読ませる（UI-17）。未知のキーは生のまま出す。 */
-const FIELD_LABELS: Record<string, string> = {
-  target_env: '集計対象環境',
-  cutoff_day: '締め日',
-  cutoff_time: '締め時刻',
-  auto_retry_days: '自動再実行上限日数',
-  auto_run_enabled: '自動実行',
-  auto_run_from_month: '自動実行の開始月',
-  mail_enabled: 'メール配布',
-  slack_enabled: 'Slack 配布',
-  mail_to: 'メール宛先 To',
-  mail_cc: 'メール宛先 Cc',
-  slack_channel_id: 'Slack チャンネル ID',
-  slack_channel_label: 'Slack チャンネル表示名',
-  slack_mention: 'Slack メンション',
-  slack_template: 'Slack 文面',
-  exclude_keywords: '除外キーワード',
-  camera_format_names: 'カメラ扱いフォーマット名',
-  effective_from: '適用開始日',
-  bands: '項目数帯',
-  camera: 'カメラ地点の単価',
-  note: '備考',
-}
-
+/** ユーザー候補より前に出す特別なメンション（#1011）。 */
+const MENTION_SPECIALS: SuggestItem[] = [
+  { value: '<!here>', label: '@here', hint: 'オンライン全員' },
+  { value: '<!channel>', label: '@channel', hint: 'チャンネル全員' },
+]
 /** v-combobox multiple は Enter か blur までチップにならない（UI-11）。 */
 type ListField = 'mail_to' | 'mail_cc' | 'exclude_keywords' | 'camera_format_names'
 
@@ -94,13 +72,13 @@ let leaveResolve: ((leave: boolean) => void) | null = null
 const form = reactive<SettingsForm>({
   cutoff_day: '',
   cutoff_time: '',
-  auto_retry_days: '',
   auto_run_enabled: false,
   auto_run_from_month: '',
   mail_enabled: false,
   slack_enabled: false,
   mail_to: [],
   mail_cc: [],
+  mail_attachment_sheets: 'billing_only',
   slack_channel_id: '',
   slack_channel_label: '',
   slack_mention: '',
@@ -118,13 +96,13 @@ function seed(settings: SettingsView | null): void {
   }
   form.cutoff_day = String(settings.cutoff_day)
   form.cutoff_time = settings.cutoff_time
-  form.auto_retry_days = String(settings.auto_retry_days)
   form.auto_run_enabled = settings.auto_run_enabled
   form.auto_run_from_month = settings.auto_run_from_month
   form.mail_enabled = settings.mail_enabled
   form.slack_enabled = settings.slack_enabled
   form.mail_to = [...settings.mail_to]
   form.mail_cc = [...settings.mail_cc]
+  form.mail_attachment_sheets = settings.mail_attachment_sheets ?? 'billing_only'
   form.slack_channel_id = settings.slack_channel_id
   form.slack_channel_label = settings.slack_channel_label
   form.slack_mention = settings.slack_mention
@@ -169,7 +147,7 @@ function slackChannelErrors(): string[] {
   }
   return SLACK_CHANNEL_PATTERN.test(form.slack_channel_id)
     ? []
-    : ['チャンネル ID は C または G で始まる英数字です（#名前 は不可）']
+    : ['保存済みの値が古い形式です。候補から選び直してください']
 }
 
 /** 宛先はメール配布が ON のときだけ必須。項目のメール形式は常に見る（バックエンドと同条件）。 */
@@ -195,9 +173,6 @@ const errors = computed(() => {
       form.cutoff_time === END_OF_DAY || TIME_PATTERN.test(form.cutoff_time)
         ? []
         : ['締め時刻は HH:MM 形式で指定してください（24:00 可）'],
-    auto_retry_days: inRange(form.auto_retry_days, AUTO_RETRY_DAYS_MIN, AUTO_RETRY_DAYS_MAX)
-      ? []
-      : [`自動再実行上限日数は ${AUTO_RETRY_DAYS_MIN}〜${AUTO_RETRY_DAYS_MAX} で指定してください`],
     auto_run_from_month: MONTH_PATTERN.test(form.auto_run_from_month)
       ? []
       : ['自動実行の開始月は YYYY-MM 形式で指定してください'],
@@ -211,6 +186,49 @@ const errors = computed(() => {
 })
 
 const hasError = computed(() => Object.values(errors.value).some((messages) => messages.length))
+
+const channelItems = computed<SuggestItem[]>(() =>
+  (store.directory?.channels ?? []).map((channel) => ({
+    value: channel.id,
+    label: `#${channel.name}`,
+    hint: channel.is_private ? '非公開' : undefined,
+    keywords: [channel.name],
+  })),
+)
+
+const mentionItems = computed<SuggestItem[]>(() => [
+  ...MENTION_SPECIALS,
+  ...(store.directory?.users ?? []).map((user) => ({
+    value: `<@${user.id}>`,
+    label: `@${user.display_name || user.real_name}`,
+    hint: `${user.real_name} · @${user.handle}`,
+    keywords: [user.handle, user.real_name, user.display_name],
+  })),
+])
+
+/** チャンネルは 1 件だけ。選んだときに表示名メモ（`slack_channel_label`）も揃える。 */
+const slackChannelValues = computed({
+  get: () => (form.slack_channel_id ? [form.slack_channel_id] : []),
+  set: (values: string[]) => {
+    const id = values[0] ?? ''
+    const item = channelItems.value.find((candidate) => candidate.value === id)
+    form.slack_channel_id = id
+    form.slack_channel_label = id ? (item?.label ?? form.slack_channel_label) : ''
+  },
+})
+
+/** 保存形式は空白区切りの文字列のまま。画面ではトークンの配列として扱う（#1011）。 */
+const slackMentionValues = computed({
+  get: () => parseMentions(form.slack_mention),
+  set: (values: string[]) => {
+    form.slack_mention = joinMentions(values)
+  },
+})
+
+/** 候補に無いチャンネルは保存済みの表示名で見せる。それも無いときだけ ID を借りる。 */
+function channelFallbackLabel(id: string): string {
+  return form.slack_channel_label || `#${id}`
+}
 
 // 集計対象環境はサイトごとに固定で、画面からは変更できない（設計 R1 / UI-08）
 const fixedEnv = computed<TargetEnv | null>(() => store.settings?.target_env ?? null)
@@ -239,18 +257,10 @@ const saveBlockedReason = computed(() => {
   return ''
 })
 
-function changedKeys(entry: AuditEntry): string {
-  const keys = Object.keys(entry.after).filter(
-    (key) => JSON.stringify(entry.before[key]) !== JSON.stringify(entry.after[key]),
-  )
-  return keys.map((key) => FIELD_LABELS[key] ?? key).join('、') || '—'
-}
-
 async function save(): Promise<void> {
   const ok = await store.save({
     ...form,
     cutoff_day: Number(form.cutoff_day),
-    auto_retry_days: Number(form.auto_retry_days),
   })
   if (ok) {
     ui.notify('設定を保存しました', 'success')
@@ -299,13 +309,14 @@ watch(() => store.settings, seed, { immediate: true })
 // 編集中でなければ画面に入るたびに取り直す（他の人の更新を古い値で上書きしないため）
 onActivated(async () => {
   window.addEventListener('beforeunload', warnUnload)
+  // 候補は admin 専用の API。閲覧者に権限エラーの警告を出さず、取得済みなら往復も省く（#1011）
+  if (isAdmin.value && !store.directory) {
+    void store.loadSlackDirectory()
+  }
   if (store.settings && isDirty.value) {
     return
   }
   await store.fetch()
-  if (isAdmin.value) {
-    await store.fetchAudits()
-  }
 })
 
 onDeactivated(() => window.removeEventListener('beforeunload', warnUnload))
@@ -408,75 +419,81 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
             cols="12"
             sm="4"
           >
-            <v-text-field
-              v-model="form.cutoff_day"
-              data-test="cutoff-day"
-              label="締め日（毎月）"
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.cutoff_day"
-            />
+            <HelpTip :text="HELP.settings.cutoff">
+              <template #default="{ props }">
+                <v-text-field
+                  v-bind="props"
+                  v-model="form.cutoff_day"
+                  data-test="cutoff-day"
+                  label="締め日（毎月）"
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.cutoff_day"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="4"
           >
-            <v-text-field
-              v-model="form.cutoff_time"
-              data-test="cutoff-time"
-              label="締め時刻"
-              hint="24:00 はその日の終わりまで含む"
-              persistent-hint
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.cutoff_time"
-            />
+            <HelpTip :text="HELP.settings.cutoff">
+              <template #default="{ props }">
+                <v-text-field
+                  v-bind="props"
+                  v-model="form.cutoff_time"
+                  data-test="cutoff-time"
+                  label="締め時刻"
+                  hint="24:00 はその日の終わりまで含む"
+                  persistent-hint
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.cutoff_time"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="4"
           >
-            <v-text-field
-              v-model="form.auto_retry_days"
-              data-test="auto-retry-days"
-              label="自動再実行上限日数"
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.auto_retry_days"
-            />
-          </v-col>
-          <v-col
-            cols="12"
-            sm="4"
-          >
-            <v-text-field
-              v-model="form.auto_run_from_month"
-              data-test="auto-run-from-month"
-              label="自動実行の開始月"
-              placeholder="YYYY-MM"
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.auto_run_from_month"
-            />
+            <HelpTip :text="HELP.settings.autoRun">
+              <template #default="{ props }">
+                <v-text-field
+                  v-bind="props"
+                  v-model="form.auto_run_from_month"
+                  data-test="auto-run-from-month"
+                  label="自動実行の開始月"
+                  placeholder="YYYY-MM"
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.auto_run_from_month"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="4"
             class="d-flex align-center"
           >
-            <v-switch
-              v-model="form.auto_run_enabled"
-              data-test="auto-run-enabled"
-              label="自動実行を有効にする"
-              color="primary"
-              density="comfortable"
-              hide-details
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.autoRun">
+              <template #default="{ props }">
+                <v-switch
+                  v-bind="props"
+                  v-model="form.auto_run_enabled"
+                  data-test="auto-run-enabled"
+                  label="自動実行を有効にする"
+                  color="primary"
+                  density="comfortable"
+                  hide-details
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
@@ -494,165 +511,250 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 
         <v-row dense>
           <v-col cols="12">
-            <v-switch
-              v-model="form.mail_enabled"
-              data-test="mail-enabled"
-              label="メール配布を有効にする"
-              hint="OFF のときは宛先を空にできます"
-              persistent-hint
-              color="primary"
-              density="comfortable"
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.mailEnabled">
+              <template #default="{ props }">
+                <v-switch
+                  v-bind="props"
+                  v-model="form.mail_enabled"
+                  data-test="mail-enabled"
+                  label="メール配布を有効にする"
+                  hint="OFF のときは宛先を空にできます"
+                  persistent-hint
+                  color="primary"
+                  density="comfortable"
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="6"
             @focusout="commitPending($event, 'mail_to')"
           >
-            <v-combobox
-              v-model="form.mail_to"
-              data-test="mail-to"
-              label="メール宛先 To"
-              hint="入力して Enter で追加します"
-              persistent-hint
-              multiple
-              chips
-              closable-chips
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.mail_to"
-            />
+            <HelpTip :text="HELP.settings.mailTo">
+              <template #default="{ props }">
+                <v-combobox
+                  v-bind="props"
+                  v-model="form.mail_to"
+                  data-test="mail-to"
+                  label="メール宛先 To"
+                  hint="入力して Enter で追加します"
+                  persistent-hint
+                  multiple
+                  chips
+                  closable-chips
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.mail_to"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="6"
             @focusout="commitPending($event, 'mail_cc')"
           >
-            <v-combobox
-              v-model="form.mail_cc"
-              data-test="mail-cc"
-              label="メール宛先 Cc"
-              hint="入力して Enter で追加します"
-              persistent-hint
-              multiple
-              chips
-              closable-chips
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.mail_cc"
-            />
+            <HelpTip :text="HELP.settings.mailCc">
+              <template #default="{ props }">
+                <v-combobox
+                  v-bind="props"
+                  v-model="form.mail_cc"
+                  data-test="mail-cc"
+                  label="メール宛先 Cc"
+                  hint="入力して Enter で追加します"
+                  persistent-hint
+                  multiple
+                  chips
+                  closable-chips
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.mail_cc"
+                />
+              </template>
+            </HelpTip>
+          </v-col>
+          <v-col
+            cols="12"
+            sm="6"
+          >
+            <HelpTip :text="HELP.settings.mailAttachmentSheets">
+              <template #default="{ props }">
+                <v-select
+                  v-bind="props"
+                  v-model="form.mail_attachment_sheets"
+                  data-test="mail-attachment-sheets"
+                  label="メールに添付する Excel"
+                  :items="[
+                    { title: 'シート 1（請求照合）のみ', value: 'billing_only' },
+                    { title: '両方のシート（請求照合 + 全地点）', value: 'all' },
+                  ]"
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col cols="12">
-            <v-switch
-              v-model="form.slack_enabled"
-              data-test="slack-enabled"
-              label="Slack 配布を有効にする"
-              hint="OFF のときはチャンネル ID を空にできます"
-              persistent-hint
-              color="primary"
-              density="comfortable"
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.slackEnabled">
+              <template #default="{ props }">
+                <v-switch
+                  v-bind="props"
+                  v-model="form.slack_enabled"
+                  data-test="slack-enabled"
+                  label="Slack 配布を有効にする"
+                  hint="OFF のときはチャンネル ID を空にできます"
+                  persistent-hint
+                  color="primary"
+                  density="comfortable"
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
+          </v-col>
+          <v-col
+            v-if="isAdmin && store.directoryError"
+            cols="12"
+          >
+            <v-alert
+              data-test="slack-directory-error"
+              type="warning"
+              variant="tonal"
+              density="compact"
+            >
+              <div class="d-flex align-center flex-wrap ga-2">
+                <span>Slack の候補を取得できませんでした: {{ store.directoryError }}</span>
+                <HelpTip :text="HELP.settings.slackDirectoryRetry">
+                  <template #default="{ props }">
+                    <v-btn
+                      v-bind="props"
+                      data-test="slack-directory-retry"
+                      size="small"
+                      variant="text"
+                      @click="store.loadSlackDirectory(true)"
+                    >
+                      再取得
+                    </v-btn>
+                  </template>
+                </HelpTip>
+              </div>
+            </v-alert>
           </v-col>
           <v-col
             cols="12"
-            sm="4"
+            sm="6"
           >
-            <v-text-field
-              v-model="form.slack_channel_id"
-              data-test="slack-channel-id"
-              label="Slack チャンネル ID"
-              placeholder="C0123ABCD"
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.slack_channel_id"
-            />
+            <HelpTip :text="HELP.settings.slackChannel">
+              <template #default="{ props }">
+                <TriggerSuggestField
+                  v-bind="props"
+                  v-model="slackChannelValues"
+                  data-test="slack-channel-id"
+                  trigger="#"
+                  label="Slack チャンネル"
+                  placeholder="「#」を入力するとチャンネル候補が出ます"
+                  :items="channelItems"
+                  :fallback-label="channelFallbackLabel"
+                  :disabled="!isAdmin"
+                  :loading="store.directoryLoading"
+                  :error-messages="errors.slack_channel_id"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
-            sm="4"
+            sm="6"
           >
-            <v-text-field
-              v-model="form.slack_channel_label"
-              data-test="slack-channel-label"
-              label="Slack チャンネル表示名"
-              hint="画面表示用のメモ。投稿先の決定には使わない"
-              persistent-hint
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-            />
-          </v-col>
-          <v-col
-            cols="12"
-            sm="4"
-          >
-            <v-text-field
-              v-model="form.slack_mention"
-              data-test="slack-mention"
-              label="Slack メンション"
-              placeholder="<!here>"
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.slackMention">
+              <template #default="{ props }">
+                <TriggerSuggestField
+                  v-bind="props"
+                  v-model="slackMentionValues"
+                  data-test="slack-mention"
+                  trigger="@"
+                  label="Slack メンション"
+                  placeholder="「@」を入力するとメンション候補が出ます"
+                  multiple
+                  :items="mentionItems"
+                  :fallback-label="mentionFallbackLabel"
+                  :disabled="!isAdmin"
+                  :loading="store.directoryLoading"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col cols="12">
-            <v-textarea
-              v-model="form.slack_template"
-              data-test="slack-template"
-              label="Slack 文面"
-              rows="3"
-              auto-grow
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-              :error-messages="errors.slack_template"
-              :hint="`使えるプレースホルダ: ${ALLOWED_PLACEHOLDERS.join(' ')}`"
-              persistent-hint
-            />
+            <HelpTip :text="HELP.settings.slackTemplate">
+              <template #default="{ props }">
+                <v-textarea
+                  v-bind="props"
+                  v-model="form.slack_template"
+                  data-test="slack-template"
+                  label="Slack 文面"
+                  rows="3"
+                  auto-grow
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                  :error-messages="errors.slack_template"
+                  :hint="`使えるプレースホルダ: ${ALLOWED_PLACEHOLDERS.join(' ')}`"
+                  persistent-hint
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="6"
             @focusout="commitPending($event, 'exclude_keywords')"
           >
-            <v-combobox
-              v-model="form.exclude_keywords"
-              data-test="exclude-keywords"
-              label="除外キーワード"
-              hint="入力して Enter で追加します（テナント説明欄・地点備考欄に含まれたら課金対象外）"
-              persistent-hint
-              multiple
-              chips
-              closable-chips
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.excludeKeywords">
+              <template #default="{ props }">
+                <v-combobox
+                  v-bind="props"
+                  v-model="form.exclude_keywords"
+                  data-test="exclude-keywords"
+                  label="除外キーワード"
+                  hint="入力して Enter で追加します（テナント説明欄・地点備考欄に含まれたら課金対象外）"
+                  persistent-hint
+                  multiple
+                  chips
+                  closable-chips
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
           </v-col>
           <v-col
             cols="12"
             sm="6"
             @focusout="commitPending($event, 'camera_format_names')"
           >
-            <v-combobox
-              v-model="form.camera_format_names"
-              data-test="camera-format-names"
-              label="カメラ扱いフォーマット名"
-              hint="入力して Enter で追加します（フォーマット名の完全一致）"
-              persistent-hint
-              multiple
-              chips
-              closable-chips
-              density="comfortable"
-              variant="outlined"
-              :disabled="!isAdmin"
-            />
+            <HelpTip :text="HELP.settings.cameraFormats">
+              <template #default="{ props }">
+                <v-combobox
+                  v-bind="props"
+                  v-model="form.camera_format_names"
+                  data-test="camera-format-names"
+                  label="カメラ扱いフォーマット名"
+                  hint="入力して Enter で追加します（フォーマット名の完全一致）"
+                  persistent-hint
+                  multiple
+                  chips
+                  closable-chips
+                  density="comfortable"
+                  variant="outlined"
+                  :disabled="!isAdmin"
+                />
+              </template>
+            </HelpTip>
           </v-col>
         </v-row>
 
@@ -674,15 +776,22 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
         >
           未保存の変更があります
         </v-chip>
-        <v-btn
+        <HelpTip
           v-if="isDirty"
-          data-test="discard-changes"
-          variant="text"
-          size="small"
-          @click="seed(store.settings)"
+          :text="HELP.settings.discard"
         >
-          変更を破棄
-        </v-btn>
+          <template #default="{ props }">
+            <v-btn
+              v-bind="props"
+              data-test="discard-changes"
+              variant="text"
+              size="small"
+              @click="seed(store.settings)"
+            >
+              変更を破棄
+            </v-btn>
+          </template>
+        </HelpTip>
         <v-spacer />
         <span
           v-if="saveBlockedReason"
@@ -691,15 +800,25 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
         >
           {{ saveBlockedReason }}
         </span>
-        <v-btn
-          data-test="settings-save"
-          color="primary"
-          variant="flat"
-          :disabled="!canSave"
-          @click="save"
-        >
-          保存
-        </v-btn>
+        <!-- disabled なボタンはマウスイベントを受け取らないので、activator をラッパ側に置く -->
+        <HelpTip :text="HELP.settings.save">
+          <template #default="{ props }">
+            <span
+              v-bind="props"
+              class="d-inline-block"
+            >
+              <v-btn
+                data-test="settings-save"
+                color="primary"
+                variant="flat"
+                :disabled="!canSave"
+                @click="save"
+              >
+                保存
+              </v-btn>
+            </span>
+          </template>
+        </HelpTip>
       </v-card-actions>
     </v-card>
 
@@ -709,52 +828,6 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
       :editable="isAdmin"
       @add="addPrice"
     />
-
-    <v-card
-      v-if="isAdmin"
-      data-test="audit-block"
-      variant="flat"
-      border
-    >
-      <v-card-item>
-        <v-card-title class="text-subtitle-1">
-          変更履歴
-        </v-card-title>
-        <v-card-subtitle>直近 50 件を新しい順に表示します。</v-card-subtitle>
-      </v-card-item>
-      <v-table density="comfortable">
-        <thead>
-          <tr>
-            <th>日時</th>
-            <th>対象</th>
-            <th>実行者</th>
-            <th>変更項目</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-if="!store.audits.length">
-            <td
-              colspan="4"
-              class="text-center text-medium-emphasis py-6"
-            >
-              変更履歴がありません。
-            </td>
-          </tr>
-          <tr
-            v-for="entry in store.audits"
-            :key="`${entry.at}-${entry.target}`"
-            data-test="audit-row"
-          >
-            <td class="text-no-wrap">
-              {{ formatDateTime(entry.at) }}
-            </td>
-            <td>{{ AUDIT_TARGET_LABELS[entry.target] }}</td>
-            <td>{{ entry.actor_email }}</td>
-            <td>{{ changedKeys(entry) }}</td>
-          </tr>
-        </tbody>
-      </v-table>
-    </v-card>
 
     <v-dialog
       v-model="leaveDialog"

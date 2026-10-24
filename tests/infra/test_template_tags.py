@@ -45,6 +45,7 @@ ALLOWED_NAME_VALUES = frozenset(
         # cfn-lint のプロバイダスキーマ上 Tags を持つと確認できた 2 型（設計 14.2 の表への追記を要提案）
         "EventSourceMapping",  # AWS::Lambda::EventSourceMapping
         "EmailIdentity",  # AWS::SES::EmailIdentity
+        "Rule",  # AWS::Events::Rule
     }
 )
 
@@ -201,6 +202,7 @@ def _tag_list(name: str) -> list[dict]:
         ("AWS::Lambda::EventSourceMapping", "EventSourceMapping"),
         ("AWS::SES::EmailIdentity", "EmailIdentity"),
         ("AWS::CloudFront::Function", "EdgeFunction"),
+        ("AWS::Events::Rule", "Rule"),
     ],
 )
 def test_types_with_tags_support_are_not_excluded(resource_type, name_value):

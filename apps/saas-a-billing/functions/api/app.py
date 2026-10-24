@@ -26,7 +26,7 @@ from urllib.parse import urlparse
 import boto3
 from aws_lambda_powertools.event_handler import APIGatewayHttpResolver, Response
 from botocore.exceptions import ClientError
-from saas_a_billing import execution, messages, period, repo, storage
+from saas_a_billing import execution, messages, period, repo, schedule, slack_directory, storage
 from saas_a_billing.pricing import PriceTableNotFoundError
 
 from example_backoffice import auth, mail, origin_verify, response
@@ -49,19 +49,24 @@ VERSION_CONFLICT = "VERSION_CONFLICT"
 ALREADY_EXISTS = "ALREADY_EXISTS"
 MONTH_NOT_STARTED = "MONTH_NOT_STARTED"
 NOT_FOUND = "NOT_FOUND"
+OTHER_RUN_RUNNING = "OTHER_RUN_RUNNING"
+SCHEDULE_IMMINENT = "SCHEDULE_IMMINENT"
 START_EXECUTION_FAILED = "START_EXECUTION_FAILED"
+SLACK_NOT_CONFIGURED = "SLACK_NOT_CONFIGURED"
+SLACK_API_ERROR = "SLACK_API_ERROR"
+SLACK_UNAVAILABLE = "SLACK_UNAVAILABLE"
 
 EDITABLE_SETTINGS = (
     "target_env",
     "cutoff_day",
     "cutoff_time",
-    "auto_retry_days",
     "auto_run_enabled",
     "auto_run_from_month",
     "mail_enabled",
     "slack_enabled",
     "mail_to",
     "mail_cc",
+    "mail_attachment_sheets",
     "slack_channel_id",
     "slack_channel_label",
     "slack_mention",
@@ -69,7 +74,7 @@ EDITABLE_SETTINGS = (
     "exclude_keywords",
     "camera_format_names",
 )
-REDACTED_RUN_ATTRIBUTES = (*repo.TOKEN_ATTRIBUTES, "run_token", "retry_alert_sent")
+REDACTED_RUN_ATTRIBUTES = (*repo.TOKEN_ATTRIBUTES, "run_token")
 LIST_REDACTED_RUN_ATTRIBUTES = (*REDACTED_RUN_ATTRIBUTES, repo.REQUEST_HISTORY)
 STRING_LIST_SETTINGS = ("exclude_keywords", "camera_format_names")
 TEXT_SETTINGS = ("slack_channel_label", "slack_mention")
@@ -78,10 +83,11 @@ BAND_FIELDS = ("max_items", "price_3y", "price_1y")
 CAMERA_FIELDS = ("price_3y", "price_1y")
 
 CUTOFF_DAY_MIN, CUTOFF_DAY_MAX = 1, 28
-AUTO_RETRY_DAYS_MIN, AUTO_RETRY_DAYS_MAX = 1, 31
 RUN_LIST_LIMIT_MAX = 100
+AUDIT_LIMIT_MIN = 1
 END_OF_DAY = "24:00"
 TARGET_ENV_LABEL = " / ".join(repo.TARGET_ENVS)
+AUDIT_TARGET_LABEL = " / ".join(repo.AUDIT_TARGETS)
 
 _MONTH_PATTERN = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -110,6 +116,7 @@ def reset_clients() -> None:
     global _ssm_cache, _states_cache
     _ssm_cache = None
     _states_cache = None
+    slack_directory.reset_clients()
 
 
 def _ssm():
@@ -239,13 +246,51 @@ def _query_limit(default: int) -> int:
     value = app.current_event.get_query_string_value("limit")
     if not value:
         return default
-    _require(value.isdigit() and int(value) > 0, "limit は 1 以上の整数で指定してください")
+    _require(value.isdecimal() and int(value) > 0, "limit は 1 以上の整数で指定してください")
     return min(int(value), RUN_LIST_LIMIT_MAX)
+
+
+def _query_audit_limit() -> int:
+    """`GET /audits` の `limit`。丸めずに範囲外を断る（見えていない件数を黙って変えない）。"""
+    value = app.current_event.get_query_string_value("limit")
+    if not value:
+        return repo.AUDIT_LIST_LIMIT
+    _require(
+        value.isdecimal() and AUDIT_LIMIT_MIN <= int(value) <= repo.AUDIT_LIST_MAX,
+        f"limit は {AUDIT_LIMIT_MIN}〜{repo.AUDIT_LIST_MAX} の整数で指定してください",
+    )
+    return int(value)
+
+
+def _query_audit_target() -> str | None:
+    value = app.current_event.get_query_string_value("target")
+    if not value:
+        return None
+    _require(value in repo.AUDIT_TARGETS, f"target は {AUDIT_TARGET_LABEL} のいずれかで指定してください")
+    return value
+
+
+def _query_since() -> str | None:
+    """`GET /audits` の `since`。`Z` でもオフセット付きでも受け、正規化は repo に任せる。"""
+    value = app.current_event.get_query_string_value("since")
+    if not value:
+        return None
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValidationError("since は ISO 8601 形式で指定してください") from error
+    return value
 
 
 def _query_detail() -> bool:
     """`?detail=true` のときだけ `result.json` を読む。"""
     value = app.current_event.get_query_string_value("detail")
+    return bool(value) and value.lower() not in ("false", "0")
+
+
+def _query_refresh() -> bool:
+    """`?refresh=1` のときだけ Slack の候補キャッシュを捨てて取り直す。"""
+    value = app.current_event.get_query_string_value("refresh")
     return bool(value) and value.lower() not in ("false", "0")
 
 
@@ -329,17 +374,17 @@ def _validate_settings(values: dict) -> None:
         cutoff_time == END_OF_DAY or (isinstance(cutoff_time, str) and bool(_TIME_PATTERN.match(cutoff_time))),
         f"cutoff_time は HH:MM 形式で指定してください（{END_OF_DAY} を含む）",
     )
-    auto_retry_days = values.get("auto_retry_days")
-    _require(
-        _is_int(auto_retry_days) and AUTO_RETRY_DAYS_MIN <= auto_retry_days <= AUTO_RETRY_DAYS_MAX,
-        f"auto_retry_days は {AUTO_RETRY_DAYS_MIN}〜{AUTO_RETRY_DAYS_MAX} の整数で指定してください",
-    )
     for name in BOOL_SETTINGS:
         _require(isinstance(values.get(name), bool), f"{name} は真偽値で指定してください")
     _require(_is_month(values.get("auto_run_from_month")), "auto_run_from_month は YYYY-MM 形式で指定してください")
     _validate_slack_channel(values)
     _validate_mail_to(values)
     _validate_emails(values.get("mail_cc"), "mail_cc", required=False)
+    _require(
+        isinstance(values.get("mail_attachment_sheets"), str)
+        and values["mail_attachment_sheets"] in ("billing_only", "all"),
+        "mail_attachment_sheets は billing_only / all で指定してください",
+    )
     for name in STRING_LIST_SETTINGS:
         _validate_string_list(values.get(name), name)
     for name in TEXT_SETTINGS:
@@ -411,6 +456,20 @@ def put_settings() -> dict:
     return response.ok(repo.put_settings(updated, version, claims.sub, claims.email))
 
 
+# 設定画面の `#` / `@` 候補だけに使う読み取り（設計 8 章 / #1011）。監査には残さない。
+@app.get("/slack/directory")
+def get_slack_directory() -> dict | Response:
+    _admin_claims()
+    try:
+        return response.ok(slack_directory.get_directory(refresh=_query_refresh()))
+    except slack_directory.SlackNotConfiguredError as error:
+        return response.error(SLACK_NOT_CONFIGURED, str(error), 503)
+    except slack_directory.SlackApiError as error:
+        return response.error(SLACK_API_ERROR, str(error), 502)
+    except slack_directory.SlackUnavailableError as error:
+        return response.error(SLACK_UNAVAILABLE, str(error), 502)
+
+
 @app.get("/prices")
 def get_prices() -> dict:
     _claims()
@@ -477,6 +536,15 @@ def post_runs() -> Response:
     closing = period.closing_period(month, settings["cutoff_day"], settings["cutoff_time"])
     _require(closing.start <= now, f"{month} の課金対象期間はまだ始まっていません", MONTH_NOT_STARTED)
 
+    imminent = _schedule_imminent_message(now)
+    if imminent:
+        return response.error(SCHEDULE_IMMINENT, imminent, 409)
+
+    running = _other_running_months(target_env, month, now)
+    if running:
+        message = f"{'、'.join(running)} が実行中です。終わってから実行してください。"
+        return response.error(OTHER_RUN_RUNNING, message, 409)
+
     distribute = _bool_field(payload, "distribute", False)
     force = _bool_field(payload, "force", False)
     run_token = str(uuid.uuid4())
@@ -507,6 +575,17 @@ def post_runs() -> Response:
         "手動実行を受け付けました",
         {"target_env": target_env, "month": month, "attempt": attempt, "execution_arn": execution_arn},
     )
+    _put_run_audit(
+        claims,
+        {
+            "month": month,
+            "target_env": target_env,
+            "distribute": distribute,
+            "force": force,
+            "attempt": attempt,
+            "execution_name": execution_arn.rsplit(":", 1)[-1],
+        },
+    )
     return response.json_response(
         response.ok(
             {
@@ -519,6 +598,33 @@ def post_runs() -> Response:
         ),
         202,
     )
+
+
+def _schedule_imminent_message(now: datetime) -> str | None:
+    """スケジュール実行の直前なら案内文を返す（#1006）。窓の外は `None`。
+
+    先に発火されるとログインの奪い合いになるため、実行中判定より手前で断る。
+    """
+    hour = int(os.environ.get("SCHEDULE_HOUR") or schedule.DEFAULT_HOUR)
+    minute = int(os.environ.get("SCHEDULE_MINUTE") or schedule.DEFAULT_MINUTE)
+    tz = schedule.timezone_of(os.environ.get("SCHEDULE_TIMEZONE") or schedule.DEFAULT_TIMEZONE)
+    if not schedule.is_imminent(now, hour, minute, tz):
+        return None
+    return (
+        f"{schedule.schedule_label(hour, minute)} のスケジュール実行の直前です。"
+        f"{schedule.next_allowed_label(hour, minute)}に実行してください。"
+    )
+
+
+def _other_running_months(target_env: str, month: str, now: datetime) -> list[str]:
+    """対象月以外で走っている RUN の月（#1006）。
+
+    SaaS_A の管理 API は 1 ユーザー 1 トークンで、後発の `Init` のログインが先発の
+    トークンを無効化する。重ねると先発の残りテナントが全部 401 になり、成功扱いのまま
+    取得失敗入りの Excel ができるため、手前で断る。対象月自身は `acquire_run` の
+    条件式が `ALREADY_RUNNING` として弾く。
+    """
+    return [run["month"] for run in repo.active_runs(target_env, now) if run["month"] != month]
 
 
 def _start_execution(target_env: str, month: str, attempt: int, run_token: str, distribute: bool, force: bool) -> str:
@@ -541,10 +647,23 @@ def _start_execution(target_env: str, month: str, attempt: int, run_token: str, 
     return started["executionArn"]
 
 
+def _put_run_audit(claims: auth.Claims, after: dict) -> None:
+    """受理した手動実行を監査に残す（ログタブの「手動実行」）。
+
+    RUN は既に始まっているため、記録に失敗しても 202 は返す。断ったとき（409）は
+    「実行した」ことにならないので呼ばない。
+    """
+    try:
+        repo.put_run_audit(claims.sub, claims.email, after, _now())
+    except Exception:
+        logger.exception("手動実行の監査記録に失敗しました", after)
+
+
 @app.get("/audits")
 def get_audits() -> dict:
     _admin_claims()
-    return response.ok(repo.list_audits(repo.AUDIT_LIST_LIMIT))
+    limit, target, since = _query_audit_limit(), _query_audit_target(), _query_since()
+    return response.ok(repo.list_audits(limit, target=target, since=since))
 
 
 @app.exception_handler(ValidationError)

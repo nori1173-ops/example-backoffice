@@ -10,6 +10,7 @@ import {
   formatYen,
   toWallClock,
 } from '@/utils/format'
+import HelpTip from '@/components/HelpTip.vue'
 import { billingApi } from '../api'
 import EnvBadge from '../components/EnvBadge.vue'
 import JudgementChip, {
@@ -21,7 +22,10 @@ import JudgementChip, {
 } from '../components/JudgementChip.vue'
 import RunConfirmSummary from '../components/RunConfirmSummary.vue'
 import StatusChip from '../components/StatusChip.vue'
+import TriggerChip from '../components/TriggerChip.vue'
+import { HELP } from '../help'
 import { runKey, useRunsStore } from '../stores/runs'
+import { DEFAULT_EXCLUDE_KEYWORDS, isTenantExcluded } from '../utils/tenants'
 import type {
   BillingSummary,
   ClosingPeriod,
@@ -84,14 +88,11 @@ const JUDGEMENT_FILTERS: readonly { value: Judgement; label: string }[] = [
 
 const CAMERA_SOURCE_LABELS: Record<string, string> = { export: 'export', settings: '設定' }
 
-/** 行の塗り分けは Excel と同じ意味を持つので、色だけに頼らせない（UI-20 / 設計 6.6）。 */
-const LEGEND: readonly { judgement: ChipJudgement; description: string }[] = [
-  { judgement: 'billable', description: '締め期間内に受信があり課金対象' },
-  { judgement: 'no_data', description: '締め期間内に受信が無い（0 円）' },
-  { judgement: 'excluded', description: '除外キーワードに一致（0 円）' },
-  { judgement: 'failed', description: 'テナントの取得に失敗（0 円・再実行が要る）' },
-  { judgement: 'missing', description: '前回 RUN にあり今回の一覧に無い（金額に計上しない）' },
-]
+/** 行の塗り分けは Excel と同じ意味を持つので、色だけに頼らせない（UI-20 / 設計 6.6）。説明は help.ts。 */
+const LEGEND: readonly ChipJudgement[] = ['billable', 'no_data', 'excluded', 'failed', 'missing']
+
+/** テナント行の色分けは判定とは別軸なので、凡例にも独立で並べる（設計 3.4 / 6.6）。 */
+const TENANT_LEGEND_LABEL = 'デモテナント'
 
 const REVIEW_HELP = Object.values(REVIEW_REASONS)
 
@@ -160,7 +161,21 @@ function legendStyle(judgement: ChipJudgement): Record<string, string> {
   }
 }
 
-const missingRowStyle = { '--row-text': MISSING_TEXT_COLOR }
+const missingRowStyle = {
+  '--row-text': MISSING_TEXT_COLOR,
+  '--row-fill': JUDGEMENT_FILLS.missing,
+}
+const tenantRowStyle = { '--tenant-fill': JUDGEMENT_FILLS.excluded }
+const tenantLegendStyle = { '--swatch-fill': JUDGEMENT_FILLS.excluded }
+
+const excludeKeywords = computed(
+  () => result.value?.settings_snapshot?.exclude_keywords ?? DEFAULT_EXCLUDE_KEYWORDS,
+)
+
+/** 古い result.json は `tenant_excluded` を持たないので、設定スナップショットから補う（設計 7.3）。 */
+function demoTenant(tenant: TenantResult): boolean {
+  return tenant.tenant_excluded ?? isTenantExcluded(tenant, excludeKeywords.value)
+}
 
 /** 要確認は判定を問わず立つ（除外・通信なしの行にも理由が付きうる）。 */
 function matches(device: DeviceJudgement): boolean {
@@ -343,16 +358,21 @@ watch(
 
 <template>
   <div>
-    <v-btn
-      data-test="back-to-runs"
-      variant="text"
-      size="small"
-      prepend-icon="mdi-arrow-left"
-      :to="{ name: 'saas-a-billing.runs' }"
-      class="mb-2"
-    >
-      実行履歴へ戻る
-    </v-btn>
+    <HelpTip :text="HELP.runDetail.back">
+      <template #default="{ props }">
+        <v-btn
+          v-bind="props"
+          data-test="back-to-runs"
+          variant="text"
+          size="small"
+          prepend-icon="mdi-arrow-left"
+          :to="{ name: 'saas-a-billing.runs' }"
+          class="mb-2"
+        >
+          実行履歴へ戻る
+        </v-btn>
+      </template>
+    </HelpTip>
     <div class="d-flex align-center flex-wrap ga-3 mb-4">
       <div>
         <h1 class="text-h5 mb-1">
@@ -364,6 +384,11 @@ watch(
             v-if="run"
             :status="run.status"
           />
+          <TriggerChip
+            v-if="run"
+            :trigger="run.trigger"
+            data-test="trigger"
+          />
           <span
             v-if="run?.saasa_host"
             class="text-body-2 text-medium-emphasis"
@@ -371,30 +396,49 @@ watch(
         </div>
       </div>
       <v-spacer />
-      <v-btn
-        data-test="download"
-        :disabled="!canDownload"
-        :loading="downloading"
-        variant="text"
-        prepend-icon="mdi-file-excel-outline"
-        @click="store.download(month, targetEnv)"
-      >
-        Excel
-      </v-btn>
+      <!-- disabled なボタンはマウスイベントを受け取らないので、activator をラッパ側に置く -->
+      <HelpTip :text="HELP.download">
+        <template #default="{ props }">
+          <span
+            v-bind="props"
+            class="d-inline-block"
+          >
+            <v-btn
+              data-test="download"
+              :disabled="!canDownload"
+              :loading="downloading"
+              variant="text"
+              prepend-icon="mdi-file-excel-outline"
+              @click="store.download(month, targetEnv)"
+            >
+              Excel
+            </v-btn>
+          </span>
+        </template>
+      </HelpTip>
       <span
         v-if="!canDownload"
         data-test="download-reason"
         class="text-caption text-medium-emphasis"
       >成功・配布済みの月だけダウンロードできます</span>
-      <v-btn
-        data-test="rerun"
-        color="primary"
-        prepend-icon="mdi-refresh"
-        :disabled="rerunBlocked"
-        @click="openRerun"
-      >
-        再実行
-      </v-btn>
+      <HelpTip :text="HELP.runDetail.rerun">
+        <template #default="{ props }">
+          <span
+            v-bind="props"
+            class="d-inline-block"
+          >
+            <v-btn
+              data-test="rerun"
+              color="primary"
+              prepend-icon="mdi-refresh"
+              :disabled="rerunBlocked"
+              @click="openRerun"
+            >
+              再実行
+            </v-btn>
+          </span>
+        </template>
+      </HelpTip>
       <span
         v-if="rerunBlocked"
         data-test="rerun-blocked-reason"
@@ -416,6 +460,18 @@ watch(
       class="mb-4"
     >
       {{ pageError }}
+    </v-alert>
+
+    <!-- 取得失敗があると配布を見送るため、配られなかった理由をここで伝える（#1006） -->
+    <v-alert
+      v-if="run?.distribute_note"
+      data-test="distribute-note"
+      type="warning"
+      variant="tonal"
+      density="compact"
+      class="mb-4"
+    >
+      {{ run.distribute_note }}
     </v-alert>
 
     <v-card
@@ -472,9 +528,16 @@ watch(
               :key="item.key"
               data-test="summary-item"
             >
-              <div class="text-caption text-medium-emphasis">
-                {{ item.label }}
-              </div>
+              <HelpTip :text="HELP.summary[item.key]">
+                <template #default="{ props }">
+                  <div
+                    v-bind="props"
+                    class="text-caption text-medium-emphasis d-inline-block"
+                  >
+                    {{ item.label }}
+                  </div>
+                </template>
+              </HelpTip>
               <div class="text-h6">
                 {{ formatCount(result.summary[item.key]) }}
               </div>
@@ -485,11 +548,18 @@ watch(
             data-test="closing-period"
             class="text-body-2"
           >
-            <span class="text-medium-emphasis me-2">課金対象期間</span>
+            <HelpTip :text="HELP.runDetail.closingPeriod">
+              <template #default="{ props }">
+                <span
+                  v-bind="props"
+                  class="text-medium-emphasis me-2"
+                >課金対象期間</span>
+              </template>
+            </HelpTip>
             {{ periodLabel(result.closing_period) }}
             <span class="text-medium-emphasis ms-2">
               （締め日時: 毎月 {{ result.closing_period.cutoff_day }} 日
-              {{ result.closing_period.cutoff_time }}・受信日時基準・JST）
+              {{ result.closing_period.cutoff_time }}・観測データの日時基準・JST）
             </span>
           </div>
         </v-card-text>
@@ -509,28 +579,45 @@ watch(
             variant="outlined"
             divided
           >
-            <v-btn
+            <HelpTip
               v-for="filter in JUDGEMENT_FILTERS"
               :key="filter.value"
-              :value="filter.value"
+              :text="HELP.runDetail.judgementFilter"
             >
-              {{ filter.label }}
-            </v-btn>
+              <template #default="{ props }">
+                <v-btn
+                  v-bind="props"
+                  :value="filter.value"
+                >
+                  {{ filter.label }}
+                </v-btn>
+              </template>
+            </HelpTip>
           </v-btn-toggle>
-          <v-checkbox
-            v-model="reviewOnly"
-            data-test="review-only"
-            label="要確認のみ"
-            density="compact"
-            hide-details
-          />
-          <v-checkbox
-            v-model="boundaryOnly"
-            data-test="boundary-only"
-            label="境界日のみ受信"
-            density="compact"
-            hide-details
-          />
+          <HelpTip :text="HELP.runDetail.reviewOnly">
+            <template #default="{ props }">
+              <v-checkbox
+                v-bind="props"
+                v-model="reviewOnly"
+                data-test="review-only"
+                label="要確認のみ"
+                density="compact"
+                hide-details
+              />
+            </template>
+          </HelpTip>
+          <HelpTip :text="HELP.runDetail.boundaryOnly">
+            <template #default="{ props }">
+              <v-checkbox
+                v-bind="props"
+                v-model="boundaryOnly"
+                data-test="boundary-only"
+                label="境界日のみ受信"
+                density="compact"
+                hide-details
+              />
+            </template>
+          </HelpTip>
         </v-card-text>
       </v-card>
 
@@ -549,17 +636,38 @@ watch(
           data-test="judgement-legend"
           class="d-flex flex-wrap ga-4 px-4"
         >
-          <span
+          <HelpTip
             v-for="item in LEGEND"
-            :key="item.judgement"
-            class="d-inline-flex align-center ga-2 text-caption"
+            :key="item"
+            :text="HELP.judgement[item]"
           >
-            <span
-              class="legend-swatch"
-              :style="legendStyle(item.judgement)"
-            />
-            {{ JUDGEMENT_LABELS[item.judgement] }}
-          </span>
+            <template #default="{ props }">
+              <span
+                v-bind="props"
+                class="d-inline-flex align-center ga-2 text-caption"
+              >
+                <span
+                  class="legend-swatch"
+                  :style="legendStyle(item)"
+                />
+                {{ JUDGEMENT_LABELS[item] }}
+              </span>
+            </template>
+          </HelpTip>
+          <HelpTip :text="HELP.tenantExcluded">
+            <template #default="{ props }">
+              <span
+                v-bind="props"
+                class="d-inline-flex align-center ga-2 text-caption"
+              >
+                <span
+                  class="legend-swatch"
+                  :style="tenantLegendStyle"
+                />
+                {{ TENANT_LEGEND_LABEL }}
+              </span>
+            </template>
+          </HelpTip>
         </div>
         <v-expansion-panels
           variant="accordion"
@@ -576,10 +684,11 @@ watch(
               <ul class="text-body-2 ps-5 mb-2">
                 <li
                   v-for="item in LEGEND"
-                  :key="item.judgement"
+                  :key="item"
                 >
-                  {{ JUDGEMENT_LABELS[item.judgement] }}: {{ item.description }}
+                  {{ JUDGEMENT_LABELS[item] }}: {{ HELP.judgement[item] }}
                 </li>
+                <li>{{ TENANT_LEGEND_LABEL }}: {{ HELP.tenantExcluded }}</li>
               </ul>
               <div class="text-body-2 font-weight-medium">
                 要確認
@@ -637,18 +746,25 @@ watch(
               v-for="node in tree"
               :key="node.tenant.tenant_cd"
             >
-              <tr data-test="tenant-row">
-                <td
-                  colspan="10"
-                  class="bg-grey-lighten-4"
-                >
+              <tr
+                data-test="tenant-row"
+                class="tenant-row"
+                :class="{ 'tenant-row--excluded': demoTenant(node.tenant) }"
+                :style="tenantRowStyle"
+              >
+                <td colspan="10">
                   <span class="font-weight-bold">
                     ■ {{ node.tenant.tenant_cd }} {{ node.tenant.tenant_name }}
                   </span>
-                  <span
-                    class="retention-badge ms-2"
-                    :style="retentionStyle(node.tenant.retention_period)"
-                  >{{ retentionLabel(node.tenant.retention_period) }}</span>
+                  <HelpTip :text="HELP.runDetail.retention">
+                    <template #default="{ props }">
+                      <span
+                        v-bind="props"
+                        class="retention-badge ms-2"
+                        :style="retentionStyle(node.tenant.retention_period)"
+                      >{{ retentionLabel(node.tenant.retention_period) }}</span>
+                    </template>
+                  </HelpTip>
                   <span class="ms-2 text-body-2">
                     課金 {{ formatCount(node.tenant.counts.billable) }} 地点 ｜ 小計
                     <span class="font-weight-bold">{{ formatYen(node.tenant.subtotal) }}</span>
@@ -657,6 +773,13 @@ watch(
                     v-if="node.tenant.status === 'failed'"
                     class="ms-2 text-body-2 text-error"
                   >取得失敗: {{ node.tenant.error }}</span>
+                  <div
+                    v-if="node.tenant.tenant_description"
+                    data-test="tenant-description"
+                    class="text-caption text-medium-emphasis"
+                  >
+                    {{ node.tenant.tenant_description }}
+                  </div>
                 </td>
               </tr>
               <template
@@ -756,7 +879,7 @@ watch(
             消えた地点
           </v-card-title>
           <v-card-subtitle>
-            前回 RUN にあり今回の地点一覧に無い地点です。金額には計上していません。
+            前月分の結果にあり今回の地点一覧に無い地点です。金額には計上していません。
           </v-card-subtitle>
         </v-card-item>
         <v-table density="comfortable">
@@ -806,7 +929,11 @@ watch(
       >
         <v-card-item>
           <v-card-title class="text-subtitle-1">
-            使用単価表
+            <HelpTip :text="HELP.runDetail.priceTable">
+              <template #default="{ props }">
+                <span v-bind="props">使用単価表</span>
+              </template>
+            </HelpTip>
           </v-card-title>
           <v-card-subtitle>
             {{ result.price_table.effective_from }} 適用版
@@ -880,26 +1007,36 @@ watch(
           >
             この月は既に集計済みです。結果を作り直すには「強制再実行」にチェックを入れてください。
           </v-alert>
-          <v-checkbox
-            v-model="rerunDistribute"
-            data-test="rerun-distribute"
-            label="メール・Slack へ配布する"
-            density="compact"
-            hide-details
-          />
+          <HelpTip :text="HELP.runDialog.distribute">
+            <template #default="{ props }">
+              <v-checkbox
+                v-bind="props"
+                v-model="rerunDistribute"
+                data-test="rerun-distribute"
+                label="メール・Slack へ配布する"
+                density="compact"
+                hide-details
+              />
+            </template>
+          </HelpTip>
           <div
             data-test="distribute-targets"
             class="text-caption text-medium-emphasis ms-10 mb-2"
           >
             {{ distributeTargets }}
           </div>
-          <v-checkbox
-            v-model="rerunForce"
-            data-test="rerun-force"
-            label="強制再実行（二重起動の防止を外す）"
-            density="compact"
-            hide-details
-          />
+          <HelpTip :text="HELP.runDialog.force">
+            <template #default="{ props }">
+              <v-checkbox
+                v-bind="props"
+                v-model="rerunForce"
+                data-test="rerun-force"
+                label="強制再実行（二重起動の防止を外す）"
+                density="compact"
+                hide-details
+              />
+            </template>
+          </HelpTip>
           <v-alert
             v-if="rerunForce"
             data-test="rerun-force-warning"
@@ -916,15 +1053,22 @@ watch(
             :month="month"
             :distribute="rerunDistribute"
           />
-          <v-checkbox
+          <HelpTip
             v-if="rerunDistribute"
-            v-model="distributeAck"
-            data-test="distribute-ack"
-            label="上の配布先へ送ることを確認しました"
-            density="compact"
-            hide-details
-            class="mt-2"
-          />
+            :text="HELP.runDialog.ack"
+          >
+            <template #default="{ props }">
+              <v-checkbox
+                v-bind="props"
+                v-model="distributeAck"
+                data-test="distribute-ack"
+                label="上の配布先へ送ることを確認しました"
+                density="compact"
+                hide-details
+                class="mt-2"
+              />
+            </template>
+          </HelpTip>
           <v-alert
             v-if="rerunError"
             data-test="rerun-error"
@@ -938,21 +1082,31 @@ watch(
         </v-card-text>
         <v-card-actions>
           <v-spacer />
-          <v-btn
-            data-test="rerun-cancel"
-            @click="rerunDialog = false"
-          >
-            キャンセル
-          </v-btn>
-          <v-btn
-            data-test="rerun-confirm"
-            :color="rerunDangerous ? 'error' : 'primary'"
-            variant="flat"
-            :disabled="!rerunConfirmed"
-            @click="rerun"
-          >
-            {{ rerunDangerous ? '本番へ配布して実行' : '実行' }}
-          </v-btn>
+          <HelpTip :text="HELP.runDialog.cancel">
+            <template #default="{ props }">
+              <v-btn
+                v-bind="props"
+                data-test="rerun-cancel"
+                @click="rerunDialog = false"
+              >
+                キャンセル
+              </v-btn>
+            </template>
+          </HelpTip>
+          <HelpTip :text="HELP.runDialog.submit">
+            <template #default="{ props }">
+              <v-btn
+                v-bind="props"
+                data-test="rerun-confirm"
+                :color="rerunDangerous ? 'error' : 'primary'"
+                variant="flat"
+                :disabled="!rerunConfirmed"
+                @click="rerun"
+              >
+                {{ rerunDangerous ? '本番へ配布して実行' : '実行' }}
+              </v-btn>
+            </template>
+          </HelpTip>
         </v-card-actions>
       </v-card>
     </v-dialog>
@@ -976,8 +1130,18 @@ watch(
   background-color: var(--row-fill);
 }
 
+/* テナント見出しは既定でグレー。デモテナントだけ Excel の除外色で塗る（設計 6.6） */
+.tenant-row > td {
+  background-color: rgba(0, 0, 0, 0.04);
+}
+
+.tenant-row--excluded > td {
+  background-color: var(--tenant-fill);
+}
+
 .missing-row {
   color: var(--row-text);
+  background-color: var(--row-fill);
 }
 
 /* 長い名前・備考で表全体が横に伸びるのを防ぐ（UI-03） */

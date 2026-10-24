@@ -53,6 +53,11 @@ def contains_any(text: str | None, keywords: list[str]) -> bool:
     return any(keyword and keyword.lower() in lowered for keyword in keywords)
 
 
+def is_tenant_excluded(tenant: dict, keywords: list[str]) -> bool:
+    """テナント説明欄が除外キーワードに一致するか（テナントごとデモ扱い。設計 2.2 / 7.3）。"""
+    return contains_any(tenant.get("tenant_description"), keywords)
+
+
 def boundary_only(first_seen: str | None, last_seen: str | None, period: ClosingPeriod) -> bool:
     """受信が課金対象期間の初日だけ、または最終日だけに収まっているか。"""
     if not first_seen or not last_seen:
@@ -77,7 +82,7 @@ def classify(
     device_cd = device["device_cd"]
     keywords = settings.get("exclude_keywords") or []
     device_description = device.get("device_description") or ""
-    excluded = contains_any(tenant.get("tenant_description"), keywords) or contains_any(device_description, keywords)
+    excluded = is_tenant_excluded(tenant, keywords) or contains_any(device_description, keywords)
 
     format_name = device.get("format_name") or ""
     if device_cd in camera_by_export:
@@ -130,7 +135,7 @@ def classify(
 def missing_devices(
     prev_result: dict | None, current_device_cds: set[str], failed_tenant_cds: frozenset[str] = frozenset()
 ) -> list[dict]:
-    """前回 RUN の `result.json` にあり今回の `device/list` に無い地点（設計 2.5 / 7.3）。
+    """前月分の結果（`result.json`）にあり今回の `device/list` に無い地点（設計 2.5 / 7.3）。
 
     今回取得に失敗したテナントは地点一覧そのものが不明なので差分から外す。撤去された
     のか取れなかったのか区別できず、撤去として並べると請求停止の誤判断につながる。

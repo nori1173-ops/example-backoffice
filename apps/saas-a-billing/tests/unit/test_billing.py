@@ -5,6 +5,7 @@ from saas_a_billing.billing import (
     boundary_only,
     classify,
     contains_any,
+    is_tenant_excluded,
     missing_devices,
     sort_devices,
     sort_tenants,
@@ -81,7 +82,7 @@ def make_judgement(**overrides) -> DeviceJudgement:
 
 
 def make_prev_result(*device_cds: str, month: str = "2026-09") -> dict:
-    """前回 RUN の `result.json`（`missing_devices` の入力）。"""
+    """前月分の結果の `result.json`（`missing_devices` の入力）。"""
     return {
         "month": month,
         "tenants": [
@@ -172,6 +173,34 @@ def test_exclusion_with_multiple_keywords():
     miss = judge(device=make_device(device_description="本番運用中"), settings=settings)
     assert hit.judgement == "excluded"
     assert miss.judgement == "billable"
+
+
+def test_is_tenant_excluded_from_tenant_description():
+    assert is_tenant_excluded(make_tenant(tenant_description="デモ用テナント"), ["デモ"]) is True
+
+
+def test_is_tenant_excluded_false_when_description_does_not_match():
+    assert is_tenant_excluded(make_tenant(tenant_description="本番運用"), ["デモ"]) is False
+
+
+def test_is_tenant_excluded_false_when_description_is_missing():
+    assert is_tenant_excluded(make_tenant(tenant_description=None), ["デモ"]) is False
+    assert is_tenant_excluded({}, ["デモ"]) is False
+
+
+def test_is_tenant_excluded_is_case_insensitive_partial_match():
+    assert is_tenant_excluded(make_tenant(tenant_description="DEMO tenant"), ["demo"]) is True
+    assert is_tenant_excluded(make_tenant(tenant_description="社内デモ用"), ["デモ"]) is True
+
+
+def test_is_tenant_excluded_ignores_device_description():
+    assert is_tenant_excluded(make_tenant(), ["デモ"]) is False
+
+
+def test_classify_uses_is_tenant_excluded():
+    tenant = make_tenant(tenant_description="デモ用テナント")
+    assert is_tenant_excluded(tenant, ["デモ"]) is True
+    assert judge(tenant=tenant).judgement == "excluded"
 
 
 def test_camera_by_export():

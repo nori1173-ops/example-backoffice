@@ -163,15 +163,15 @@ def test_user_pool_tier_is_lite(load_template):
     assert _user_pool_properties(template).get("UserPoolTier") == "LITE"
 
 
-def test_user_pool_mfa_is_required_totp_only(load_template):
-    """MFA は TOTP のみ・必須（計画 R2 / SEC-02）。SMS は一度有効化すると無効化できない。
+def test_user_pool_mfa_is_optional_totp_only(load_template):
+    """MFA は任意（OPTIONAL）で TOTP のみ。SMS は一度有効化すると無効化できない。
 
-    パスワード 1 要素では `cognito-idp` エンドポイントが社外から到達できるため、
-    dev / prod とも `ON` にする（prod は新規 User Pool なので既存ユーザーの締め出しも無い）。
+    ref-project-a と同等の認証に合わせる。パスワード + CloudFront の社内 IP 制限
+    + Pre sign-up による @example.co.jp 限定で運用し、認証アプリの登録は利用者の任意とする。
     """
     template = _load_or_skip(load_template)
     properties = _user_pool_properties(template)
-    assert properties.get("MfaConfiguration") == "ON"
+    assert properties.get("MfaConfiguration") == "OPTIONAL"
     assert properties.get("EnabledMfas") == ["SOFTWARE_TOKEN_MFA"]
     assert "SmsConfiguration" not in properties
     assert "SmsAuthenticationMessage" not in properties

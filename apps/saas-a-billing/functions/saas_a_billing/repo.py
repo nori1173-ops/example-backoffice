@@ -41,9 +41,18 @@ TARGET_ENVS = ("verification", "production")
 DEFAULT_TARGET_ENV = TARGET_ENVS[0]
 DEFAULT_PRICE_EFFECTIVE_FROM = "2025-09-01"
 RUN_LIST_LIMIT = 24
-AUDIT_LIST_LIMIT = 50
+# 実行中判定は表示上限と無関係にパーティション全件を見る。24 か月を超えて運用したあと
+# 古い月を再集計している最中の RUN を取りこぼすと、二重 RUN がそのまま再発する（#1006）
+ACTIVE_RUN_SCAN_LIMIT = None
+AUDIT_TARGET_SETTINGS = "settings"
+AUDIT_TARGET_PRICE = "price"
+AUDIT_TARGET_RUN = "run"
+AUDIT_TARGETS = (AUDIT_TARGET_SETTINGS, AUDIT_TARGET_PRICE, AUDIT_TARGET_RUN)
+AUDIT_LIST_LIMIT = 100
+AUDIT_LIST_MAX = 200
 REQUEST_HISTORY_LIMIT = 20
 REQUEST_HISTORY = "request_history"
+DISTRIBUTED_COUNT = "distributed_count"
 SYSTEM_ACTOR = "system"
 
 QUEUED = "queued"
@@ -55,6 +64,8 @@ ACTIVE_STATUSES = (QUEUED, RUNNING)
 DONE_STATUSES = (SUCCEEDED, DISTRIBUTED)
 
 TOKEN_ATTRIBUTES = ("api_token", "token_expires_at")
+# `distributed_count` は attempt を跨いで数え、`distributed_started_at` は締め後の配布済みの
+# 印として後の attempt が失敗しても残すため、ここには入れない（#1013 / #1015）
 PREVIOUS_ATTEMPT_ATTRIBUTES = ("error", "finished_at", "execution_arn", "summary", *TOKEN_ATTRIBUTES)
 DISTRIBUTION_TOGGLES = ("mail_enabled", "slack_enabled")
 
@@ -185,8 +196,20 @@ def _set_expression(values: dict) -> tuple[str, dict, dict]:
     return expression, names, attribute_values
 
 
-def _query(key_condition: str, names: dict, values: dict, *, limit: int | None = None) -> list[dict]:
-    """`ScanIndexForward=False` の Query。`limit` 件に達するまでページを辿る。"""
+def _query(
+    key_condition: str,
+    names: dict,
+    values: dict,
+    *,
+    limit: int | None = None,
+    filter_expression: str | None = None,
+) -> list[dict]:
+    """`ScanIndexForward=False` の Query。`limit` 件に達するまでページを辿る。
+
+    `Limit` はフィルタより先に効く。`filter_expression` があるときに残り件数を `Limit` に
+    入れると、`limit` に近づくほど 1 ページの走査幅が 1 まで縮んで往復が線形に増えるため、
+    `Limit` は送らず 1 ページ 1MB に任せ、集まった分を最後に `limit` 件へ切る。
+    """
     if limit is not None and limit <= 0:
         return []
     items: list[dict] = []
@@ -199,7 +222,9 @@ def _query(key_condition: str, names: dict, values: dict, *, limit: int | None =
             "ExpressionAttributeValues": values,
             "ScanIndexForward": False,
         }
-        if limit is not None:
+        if filter_expression is not None:
+            request["FilterExpression"] = filter_expression
+        if limit is not None and filter_expression is None:
             request["Limit"] = limit - len(items)
         if start_key is not None:
             request["ExclusiveStartKey"] = start_key
@@ -211,7 +236,7 @@ def _query(key_condition: str, names: dict, values: dict, *, limit: int | None =
     return items[:limit] if limit is not None else items
 
 
-def _audit_item(target: str, actor: str, actor_email: str, before: dict, after: dict, at: str) -> dict:
+def _audit_item(target: str, actor: str, actor_email: str, before: dict | None, after: dict, at: str) -> dict:
     values = {
         "target": target,
         "actor": actor,
@@ -245,13 +270,13 @@ def _default_settings(actor: str, now: datetime) -> dict:
         "target_env": target_env(),
         "cutoff_day": 20,
         "cutoff_time": "24:00",
-        "auto_retry_days": 5,
         "auto_run_enabled": False,
         "auto_run_from_month": _as_jst(now).strftime("%Y-%m"),
         "mail_enabled": False,
         "slack_enabled": False,
         "mail_to": ["devA@example.co.jp"],
         "mail_cc": [],
+        "mail_attachment_sheets": "billing_only",
         "slack_channel_id": "",
         "slack_channel_label": "#proj-saas-a-billing",
         "slack_mention": "",
@@ -266,8 +291,13 @@ def _default_settings(actor: str, now: datetime) -> dict:
 
 
 def _normalized(settings: dict) -> dict:
-    """読み出し時の正規化。配布トグルを False で補い、集計対象環境を固定値に上書きする。"""
-    return {**dict.fromkeys(DISTRIBUTION_TOGGLES, False), **settings, "target_env": target_env()}
+    """配布トグル・メール添付の既定値を補い、集計対象環境を固定値に上書きする。"""
+    return {
+        **dict.fromkeys(DISTRIBUTION_TOGGLES, False),
+        "mail_attachment_sheets": "billing_only",
+        **settings,
+        "target_env": target_env(),
+    }
 
 
 def get_settings() -> dict:
@@ -327,7 +357,7 @@ def put_settings(new: dict, expected_version: int, actor: str, actor_email: str)
                 {
                     "Put": {
                         "TableName": _table_name(),
-                        "Item": _audit_item("settings", actor, actor_email, current, stored, _iso(now)),
+                        "Item": _audit_item(AUDIT_TARGET_SETTINGS, actor, actor_email, current, stored, _iso(now)),
                     }
                 },
             ]
@@ -396,7 +426,7 @@ def put_price(item: dict, actor: str, actor_email: str) -> dict:
                 {
                     "Put": {
                         "TableName": _table_name(),
-                        "Item": _audit_item("price", actor, actor_email, {}, stored, _iso(now)),
+                        "Item": _audit_item(AUDIT_TARGET_PRICE, actor, actor_email, {}, stored, _iso(now)),
                     }
                 },
             ]
@@ -444,7 +474,7 @@ def list_runs(target_env: str | None = None, limit: int = RUN_LIST_LIMIT) -> lis
     return runs[:limit]
 
 
-def _list_runs_of(target_env: str, limit: int) -> list[dict]:
+def _list_runs_of(target_env: str, limit: int | None) -> list[dict]:
     items = _query(
         "#pk = :pk",
         {"#pk": "PK"},
@@ -454,12 +484,27 @@ def _list_runs_of(target_env: str, limit: int) -> list[dict]:
     return [_values(item, month=item["SK"]["S"]) for item in items]
 
 
+def active_runs(target_env: str, now: datetime) -> list[dict]:
+    """同じ集計環境で走っている RUN を月昇順で返す（設計 6.2）。
+
+    SaaS_A の管理 API は 1 ユーザー 1 トークンで、後発の `Init` のログインが先発の
+    トークンを無効化する。重ねて走らせないための判定に使う。stale な RUN は
+    `acquire_run` が奪えるため、ここでも走っていないものとして扱う。
+
+    走査は `ACTIVE_RUN_SCAN_LIMIT`（全件）で、一覧表示の `RUN_LIST_LIMIT` とは切り離す。
+    パーティションは月数分（高々数十件）なので Query 1〜2 回で収まる。
+    """
+    runs = [run for run in _list_runs_of(target_env, ACTIVE_RUN_SCAN_LIMIT) if run.get("status") in ACTIVE_STATUSES]
+    return sorted((run for run in runs if not is_stale(run, now)), key=lambda run: run["month"])
+
+
 def acquire_run(
     target_env: str,
     month: str,
     *,
     trigger: str,
     force: bool,
+    guard_active: bool = False,
     run_token: str,
     requested_by: str | None = None,
     requested_by_email: str | None = None,
@@ -471,8 +516,12 @@ def acquire_run(
     再取得では前回 attempt の残留属性（`PREVIOUS_ATTEMPT_ATTRIBUTES`）を REMOVE する。
     特に `api_token` を新しい attempt へ持ち越さない。`REQUEST_HISTORY` は上書きせず
     追記し、直近 `REQUEST_HISTORY_LIMIT` 件を残す（SEC-10 / 計画 R8）。
+
+    `guard_active` は `force` と併用したときだけ効き、「実行中（stale でない
+    `queued` / `running`）の RUN は奪わない」条件を残す。成功済みを奪いたいだけの
+    スケジュール実行が使う（#1013）。手動の `force` は刺さった RUN を取り直す用途が
+    あるため無条件のままにする（設計 14.3）。
     """
-    scheduled = trigger == "scheduled"
     values = {
         "target_env": target_env,
         "status": QUEUED,
@@ -483,12 +532,10 @@ def acquire_run(
         "distribute": bool(distribute),
         "force": bool(force),
         "started_at": _iso(_now()),
-        "retry_alert_sent": False,
     }
     created = {
         **values,
         "attempt": 1,
-        "auto_attempts": 1 if scheduled else 0,
         REQUEST_HISTORY: [_request_entry(values)],
     }
     try:
@@ -502,7 +549,14 @@ def acquire_run(
             raise
     else:
         return {**created, "month": month}
-    return _reacquire_run(target_env, month, values, scheduled=scheduled, force=force, stale_before=stale_before)
+    return _reacquire_run(
+        target_env,
+        month,
+        values,
+        force=force,
+        guard_active=guard_active,
+        stale_before=stale_before,
+    )
 
 
 def _request_entry(values: dict) -> dict:
@@ -547,8 +601,8 @@ def _reacquire_run(
     month: str,
     values: dict,
     *,
-    scheduled: bool,
     force: bool,
+    guard_active: bool = False,
     stale_before: datetime,
 ) -> dict:
     expression, names, attribute_values = _set_expression(values)
@@ -561,9 +615,6 @@ def _reacquire_run(
     counters.append(
         f"#{REQUEST_HISTORY} = list_append(if_not_exists(#{REQUEST_HISTORY}, :cond_empty_list), :{REQUEST_HISTORY})"
     )
-    if scheduled:
-        counters.append("#auto_attempts = if_not_exists(#auto_attempts, :cond_zero) + :cond_one")
-        names.update(_names("auto_attempts"))
     names.update(_names(*PREVIOUS_ATTEMPT_ATTRIBUTES))
     removes = ", ".join(f"#{name}" for name in PREVIOUS_ATTEMPT_ATTRIBUTES)
     request = {
@@ -582,6 +633,15 @@ def _reacquire_run(
         attribute_values[":cond_stale"] = to_dynamo(_iso(stale_before))
         request["ConditionExpression"] = (
             "#status = :cond_failed OR (#status IN (:cond_queued, :cond_running) AND #started_at < :cond_stale)"
+        )
+    elif guard_active:
+        names.update(_names("started_at"))
+        attribute_values[":cond_succeeded"] = to_dynamo(SUCCEEDED)
+        attribute_values[":cond_distributed"] = to_dynamo(DISTRIBUTED)
+        attribute_values[":cond_failed"] = to_dynamo(FAILED)
+        attribute_values[":cond_stale"] = to_dynamo(_iso(stale_before))
+        request["ConditionExpression"] = (
+            "#status IN (:cond_succeeded, :cond_distributed, :cond_failed) OR #started_at < :cond_stale"
         )
     try:
         response = _client().update_item(**request)
@@ -616,8 +676,13 @@ def _update_run(
     *,
     removes: tuple[str, ...] = (),
     adds: dict | None = None,
+    copies: dict | None = None,
 ) -> None:
     expression, names, attribute_values = _set_expression(values) if values else ("", {}, {})
+    if copies:
+        names.update(_names(*copies, *copies.values()))
+        assignments = ", ".join(f"#{name} = #{source}" for name, source in copies.items())
+        expression = f"{expression}, {assignments}" if expression else f"SET {assignments}"
     if adds:
         names.update(_names(*adds))
         attribute_values.update({f":{name}": to_dynamo(value) for name, value in adds.items()})
@@ -745,7 +810,15 @@ def finish_distributed(
     notify_channels: list[str],
     distribute_note: str,
 ) -> None:
-    """`succeeded` → `distributed`。共通 notify への投函結果を記録する。"""
+    """`succeeded` → `distributed`。共通 notify への投函結果を記録する。
+
+    `distributed_count` は「この月を何回 Excel を配ったか」で、attempt とは別に数える
+    （#1013）。件名の再送表記の根拠に使う。配布見送りの連絡（`set_distribute_note`）は
+    Excel を配っていないので数えない。
+
+    配布した attempt の `started_at` を `distributed_started_at` に写す。スケジュール実行
+    が「締め後に配布済みの月」を見分ける根拠で、後の attempt が失敗しても残す（#1015）。
+    """
     _update_run(
         target_env,
         month,
@@ -757,12 +830,34 @@ def finish_distributed(
             "distribute_note": distribute_note,
         },
         _attempt_condition(attempt, SUCCEEDED),
+        adds={DISTRIBUTED_COUNT: 1},
+        copies={"distributed_started_at": "started_at"},
     )
 
 
-def set_distribute_note(target_env: str, month: str, attempt: int, note: str) -> None:
-    """配布しなかった理由を記録する。状態は `succeeded` のままにする（設計 6.8）。"""
-    _update_run(target_env, month, {"distribute_note": note}, _attempt_condition(attempt, SUCCEEDED))
+def set_distribute_note(
+    target_env: str,
+    month: str,
+    attempt: int,
+    note: str,
+    *,
+    notify_message_id: str | None = None,
+    notify_channels: list[str] | None = None,
+) -> None:
+    """配布しなかった理由を記録する。状態は `succeeded` のままにする（設計 6.8）。
+
+    配布は見送っても通知を投函した場合は、その結果も残す（#1006）。`distributed` には
+    しないが「見送りを知らせたか」は画面と実行履歴から追えるようにする。Excel は配って
+    いないので `distributed_count` は進めない（#1013）。
+    """
+    values = {"distribute_note": note}
+    if notify_message_id is not None:
+        values |= {
+            "notified_at": _iso(_now()),
+            "notify_message_id": notify_message_id,
+            "notify_channels": notify_channels or [],
+        }
+    _update_run(target_env, month, values, _attempt_condition(attempt, SUCCEEDED))
 
 
 def set_notify_error(target_env: str, month: str, attempt: int, error: str) -> None:
@@ -781,14 +876,47 @@ def finish_failed(target_env: str, month: str, attempt: int, error: str) -> None
     )
 
 
-def mark_retry_alert_sent(target_env: str, month: str) -> None:
-    """自動再実行の上限到達アラームを送ったことを記録する（二重送信の防止）。"""
-    _update_run(target_env, month, {"retry_alert_sent": True}, ("attribute_exists(PK)", {}, {}))
+def distribution_no(run: dict) -> int:
+    """RUN を今から配ると何回目の配布になるか（1 始まり。#1013）。
+
+    カウンタを持たない既存の RUN は 0 回配布済みとして扱う。
+    """
+    return int(run.get(DISTRIBUTED_COUNT) or 0) + 1
 
 
-def list_audits(limit: int = AUDIT_LIST_LIMIT) -> list[dict]:
-    """監査アイテムを新しい順に最大 `limit` 件返す。"""
-    items = _query("#pk = :pk", {"#pk": "PK"}, {":pk": to_dynamo(AUDIT_PK)}, limit=limit)
+def put_run_audit(actor: str, actor_email: str, after: dict, at: datetime) -> None:
+    """受理した手動実行を監査に残す。設定・単価と違い他の書き込みと束ねない単発の Put。
+
+    時刻の整形は設定・単価と同じ `_iso` に閉じる。SK は `at` で始まり `since` の範囲条件も
+    文字列比較なので、呼び出し側の書式（UTC 表記など）で並び順が変わってはいけない。
+    """
+    _client().put_item(
+        TableName=_table_name(),
+        Item=_audit_item(AUDIT_TARGET_RUN, actor, actor_email, None, after, _iso(at)),
+    )
+
+
+def list_audits(limit: int = AUDIT_LIST_LIMIT, *, target: str | None = None, since: str | None = None) -> list[dict]:
+    """監査アイテムを新しい順に最大 `limit` 件返す。
+
+    `since` は SK の先頭が保存時刻であることを使って範囲条件で絞る。保存側は JST の
+    ISO なので、`Z` 表記で渡されても同じ表記へ直してから比べる（文字列比較のため）。
+    `target` は FilterExpression で、Query の `Limit` より後に効く（`_query` が
+    `limit` 件そろうまでページを辿る）。
+    """
+    key_condition = "#pk = :pk"
+    names = {"#pk": "PK"}
+    values = {":pk": to_dynamo(AUDIT_PK)}
+    if since is not None:
+        key_condition += " AND #sk >= :since"
+        names["#sk"] = "SK"
+        values[":since"] = to_dynamo(_iso(datetime.fromisoformat(since)))
+    filter_expression = None
+    if target is not None:
+        filter_expression = "#target = :target"
+        names["#target"] = "target"
+        values[":target"] = to_dynamo(target)
+    items = _query(key_condition, names, values, limit=limit, filter_expression=filter_expression)
     return [_values(item) for item in items]
 
 

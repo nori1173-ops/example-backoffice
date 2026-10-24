@@ -18,6 +18,7 @@ from saas_a_billing.excel import (
     TOTAL_LABEL,
     build_workbook,
     column_width,
+    footnote_lines,
     spec_block_lines,
 )
 
@@ -144,6 +145,16 @@ def test_spec_block_display_period_ends_at_23_59_59(result):
     period_line = spec_block_lines(result)[3]
     assert "2026/09/21 00:00:00 〜 2026/10/20 23:59:59" in period_line
     assert "2026/10/21" not in period_line
+
+
+def test_spec_block_period_is_based_on_observation_datetime(result):
+    assert spec_block_lines(result)[3].endswith("に受信データがある地点を課金対象とする（観測データの日時基準・JST）")
+
+
+def test_spec_block_exclusion_is_judged_at_aggregation_time(result):
+    exclusion = spec_block_lines(result)[4]
+    assert exclusion.startswith("除外: テナント説明欄または地点備考欄に「デモ」")
+    assert exclusion.endswith("を含む地点は課金対象外（集計を実行した時点の内容で判定）")
 
 
 def test_spec_block_lists_failed_tenants_in_red_when_present(result, sheet1):
@@ -345,11 +356,33 @@ def test_price_table_used_is_printed(sheet1):
     assert (at(sheet1, camera, 1).value, at(sheet1, camera, 2).value) == (1800, 1400)
 
 
-def test_footnotes_present(sheet1):
+def test_footnotes_present(result, sheet1):
     start = find_row(sheet1, "脚注")
-    notes = "\n".join(str(at(sheet1, start + offset, 0).value) for offset in range(1, 7))
+    count = len(footnote_lines(result))
+    notes = "\n".join(str(at(sheet1, start + offset, 0).value) for offset in range(1, count + 1))
     for keyword in ("通信なし", "0 円", "課金対象外", "「デモ」", "日割り", "境界日のみ受信", "消えた地点"):
         assert keyword in notes
+
+
+def test_footnote_on_deleted_devices_compares_with_previous_month(result):
+    notes = footnote_lines(result)
+    assert (
+        "・集計を実行するまでに削除された地点は地点一覧に現れない。前月分の結果との差分を"
+        "「消えた地点」としてシート2に列挙する（金額は計上しない）"
+    ) in notes
+
+
+def test_footnotes_explain_camera_then_provisional_price_after_retention(result):
+    notes = footnote_lines(result)
+    retention = next(index for index, line in enumerate(notes) if line.startswith("・保存期間が 1 年 / 3 年以外"))
+    assert notes[retention + 1] == (
+        "・カメラ地点: 課金対象期間の受信データに「Base64形式データ」の列がある地点、"
+        "または設定の「カメラ扱いフォーマット名」に一致する地点にカメラ単価を適用する（項目数は見ない）"
+    )
+    assert notes[retention + 2] == (
+        "・カメラ地点以外で、項目数が単価表の上限帯を超える地点は上限帯の仮単価で計算し、"
+        "項目数が 0 の地点は 0 円とする。どちらも赤字で要確認を付ける"
+    )
 
 
 def test_column_width_counts_fullwidth_as_two():

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { billingApi } from '../api'
-import type { AuditEntry, PriceTable, PriceVersion, SettingsView } from '../types'
+import type { PriceTable, PriceVersion, SettingsView, SlackDirectory } from '../types'
 import { useSettingsStore } from '../stores/settings'
 
 vi.mock('../api', () => ({
@@ -10,22 +10,30 @@ vi.mock('../api', () => ({
     updateSettings: vi.fn(),
     listPrices: vi.fn(),
     createPrice: vi.fn(),
-    listAudits: vi.fn(),
+    getSlackDirectory: vi.fn(),
   },
 }))
+
+function makeDirectory(): SlackDirectory {
+  return {
+    channels: [{ id: 'C0123ABCD', name: 'proj-saas-a-billing', is_private: false, is_member: false }],
+    users: [{ id: 'U0000DEVA1', handle: 'devA', real_name: 'DevA', display_name: '開発者本人' }],
+    fetched_at: '2026-09-04T02:30:00Z',
+  }
+}
 
 function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
   return {
     target_env: 'verification',
     cutoff_day: 20,
     cutoff_time: '24:00',
-    auto_retry_days: 5,
     auto_run_enabled: false,
     auto_run_from_month: '2026-10',
     mail_enabled: false,
     slack_enabled: false,
     mail_to: ['devA@example.co.jp'],
     mail_cc: [],
+    mail_attachment_sheets: 'billing_only',
     slack_channel_id: 'C0123ABCD',
     slack_channel_label: '#proj-saas-a-billing',
     slack_mention: '',
@@ -66,18 +74,6 @@ function makePriceVersion(overrides: Partial<PriceVersion> = {}): PriceVersion {
   }
 }
 
-function makeAudit(overrides: Partial<AuditEntry> = {}): AuditEntry {
-  return {
-    target: 'settings',
-    actor: 'sub',
-    actor_email: 'devA@example.co.jp',
-    before: { cutoff_day: 20 },
-    after: { cutoff_day: 25 },
-    at: '2026-11-01T10:00:00+09:00',
-    ...overrides,
-  }
-}
-
 function rejectWith(status: number, code?: string): unknown {
   return {
     response: {
@@ -96,7 +92,7 @@ beforeEach(() => {
     current: makePriceVersion(),
   })
   vi.mocked(billingApi.createPrice).mockResolvedValue(makePriceVersion())
-  vi.mocked(billingApi.listAudits).mockResolvedValue([])
+  vi.mocked(billingApi.getSlackDirectory).mockResolvedValue(makeDirectory())
 })
 
 afterEach(() => {
@@ -167,6 +163,38 @@ describe('settings ストア', () => {
     expect(store.loading).toBe(false)
   })
 
+  it('loadSlackDirectory が候補を取る', async () => {
+    const store = useSettingsStore()
+
+    await store.loadSlackDirectory()
+
+    expect(billingApi.getSlackDirectory).toHaveBeenCalledWith(false)
+    expect(store.directory?.channels).toHaveLength(1)
+    expect(store.directory?.users[0].display_name).toBe('開発者本人')
+    expect(store.directoryError).toBeNull()
+    expect(store.directoryLoading).toBe(false)
+  })
+
+  it('loadSlackDirectory(true) が再取得を頼む', async () => {
+    const store = useSettingsStore()
+
+    await store.loadSlackDirectory(true)
+
+    expect(billingApi.getSlackDirectory).toHaveBeenCalledWith(true)
+  })
+
+  // 候補が無くても設定は保存できる。取得失敗は例外にせず理由だけ持つ（#1011）
+  it('候補の取得に失敗しても例外にせず理由を持つ', async () => {
+    vi.mocked(billingApi.getSlackDirectory).mockRejectedValue(rejectWith(503, 'SLACK_NOT_CONFIGURED'))
+    const store = useSettingsStore()
+
+    await store.loadSlackDirectory()
+
+    expect(store.directory).toBeNull()
+    expect(store.directoryError).toBe('サーバからのメッセージ')
+    expect(store.directoryLoading).toBe(false)
+  })
+
   it('addPrice が effective_from と bands を送る', async () => {
     const store = useSettingsStore()
     const price = makePriceTable({ effective_from: '2026-05-01' })
@@ -178,26 +206,39 @@ describe('settings ストア', () => {
     expect(vi.mocked(billingApi.createPrice).mock.calls[0][0].bands).toHaveLength(2)
     expect(billingApi.listPrices).toHaveBeenCalledTimes(1)
   })
+})
 
-  it('fetchAudits が GET /audits を呼び audits に入る', async () => {
-    const entries = [makeAudit(), makeAudit({ at: '2026-10-01T10:00:00+09:00' })]
-    vi.mocked(billingApi.listAudits).mockResolvedValue(entries)
+
+describe('メール添付のシート範囲', () => {
+  it('旧サーバーの応答はシート 1 のみで補完する', async () => {
+    const legacy = makeSettings()
+    Reflect.deleteProperty(legacy, 'mail_attachment_sheets')
+    vi.mocked(billingApi.getSettings).mockResolvedValue(legacy)
     const store = useSettingsStore()
-
-    await store.fetchAudits()
-
-    expect(billingApi.listAudits).toHaveBeenCalledTimes(1)
-    expect(store.audits).toEqual(entries)
-    expect(store.error).toBeNull()
+    await store.fetch()
+    expect(store.settings?.mail_attachment_sheets).toBe('billing_only')
   })
 
-  it('fetchAudits が 403 でも例外にせず audits が空のまま', async () => {
-    vi.mocked(billingApi.listAudits).mockRejectedValue(rejectWith(403))
+  it.each([null, '', 'billing-only', 'BILLING_ONLY', 123])(
+    '不正な値 %s はシート 1 のみで補完する',
+    async (value) => {
+      const invalid = makeSettings()
+      Reflect.set(invalid, 'mail_attachment_sheets', value)
+      vi.mocked(billingApi.getSettings).mockResolvedValue(invalid)
+      const store = useSettingsStore()
+
+      await store.fetch()
+
+      expect(store.settings?.mail_attachment_sheets).toBe('billing_only')
+    },
+  )
+
+  it.each(['billing_only', 'all'] as const)('%s を保存して再取得する', async (value) => {
     const store = useSettingsStore()
-
-    await expect(store.fetchAudits()).resolves.toBeUndefined()
-
-    expect(store.audits).toEqual([])
-    expect(store.error).toBeNull()
+    await store.fetch()
+    vi.mocked(billingApi.getSettings).mockResolvedValue(makeSettings({ mail_attachment_sheets: value }))
+    expect(await store.save({ mail_attachment_sheets: value })).toBe(true)
+    expect(billingApi.updateSettings).toHaveBeenCalledWith({ mail_attachment_sheets: value, version: 3 })
+    expect(store.settings?.mail_attachment_sheets).toBe(value)
   })
 })

@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onActivated, onDeactivated, onUnmounted, ref } from 'vue'
 import { DASH, formatCount, formatDate, formatDateTime, formatYen } from '@/utils/format'
+import HelpTip from '@/components/HelpTip.vue'
 import { billingApi } from '../api'
 import EnvBadge from '../components/EnvBadge.vue'
 import RunDialog from '../components/RunDialog.vue'
 import StatusChip from '../components/StatusChip.vue'
+import TriggerChip from '../components/TriggerChip.vue'
+import { HELP } from '../help'
 import { runKey, useRunsStore } from '../stores/runs'
-import type { RunStatus, RunSummary, SettingsView } from '../types'
+import type { BillingSummary, RunStatus, RunSummary, SettingsView } from '../types'
 
 const AUTO_RUN_HOUR = 6
 const MAX_MONTHS_AHEAD = 24
@@ -16,6 +19,16 @@ const DOWNLOAD_BLOCKED_REASON = '成功・配布済みの月のみ'
 /** 自動実行や他の人が起こした RUN も進むように、実行中の間だけ一覧を取り直す（UI-04）。 */
 const ACTIVE_STATUSES: readonly RunStatus[] = ['queued', 'running']
 const POLL_INTERVAL_MS = 10_000
+/** 内訳カウント列。説明は月次内訳の件数タイルと共用する（#1012）。 */
+const COUNT_COLUMNS: readonly { key: keyof BillingSummary; label: string }[] = [
+  { key: 'tenant_count', label: 'テナント数' },
+  { key: 'device_count', label: '地点数' },
+  { key: 'no_data_count', label: '通信なし' },
+  { key: 'excluded_count', label: '除外' },
+  { key: 'review_count', label: '要確認' },
+  { key: 'failed_tenant_count', label: '取得失敗' },
+  { key: 'missing_count', label: '消えた地点' },
+]
 
 const store = useRunsStore()
 const settings = ref<SettingsView | null>(null)
@@ -150,22 +163,33 @@ onUnmounted(stopPolling)
         </p>
       </div>
       <v-spacer />
-      <v-btn
-        data-test="refresh"
-        variant="text"
-        prepend-icon="mdi-refresh"
-        :loading="store.loading"
-        @click="refresh"
-      >
-        更新
-      </v-btn>
-      <v-btn
-        color="primary"
-        prepend-icon="mdi-play-outline"
-        @click="runDialog = true"
-      >
-        手動実行
-      </v-btn>
+      <HelpTip :text="HELP.runList.refresh">
+        <template #default="{ props }">
+          <v-btn
+            v-bind="props"
+            data-test="refresh"
+            variant="text"
+            prepend-icon="mdi-refresh"
+            :loading="store.loading"
+            @click="refresh"
+          >
+            更新
+          </v-btn>
+        </template>
+      </HelpTip>
+      <HelpTip :text="HELP.runList.manualRun">
+        <template #default="{ props }">
+          <v-btn
+            v-bind="props"
+            data-test="manual-run"
+            color="primary"
+            prepend-icon="mdi-play-outline"
+            @click="runDialog = true"
+          >
+            手動実行
+          </v-btn>
+        </template>
+      </HelpTip>
     </div>
 
     <v-card
@@ -227,37 +251,39 @@ onUnmounted(stopPolling)
               実行日時
             </th>
             <th class="text-end text-no-wrap">
-              合計金額
+              <HelpTip :text="HELP.summary.total_amount">
+                <template #default="{ props }">
+                  <span v-bind="props">合計金額</span>
+                </template>
+              </HelpTip>
             </th>
             <th class="text-no-wrap">
-              配布状況
+              <HelpTip :text="HELP.runList.distribution">
+                <template #default="{ props }">
+                  <span v-bind="props">配布状況</span>
+                </template>
+              </HelpTip>
             </th>
             <th class="text-no-wrap">
               ダウンロード
             </th>
             <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              試行回数
+              <HelpTip :text="HELP.runList.attempt">
+                <template #default="{ props }">
+                  <span v-bind="props">試行回数</span>
+                </template>
+              </HelpTip>
             </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              テナント数
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              地点数
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              通信なし
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              除外
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              要確認
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              取得失敗
-            </th>
-            <th class="text-end text-no-wrap d-none d-xl-table-cell">
-              消えた地点
+            <th
+              v-for="column in COUNT_COLUMNS"
+              :key="column.key"
+              class="text-end text-no-wrap d-none d-xl-table-cell"
+            >
+              <HelpTip :text="HELP.summary[column.key]">
+                <template #default="{ props }">
+                  <span v-bind="props">{{ column.label }}</span>
+                </template>
+              </HelpTip>
             </th>
           </tr>
         </thead>
@@ -286,6 +312,11 @@ onUnmounted(stopPolling)
               >
                 {{ run.month }}
               </router-link>
+              <TriggerChip
+                :trigger="run.trigger"
+                :data-test="`trigger-${run.target_env}-${run.month}`"
+                class="ml-2"
+              />
             </td>
             <td>
               <StatusChip :status="run.status" />
@@ -309,17 +340,22 @@ onUnmounted(stopPolling)
               {{ distributionLabel(run) }}
             </td>
             <td>
-              <v-btn
-                :data-test="`download-${run.target_env}-${run.month}`"
-                :disabled="!canDownload(run)"
-                :loading="store.downloading === downloadKey(run)"
-                size="small"
-                variant="text"
-                prepend-icon="mdi-file-excel-outline"
-                @click="store.download(run.month, run.target_env)"
-              >
-                Excel
-              </v-btn>
+              <HelpTip :text="HELP.download">
+                <template #default="{ props }">
+                  <v-btn
+                    v-bind="props"
+                    :data-test="`download-${run.target_env}-${run.month}`"
+                    :disabled="!canDownload(run)"
+                    :loading="store.downloading === downloadKey(run)"
+                    size="small"
+                    variant="text"
+                    prepend-icon="mdi-file-excel-outline"
+                    @click="store.download(run.month, run.target_env)"
+                  >
+                    Excel
+                  </v-btn>
+                </template>
+              </HelpTip>
               <div
                 v-if="!canDownload(run)"
                 :data-test="`download-reason-${run.target_env}-${run.month}`"
@@ -331,26 +367,12 @@ onUnmounted(stopPolling)
             <td class="text-end d-none d-xl-table-cell">
               {{ run.attempt }}
             </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.tenant_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.device_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.no_data_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.excluded_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.review_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.failed_tenant_count) }}
-            </td>
-            <td class="text-end d-none d-xl-table-cell">
-              {{ formatCount(run.summary?.missing_count) }}
+            <td
+              v-for="column in COUNT_COLUMNS"
+              :key="column.key"
+              class="text-end d-none d-xl-table-cell"
+            >
+              {{ formatCount(run.summary?.[column.key]) }}
             </td>
           </tr>
         </tbody>

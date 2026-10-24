@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cognito ユーザーの MFA 設定状況を一覧する（設計 6.4 の段階 3 の確認用）。
+# Cognito ユーザーの MFA 設定状況を一覧する（設計 6.4）。
 #
 # 使い方:
 #   scripts/list-mfa-status.sh dev
@@ -72,5 +72,5 @@ if [ "${total}" -eq 0 ]; then
 fi
 echo "ユーザー数: ${total} / MFA 未設定: ${without_mfa}"
 if [ "${without_mfa}" -gt 0 ]; then
-  echo "MFA 未設定のユーザーには TOTP の登録を依頼してください（設計 6.4）。"
+  echo "MFA は任意のため未設定でも利用できる（設計 6.4）。必須へ戻す前にはこの件数をゼロにする。"
 fi

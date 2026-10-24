@@ -9,7 +9,7 @@
 | 作成者 | 弊社 開発部 |
 | 対象読者 | 社内プロマネ・開発部・運用担当 |
 | 上位設計書 | [`DESIGN.md`](DESIGN.md)（プラットフォーム） / [`apps/saas-a-billing/DESIGN.md`](apps/saas-a-billing/DESIGN.md)（第一弾アプリ） |
-| Excel 版 | [`files/料金見積.xlsx`](files/料金見積.xlsx) |
+| Excel 版 | 公開版では省略（同じ内容は本書） |
 
 > 社内保守管理サイト `example-backoffice`（基盤 + 第一弾アプリ `saas-a-billing`）の月額コスト見積。**単価は AWS Pricing MCP（Price List API）から取得**（取得日 2026-08-28、税別・USD）。dev / prod は同一 AWS アカウント（210000000001）・同一リージョン（ap-northeast-1）にスタック名の接尾辞で共存するため、**環境ごとに試算し合計も示す**。
 >
@@ -54,7 +54,7 @@
 | R4 | Route 53 レコード | 既存共有ゾーン `example-cloud.com` に Alias A / AAAA を追加 | DESIGN §5.1 |
 | R5 | S3（SPA） | Standard、SSE-S3、OAC 経由のみ | DESIGN §11.2 |
 | R6 | S3（attachments） | Standard、SSE-S3。`{app}/{yyyy}/{mm}/` に Excel / result.json / parts | DESIGN §11.2 |
-| R7 | Cognito User Pool | `UserPoolTier: LITE`、TOTP MFA、`@example.co.jp` 限定セルフサインアップ | DESIGN §6.1 / 確定事項 |
+| R7 | Cognito User Pool | `UserPoolTier: LITE`、TOTP MFA（任意）、`@example.co.jp` 限定セルフサインアップ | DESIGN §6.1 / 確定事項 |
 | R8 | API Gateway HTTP API | `$default` ステージ、Cognito JWT authorizer。アプリごとに 1 API | DESIGN §5.3 |
 | R9 | Lambda（api） | Python 3.13、512 MB、timeout 29 秒 | saas-a-billing DESIGN §5.5 |
 | R10 | Lambda（trigger） | Python 3.13、256 MB、timeout 60 秒 | 同上 |
@@ -363,7 +363,7 @@
 - **WAF を後から付ける場合の追加費用**: CloudFront スコープの WebACL 1 個 + IP set ルール 1 本で **1 環境あたり月 約 $6.06**（WebACL $5.00 + ルール $1.00 + リクエスト 100,000 × $0.0000006 = $0.06）。dev + prod では **月 約 $12.07**。ブロック件数の可視化や WAF ログが必要になった時点で追加できる（単価は §10 付録の awswaf sku を参照）。
 - **Cognito User Pool にリージョナル WebACL を付ける場合**（DESIGN §5.5）: **月 +$6.00**（WebACL $5.00 + ルール $1.00）。`cognito-idp` エンドポイントは CloudFront を経由しないため、CloudFront Function では保護できない点に注意する。
 - **CloudFront 定額プランを採用した場合**: Free プラン（$0/月、1,000,000 リクエスト / 100 GB 転送 / S3 5 GB）が適用できれば prod の CloudFront $0.23 が不要になり **月 -$0.23**（dev -$0.06）。ただし DESIGN §16 のとおり定額プランは**既定では採らない**（(1) CloudFormation / SAM から指定できず CLI・API による後処理が必要、(2) アクセスログと WAF ログが出ず DESIGN §12.4 のログ要件を満たせない、(3) IP set ベースのルールが Free の 5 ルール枠でどう扱われるか公式に未記載）。運用開始後の**任意の最適化**として `aws pricing-plan-manager` による加入手順が存在する。Pro プラン（$15/月）を選ぶと逆に **月 +$14.6 程度の増**となる。
-- **MFA 必須化後に IP 制限を外した場合**（DESIGN §7）: CloudFront Function は 200 万実行まで無料のため、**コスト影響はない**（WAF 方式では -$6/環境の削減効果があったが、v0.3 では既にゼロ）。関数から IP 判定ロジックを外しても SPA フォールバックのために関数自体は残す。
+- **将来 MFA を必須へ戻して IP 制限を外した場合**（DESIGN §7.2）: CloudFront Function は 200 万実行まで無料のため、**コスト影響はない**（WAF 方式では -$6/環境の削減効果があったが、v0.3 では既にゼロ）。関数から IP 判定ロジックを外しても SPA フォールバックのために関数自体は残す。
 
 ### 8.3 その他
 
@@ -382,7 +382,7 @@
 | 上位設計書（基盤） | [`DESIGN.md`](DESIGN.md) | リソース構成・スタック分割・**入口の IP 制限（§7 CloudFront Function による IP 判定）**・通知基盤・ログ保持（§12.4）・コスト方針（§16 CloudFront 従量課金） |
 | 上位設計書（アプリ） | [`apps/saas-a-billing/DESIGN.md`](apps/saas-a-billing/DESIGN.md) | バッチ経路・Lambda のメモリ / タイムアウト・実測値 |
 | 技術調査 | [`research/research_R5.md`](research/research_R5.md) | 採用技術の裏取り |
-| Excel 版 | [`files/料金見積.xlsx`](files/料金見積.xlsx) | 同内容を Excel 表形式で（社内配布用） |
+| Excel 版 | 公開版では省略 | 同内容を Excel 表形式で（社内配布用） |
 
 ---
 

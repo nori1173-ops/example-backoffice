@@ -124,6 +124,18 @@ def test_attaches_object_from_s3(ses, s3):
     assert attachment["ContentType"] == XLSX_CONTENT_TYPE
 
 
+def test_attachment_is_sent_as_base64(ses, s3):
+    key = "saas-a-billing/2026/08/saas_a_billing_2026-08.xlsx"
+    s3.put_object(Bucket=BUCKET, Key=key, Body=b"PK\x03\x04\x80\xff\r\nbinary")
+    message = make_message(
+        attachments=[{"bucket": BUCKET, "key": key, "filename": "saas_a_billing_2026-08.xlsx"}]
+    )
+
+    send_email(message=message, from_address=FROM_ADDRESS, s3_client=s3, sesv2_client=ses)
+
+    assert ses.request["Content"]["Simple"]["Attachments"][0]["ContentTransferEncoding"] == "BASE64"
+
+
 def test_attachment_content_type_defaults_to_octet_stream(ses, s3):
     key = "saas-a-billing/2026/08/report.csv"
     s3.put_object(Bucket=BUCKET, Key=key, Body=b"a,b,c\n")

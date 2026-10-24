@@ -1,10 +1,12 @@
 import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
+import { createPinia, setActivePinia, type Pinia } from 'pinia'
 import { createMemoryHistory, createRouter, type Router } from 'vue-router'
 import { createVuetify } from 'vuetify'
 import * as components from 'vuetify/components'
 import * as directives from 'vuetify/directives'
+import { useUiStore } from '@/stores/ui'
 import { billingApi } from '../api'
 import EnvBadge from '../components/EnvBadge.vue'
 import type {
@@ -56,13 +58,13 @@ function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
     target_env: 'verification',
     cutoff_day: 20,
     cutoff_time: '24:00',
-    auto_retry_days: 5,
     auto_run_enabled: false,
     auto_run_from_month: '2026-01',
     mail_enabled: true,
     slack_enabled: true,
     mail_to: ['devA@example.co.jp'],
     mail_cc: [],
+    mail_attachment_sheets: 'billing_only',
     slack_channel_id: 'C0123ABCD',
     slack_channel_label: '#billing',
     slack_mention: '',
@@ -111,6 +113,7 @@ function makeTenant(overrides: Partial<TenantResult> = {}): TenantResult {
     tenant_cd: 'T001',
     tenant_name: '○○株式会社',
     tenant_description: '',
+    tenant_excluded: false,
     retention_period: 3,
     device_count_api: 3,
     status: 'ok',
@@ -220,6 +223,7 @@ function makeMissing(overrides: Partial<MissingDevice> = {}): MissingDevice {
 const Host = { components: { RunDetailView }, template: '<KeepAlive><RunDetailView /></KeepAlive>' }
 
 let router: Router
+let pinia: Pinia
 
 async function mountView(targetEnv: TargetEnv = 'verification'): Promise<VueWrapper> {
   router = createRouter({
@@ -237,7 +241,7 @@ async function mountView(targetEnv: TargetEnv = 'verification'): Promise<VueWrap
   await router.isReady()
 
   const vuetify = createVuetify({ components, directives })
-  const wrapper = mount(Host, { global: { plugins: [vuetify, router] } })
+  const wrapper = mount(Host, { global: { plugins: [pinia, vuetify, router] } })
   await flushPromises()
   return wrapper as unknown as VueWrapper
 }
@@ -246,8 +250,17 @@ function deviceRowTexts(wrapper: VueWrapper): string[] {
   return wrapper.findAll('[data-test="device-row"]').map((row) => row.text())
 }
 
+/** 開いているツールチップの文言。 */
+function activeTooltips(): string {
+  return Array.from(document.body.querySelectorAll('.v-overlay--active'))
+    .map((overlay) => overlay.textContent ?? '')
+    .join(' ')
+}
+
 beforeEach(() => {
   document.body.innerHTML = ''
+  pinia = createPinia()
+  setActivePinia(pinia)
   holder.runs.runs = []
   holder.runs.loading = false
   holder.runs.error = null
@@ -445,7 +458,7 @@ describe('RunDetailView', () => {
     expect(review.attributes('style')).toContain('#C00000')
   })
 
-  it('消えた地点が灰字の別ブロックに出る', async () => {
+  it('消えた地点がピンクの別ブロックに出る', async () => {
     vi.mocked(billingApi.getRun).mockResolvedValue(
       makeDetail({ result: makeResult({ missing_devices: [makeMissing()] }) }),
     )
@@ -454,8 +467,13 @@ describe('RunDetailView', () => {
     const block = wrapper.find('[data-test="missing-devices"]')
     expect(block.exists()).toBe(true)
     expect(block.text()).toContain('消えた地点X')
+    expect(block.text()).toContain(
+      '前月分の結果にあり今回の地点一覧に無い地点です。金額には計上していません。',
+    )
     expect(deviceRowTexts(wrapper).join(' ')).not.toContain('消えた地点X')
-    expect(block.find('[data-test="missing-row"]').attributes('style')).toContain('#808080')
+    const style = block.find('[data-test="missing-row"]').attributes('style')
+    expect(style).toContain('#FCE4EC')
+    expect(style).toContain('#616161')
   })
 
   it('判定フィルタで行が絞られる', async () => {
@@ -566,6 +584,12 @@ describe('RunDetailView', () => {
     )
   })
 
+  it('課金対象期間は観測データの日時基準と書く', async () => {
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="closing-period"]').text()).toContain('観測データの日時基準・JST）')
+  })
+
   // 日時・金額の表記は format.ts に統一する（UI-13 / UI-16）
   it('最終受信日時が YYYY-MM-DD HH:mm で出る', async () => {
     vi.mocked(billingApi.getRun).mockResolvedValue(
@@ -598,16 +622,140 @@ describe('RunDetailView', () => {
     }
   })
 
+  // テナントがデモかどうかを名前の並びで読ませる（#1010）
+  it('テナント行に説明が出る', async () => {
+    vi.mocked(billingApi.getRun).mockResolvedValue(
+      makeDetail({
+        result: makeResult({
+          tenants: [makeTenant({ tenant_description: 'デモ用テナント', tenant_excluded: true })],
+        }),
+      }),
+    )
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="tenant-description"]').text()).toBe('デモ用テナント')
+  })
+
+  it('説明が空ならテナント行に説明を出さない', async () => {
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="tenant-description"]').exists()).toBe(false)
+  })
+
+  it('デモテナントのテナント行に色分けの class が付く', async () => {
+    vi.mocked(billingApi.getRun).mockResolvedValue(
+      makeDetail({
+        result: makeResult({
+          tenants: [
+            makeTenant({ tenant_description: 'デモ用テナント', tenant_excluded: true }),
+            makeTenant({ tenant_cd: 'T002', devices: [makeDevice({ device_cd: 'B1' })] }),
+          ],
+        }),
+      }),
+    )
+    const wrapper = await mountView()
+
+    const rows = wrapper.findAll('[data-test="tenant-row"]')
+    expect(rows[0].classes()).toContain('tenant-row--excluded')
+    expect(rows[1].classes()).not.toContain('tenant-row--excluded')
+  })
+
+  // tenant_excluded を持たない過去の result.json でも色分けを保つ（#1010）
+  it('フラグが無い古い結果は設定スナップショットから判定する', async () => {
+    const legacy = { ...makeTenant({ tenant_description: 'デモ用テナント' }) } as Partial<TenantResult>
+    delete legacy.tenant_excluded
+    vi.mocked(billingApi.getRun).mockResolvedValue(
+      makeDetail({
+        result: makeResult({
+          settings_snapshot: { exclude_keywords: ['デモ'], camera_format_names: [] },
+          tenants: [legacy as TenantResult],
+        }),
+      }),
+    )
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="tenant-row"]').classes()).toContain('tenant-row--excluded')
+  })
+
+  it('settings_snapshot が無い古い結果でも既定の除外キーワードで判定する', async () => {
+    const legacy = makeResult({
+      tenants: [makeTenant({ tenant_description: 'デモ用テナント' })],
+    }) as Partial<RunResult>
+    delete legacy.settings_snapshot
+    delete (legacy.tenants as Partial<TenantResult>[])[0].tenant_excluded
+    vi.mocked(billingApi.getRun).mockResolvedValue(makeDetail({ result: legacy as RunResult }))
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="tenant-row"]').classes()).toContain('tenant-row--excluded')
+  })
+
   // 色だけが手掛かりだった行の塗り分けに意味を添える（UI-20）
   it('判定の凡例が地点表に出る', async () => {
     const wrapper = await mountView()
 
     const legend = wrapper.find('[data-test="judgement-legend"]')
     expect(legend.exists()).toBe(true)
-    for (const label of ['課金', '通信なし', '除外', '取得失敗', '消えた地点']) {
+    for (const label of ['課金', '通信なし', '除外', '取得失敗', '消えた地点', 'デモテナント']) {
       expect(legend.text()).toContain(label)
     }
+    expect(wrapper.find('[data-test="judgement-help"]').text()).toContain('テナント説明が除外キーワードに一致')
     expect(wrapper.find('[data-test="judgement-help"]').text()).toContain('OVER_MAX_ITEMS')
+  })
+
+  // どの結果がバッチのものか一目で分かるようにする（#1013）
+  it('ヘッダにスケジュール実行の「自動」バッジが出る', async () => {
+    vi.mocked(billingApi.getRun).mockResolvedValue(makeDetail({ run: makeRun({ trigger: 'scheduled' }) }))
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger"]').text()).toBe('自動')
+  })
+
+  it('ヘッダに手動実行の「手動」バッジが出る', async () => {
+    vi.mocked(billingApi.getRun).mockResolvedValue(makeDetail({ run: makeRun({ trigger: 'manual' }) }))
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="trigger"]').text()).toBe('手動')
+  })
+
+  it('ヘルプモード ON で自動 / 手動バッジの説明が出る', async () => {
+    useUiStore().toggleHelpMode()
+    vi.mocked(billingApi.getRun).mockResolvedValue(makeDetail({ run: makeRun({ trigger: 'manual' }) }))
+    const wrapper = await mountView()
+
+    await wrapper.find('[data-test="trigger"]').trigger('mouseenter')
+    await flushPromises()
+
+    expect(activeTooltips()).toContain('締め日時より前の手動実行の結果は、締め後の自動実行が集計し直して上書きします')
+  })
+
+  // 画面の語の意味が分からないという指摘への対応（#1012）
+  it('ヘルプモード ON で件数タイル・絞り込み・判定チップの説明が出る', async () => {
+    useUiStore().toggleHelpMode()
+    const wrapper = await mountView()
+
+    const missingTile = wrapper
+      .findAll('[data-test="summary-item"]')
+      .find((item) => item.text().includes('消えた地点'))
+    await missingTile?.find('div').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('今回の地点一覧に無い地点')
+
+    await wrapper.find('[data-test="boundary-only"]').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('ベンダーA側の締め処理時刻との微差')
+
+    await wrapper.find('[data-test="device-row"] .judgement-chip__label').trigger('mouseenter')
+    await flushPromises()
+    expect(activeTooltips()).toContain('締め期間内に受信があり課金対象')
+  })
+
+  it('ヘルプモード OFF ではツールチップが開かない', async () => {
+    const wrapper = await mountView()
+
+    await wrapper.find('[data-test="device-row"] .judgement-chip__label').trigger('mouseenter')
+    await flushPromises()
+
+    expect(document.body.querySelectorAll('.v-overlay--active')).toHaveLength(0)
   })
 
   // keep-alive のせいで別の月の数字が残っていた（UI-01）
@@ -763,6 +911,22 @@ describe('RunDetailView', () => {
     )
     // 上部の帯は詳細取得の失敗専用にする（実行の失敗と混ざって読めなかった）
     expect(wrapper.find('[data-test="page-error"]').exists()).toBe(false)
+  })
+
+  // 取得失敗があると配布を見送るため、なぜ配られなかったのかを画面で分かるようにする（#1006）
+  it('配布を見送った理由を出す', async () => {
+    vi.mocked(billingApi.getRun).mockResolvedValue(
+      makeDetail({ run: makeRun({ distribute_note: '取得失敗 2 テナントのため配布見送り' }) }),
+    )
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="distribute-note"]').text()).toContain('取得失敗 2 テナント')
+  })
+
+  it('配布を見送っていない月には理由を出さない', async () => {
+    const wrapper = await mountView()
+
+    expect(wrapper.find('[data-test="distribute-note"]').exists()).toBe(false)
   })
 
   it('成功済みの月は開いた時点で強制再実行が要ると伝える', async () => {

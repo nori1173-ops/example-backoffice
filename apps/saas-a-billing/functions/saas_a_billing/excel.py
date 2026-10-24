@@ -22,7 +22,8 @@ from saas_a_billing.period import CHANGE_DATETIME_FORMAT
 COLOR_NO_DATA = "#FDF3DC"
 COLOR_EXCLUDED = "#DFE9F8"
 COLOR_FAILED = "#E0E0E0"
-COLOR_MISSING_TEXT = "#808080"
+COLOR_MISSING = "#FCE4EC"
+COLOR_MISSING_TEXT = "#616161"
 COLOR_REVIEW_TEXT = "#C00000"
 COLOR_TOTAL_HIGHLIGHT = "#FFF2CC"
 RETENTION_3Y = ("#C6EFCE", "#006100")
@@ -65,6 +66,7 @@ SUMMARY_COLUMNS = (
     "要確認",
     "取得失敗",
     "小計",
+    "説明",
 )
 
 DETAIL_COLUMNS = (
@@ -85,6 +87,8 @@ DETAIL_COLUMNS = (
     "備考",
 )
 DETAIL_TABLE_NAME = "all_devices"
+SUMMARY_DESCRIPTION_COLUMN = len(SUMMARY_COLUMNS) - 1
+SUMMARY_DEMO_NOTE = "テナント説明が除外キーワードに一致するテナント（デモ）はサマリ行を除外色で表示"
 
 JUDGEMENT_LABELS = {"billable": "課金", "no_data": "通信なし", "excluded": "除外", "failed": "取得失敗"}
 CAMERA_SOURCE_LABELS = {"export": "export", "settings": "設定"}
@@ -201,27 +205,39 @@ def spec_block_lines(result: dict) -> list[str]:
         f"集計対象: {TARGET_ENV_LABELS.get(target_env, target_env)}（{run.get('saasa_host', '')}）",
         f"課金対象期間: {start.strftime(_DISPLAY_SECONDS_FORMAT)} 〜 "
         f"{(end - timedelta(seconds=1)).strftime(_DISPLAY_SECONDS_FORMAT)}"
-        " に受信データがある地点を課金対象とする（受信日時基準・JST）",
-        f"除外: テナント説明欄または地点備考欄に{_exclude_keywords_label(result)}を含む地点は課金対象外",
+        " に受信データがある地点を課金対象とする（観測データの日時基準・JST）",
+        f"除外: テナント説明欄または地点備考欄に{_exclude_keywords_label(result)}を含む地点は課金対象外"
+        "（集計を実行した時点の内容で判定）",
         f"使用単価表: {(result.get('price_table') or {}).get('effective_from', '').replace('-', '/')} 適用版"
         f"   環境: {run.get('env', '')}   試行: {run.get('attempt', '')} 回目",
         f"取得失敗テナント: {'、'.join(failed) if failed else 'なし'}",
     ]
 
 
-def footnote_lines(result: dict) -> list[str]:
+def footnote_lines(result: dict, *, billing_only: bool = False) -> list[str]:
     """シート1 末尾の脚注（設計 2.5 / 6.6）。"""
-    return [
+    lines = [
         "・課金対象期間に受信データがある地点だけを課金する。通信なしの地点は単価を表示するが 0 円で計上する",
         f"・テナント説明欄または地点備考欄に{_exclude_keywords_label(result)}を含む地点は課金対象外（0 円）。"
         "地点名・地点CD・現場名は除外判定に使わない",
         "・保存期間が 1 年 / 3 年以外のテナントは 3 年扱いの仮単価で計算し、赤字で要確認を付ける",
-        "・課金対象期間中に削除された地点は地点一覧に現れない。前回 RUN との差分を"
-        "「消えた地点」としてシート2に列挙する（金額は計上しない）",
+        "・カメラ地点: 課金対象期間の受信データに「Base64形式データ」の列がある地点、"
+        "または設定の「カメラ扱いフォーマット名」に一致する地点にカメラ単価を適用する（項目数は見ない）",
+        "・カメラ地点以外で、項目数が単価表の上限帯を超える地点は上限帯の仮単価で計算し、"
+        "項目数が 0 の地点は 0 円とする。どちらも赤字で要確認を付ける",
+        (
+            "・集計を実行するまでに削除された地点は地点一覧に現れない（金額は計上しない）"
+            if billing_only
+            else "・集計を実行するまでに削除された地点は地点一覧に現れない。前月分の結果との差分を"
+            "「消えた地点」としてシート2に列挙する（金額は計上しない）"
+        ),
         "・課金対象期間中に追加された地点は、受信があれば 1 か月分として課金する（日割りなし）",
         "・ベンダーA側の締め処理時刻と微差が出うるため、受信が課金対象期間の初日のみ・最終日のみだった地点は"
         "シート2の備考に「境界日のみ受信」と印を付ける",
     ]
+    if billing_only:
+        return [line for line in lines if not line.startswith("・ベンダーA側の締め処理時刻")]
+    return lines
 
 
 class _Formats:
@@ -267,7 +283,7 @@ class _Writer:
         self.worksheet = worksheet
         self._widths: dict[int, int] = {}
 
-    def write(self, row: int, col: int, value, fmt=None) -> None:
+    def write(self, row: int, col: int, value, fmt=None, count_width: bool = True) -> None:
         if isinstance(value, datetime):
             self.worksheet.write_datetime(row, col, value, fmt)
         elif value is None or value == "":
@@ -276,7 +292,8 @@ class _Writer:
             self.worksheet.write_string(row, col, value, fmt)
         else:
             self.worksheet.write(row, col, value, fmt)
-        self.reserve_width(col, column_width([_display(value)]))
+        if count_width:
+            self.reserve_width(col, column_width([_display(value)]))
 
     def reserve_width(self, col: int, width: int) -> None:
         """列幅の下限を上げる（本文より大きいフォントのセル用）。"""
@@ -303,7 +320,7 @@ def _display(value) -> str:
     return "" if value is None else str(value)
 
 
-def build_workbook(result: dict) -> bytes:
+def build_workbook(result: dict, *, billing_only: bool = False) -> bytes:
     """`result.json` 相当の dict から Excel のバイト列を作る（設計 6.6 / 6.7）。"""
     stream = io.BytesIO()
     workbook = xlsxwriter.Workbook(
@@ -315,8 +332,9 @@ def build_workbook(result: dict) -> bytes:
             "default_format_properties": {"font_name": FONT_NAME, "font_size": FONT_SIZE},
         },
     )
-    _write_sheet1(workbook, result)
-    _write_sheet2(workbook, result)
+    _write_sheet1(workbook, result, billing_only=billing_only)
+    if not billing_only:
+        _write_sheet2(workbook, result)
     workbook.close()
     return stream.getvalue()
 
@@ -443,15 +461,15 @@ def _write_price_table(writer: _Writer, formats: _Formats, price_table: dict, ro
     return row + len(bands) + 3
 
 
-def _write_footnotes(writer: _Writer, formats: _Formats, result: dict, row: int) -> int:
+def _write_footnotes(writer: _Writer, formats: _Formats, result: dict, row: int, *, billing_only: bool = False) -> int:
     writer.line(row, "脚注", formats.heading())
-    lines = footnote_lines(result)
+    lines = footnote_lines(result, billing_only=billing_only)
     for offset, line in enumerate(lines, start=1):
         writer.line(row + offset, line, formats.get())
     return row + len(lines) + 1
 
 
-def _write_sheet1(workbook, result: dict) -> None:
+def _write_sheet1(workbook, result: dict, *, billing_only: bool = False) -> None:
     """判定が「課金」の地点だけを載せる請求照合シート（設計 6.6）。"""
     worksheet = workbook.add_worksheet(SHEET1_NAME)
     formats = _Formats(workbook)
@@ -464,7 +482,7 @@ def _write_sheet1(workbook, result: dict) -> None:
             row = _write_tenant_block(writer, formats, tenant, row)
     row = _write_no_billable_tenants(writer, formats, tenants, row)
     row = _write_price_table(writer, formats, result.get("price_table") or {}, row)
-    _write_footnotes(writer, formats, result, row)
+    _write_footnotes(writer, formats, result, row, billing_only=billing_only)
     writer.apply_widths()
     worksheet.set_landscape()
     worksheet.set_paper(9)
@@ -505,34 +523,56 @@ def _tenant_counts(tenant: dict) -> dict:
     }
 
 
+def _summary_fill(tenant: dict) -> str | None:
+    """テナント説明が除外キーワードに一致するテナントは行ごと除外色で塗る（設計 6.6）。"""
+    return COLOR_EXCLUDED if tenant.get("tenant_excluded") else None
+
+
+def _summary_cells(formats: _Formats, tenant: dict, counts: dict) -> list[tuple]:
+    fill = _summary_fill(tenant)
+    retention = tenant.get("retention_period")
+    text = formats.get(**_cell_properties(fill))
+    count = formats.get(**_cell_properties(fill, num_format=COUNT_FORMAT))
+    return [
+        (tenant.get("tenant_cd") or "", text),
+        (tenant.get("tenant_name") or "", text),
+        (_retention_label(retention), formats.retention(retention, fill)),
+        (counts["device_count"], count),
+        (counts["billable"], count),
+        (counts["no_data"], count),
+        (counts["excluded"], count),
+        (counts["review"], count),
+        (counts["failed"], count),
+        (counts["subtotal"], formats.get(**_cell_properties(fill, num_format=CURRENCY_FORMAT))),
+    ]
+
+
 def _write_tenant_summary(writer: _Writer, formats: _Formats, tenants: list[dict], row: int) -> int:
     writer.line(row, "テナント別サマリ", formats.heading())
-    writer.row(row + 1, [(name, formats.header()) for name in SUMMARY_COLUMNS])
-    count = formats.get(num_format=COUNT_FORMAT)
+    writer.line(row + 1, SUMMARY_DEMO_NOTE, formats.get())
+    header = row + 2
+    writer.row(header, [(name, formats.header()) for name in SUMMARY_COLUMNS])
     subtotals = []
-    for offset, tenant in enumerate(tenants, start=2):
+    for offset, tenant in enumerate(tenants, start=1):
         counts = _tenant_counts(tenant)
         subtotals.append(counts["subtotal"])
-        retention = tenant.get("retention_period")
-        writer.row(
-            row + offset,
-            [
-                (tenant.get("tenant_cd") or "", formats.get()),
-                (tenant.get("tenant_name") or "", formats.get()),
-                (_retention_label(retention), formats.retention(retention)),
-                (counts["device_count"], count),
-                (counts["billable"], count),
-                (counts["no_data"], count),
-                (counts["excluded"], count),
-                (counts["review"], count),
-                (counts["failed"], count),
-                (counts["subtotal"], formats.get(num_format=CURRENCY_FORMAT)),
-            ],
-        )
-    total_row = row + len(tenants) + 2
+        writer.row(header + offset, _summary_cells(formats, tenant, counts))
+        _write_summary_description(writer, formats, tenant, header + offset)
+    total_row = header + len(tenants) + 1
     writer.write(total_row, 8, TOTAL_LABEL, formats.total_row(align="right", top=1))
     writer.write(total_row, 9, sum(subtotals), formats.total_row(num_format=CURRENCY_FORMAT, top=1))
     return total_row + 2
+
+
+def _write_summary_description(writer: _Writer, formats: _Formats, tenant: dict, row: int) -> None:
+    """説明は最終列に置き、幅計測から外す。物理列を明細と共有するため広げない（設計 6.6）。"""
+    writer.write(
+        row,
+        SUMMARY_DESCRIPTION_COLUMN,
+        tenant.get("tenant_description") or "",
+        formats.get(**_cell_properties(_summary_fill(tenant))),
+        count_width=False,
+    )
 
 
 def _detail_cells(formats: _Formats, tenant: dict, device: dict) -> list[tuple]:
@@ -568,9 +608,9 @@ def _detail_cells(formats: _Formats, tenant: dict, device: dict) -> list[tuple]:
 
 
 def _missing_cells(formats: _Formats, missing: dict) -> list[tuple]:
-    """消えた地点は灰字で明細の末尾に並べる。金額は計上しない（設計 6.5）。"""
-    text = formats.get(font_color=COLOR_MISSING_TEXT)
-    center = formats.get(font_color=COLOR_MISSING_TEXT, align="center")
+    """消えた地点は課金と紛れないよう桃色で明細の末尾に並べる。金額は計上しない（設計 6.5）。"""
+    text = formats.get(font_color=COLOR_MISSING_TEXT, bg_color=COLOR_MISSING)
+    center = formats.get(font_color=COLOR_MISSING_TEXT, bg_color=COLOR_MISSING, align="center")
     blank = (None, text)
     return [
         (missing.get("tenant_cd") or "", text),
@@ -587,7 +627,7 @@ def _missing_cells(formats: _Formats, missing: dict) -> list[tuple]:
         blank,
         blank,
         blank,
-        (f"前回 RUN（{missing.get('last_seen_month', '')}）に存在", text),
+        (f"前月分（{missing.get('last_seen_month', '')}）に存在", text),
     ]
 
 

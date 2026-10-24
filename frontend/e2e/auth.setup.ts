@@ -17,7 +17,7 @@ setup('認証済みの storageState を作る', async ({ page, context }) => {
   if (email && password) {
     await page.goto('/login')
     await page.getByLabel('メールアドレス').fill(email)
-    await page.getByLabel('パスワード').fill(password)
+    await page.getByLabel('パスワード', { exact: true }).fill(password)
     await page.getByRole('button', { name: 'サインイン' }).click()
   } else {
     await signInAs(page, 'user')

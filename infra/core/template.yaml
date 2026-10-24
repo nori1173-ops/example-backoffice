@@ -104,7 +104,7 @@ Resources:
           RequireLowercase: true
           RequireNumbers: true
           RequireSymbols: false
-      MfaConfiguration: "ON"
+      MfaConfiguration: OPTIONAL
       EnabledMfas:
         - SOFTWARE_TOKEN_MFA
       # COGNITO_DEFAULT で独自 From を使うには SES の送信認可ポリシーが別途要るため、

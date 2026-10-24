@@ -1,0 +1,81 @@
+{
+  "schema": "daily-security-report.daily.v2",
+  "date": "2026-10-14",
+  "sources": {
+    "guardduty": {
+      "status": "ok"
+    },
+    "cloudtrail": {
+      "status": "ok"
+    },
+    "metrics": {
+      "status": "ok"
+    },
+    "insights": {
+      "status": "ok"
+    },
+    "instances": {
+      "status": "ok"
+    },
+    "s3": {
+      "status": "ok"
+    }
+  },
+  "counters": {
+    "waf.blocked": 231
+  },
+  "comparisons": {
+    "waf.blocked": {
+      "baseline": 210,
+      "days": 7,
+      "ratio": 1.1,
+      "label": "",
+      "exceeded": false
+    }
+  },
+  "seen": {},
+  "excluded": {},
+  "instances": {
+    "ec2": [],
+    "lightsail": []
+  },
+  "duration_sec": 84,
+  "findings": [],
+  "finding_counts": {
+    "critical": 0,
+    "warning": 0
+  },
+  "rule_levels": {
+    "guardduty": "ok",
+    "cloudtrail": "ok",
+    "metrics": "ok",
+    "insights": "ok",
+    "instances": "ok",
+    "s3": "ok"
+  },
+  "levels": {
+    "guardduty": "ok",
+    "cloudtrail": "ok",
+    "metrics": "ok",
+    "insights": "ok",
+    "instances": "ok",
+    "s3": "ok"
+  },
+  "level": "ok",
+  "actors": {
+    "status": "ok",
+    "dormant": [],
+    "new": [],
+    "external": []
+  },
+  "ai": {
+    "status": "skipped"
+  },
+  "range": {
+    "from": "2026-10-14T00:00:00+09:00",
+    "to": "2026-10-15T00:00:00+09:00"
+  },
+  "no_baseline": [],
+  "baseline_missing": [],
+  "findings_truncated": {}
+}

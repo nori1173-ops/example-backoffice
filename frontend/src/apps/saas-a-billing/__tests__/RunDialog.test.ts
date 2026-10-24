@@ -41,13 +41,13 @@ function makeSettings(overrides: Partial<SettingsView> = {}): SettingsView {
     target_env: 'verification',
     cutoff_day: 20,
     cutoff_time: '24:00',
-    auto_retry_days: 5,
     auto_run_enabled: false,
     auto_run_from_month: '2026-01',
     mail_enabled: true,
     slack_enabled: true,
     mail_to: ['devA@example.co.jp'],
     mail_cc: ['cc@example.co.jp'],
+    mail_attachment_sheets: 'billing_only',
     slack_channel_id: 'C0123ABCD',
     slack_channel_label: '#proj-saas-a-billing',
     slack_mention: '',
@@ -91,6 +91,18 @@ async function click(testId: string): Promise<void> {
 async function toggle(testId: string): Promise<void> {
   field(testId).click()
   await flushPromises()
+}
+
+async function hover(testId: string): Promise<void> {
+  el(testId)!.dispatchEvent(new MouseEvent('mouseenter'))
+  await flushPromises()
+}
+
+/** 開いているツールチップの文言。 */
+function activeTooltips(): string {
+  return Array.from(document.body.querySelectorAll('.v-overlay--active'))
+    .map((overlay) => overlay.textContent ?? '')
+    .join(' ')
 }
 
 beforeEach(() => {
@@ -254,6 +266,18 @@ describe('RunDialog', () => {
     await click('run-submit')
 
     expect(useUiStore().snackbar.text).toContain('実行を受け付けました')
+  })
+
+  // 画面の語の意味が分からないという指摘への対応（#1012）
+  it('ヘルプモード ON で対象月と配布の説明が出る', async () => {
+    useUiStore().toggleHelpMode()
+    await mountDialog()
+
+    await hover('run-month')
+    expect(activeTooltips()).toContain('締め日時から課金対象期間が決まります')
+
+    await hover('run-distribute')
+    expect(activeTooltips()).toContain('OFF なら画面で見るだけで、誰にも送りません')
   })
 
   it('実行で createRun が呼ばれる', async () => {

@@ -97,12 +97,6 @@ async function logout(): Promise<void> {
           nav
         >
           <v-list-item
-            prepend-icon="mdi-shield-key-outline"
-            title="セキュリティ"
-            :to="{ name: 'mfa' }"
-            @click="closeOnNarrow"
-          />
-          <v-list-item
             prepend-icon="mdi-logout"
             title="ログアウト"
             @click="logout"
@@ -129,6 +123,28 @@ async function logout(): Promise<void> {
       </v-chip>
       <v-app-bar-title>{{ currentApp?.title ?? 'example-backoffice' }}</v-app-bar-title>
       <template #append>
+        <!-- トグル自身の説明はヘルプモードに関わらず常時出す（#1012） -->
+        <v-tooltip
+          v-if="currentApp?.helpMode"
+          text="ON にすると各ボタン・入力欄の説明がマウスオーバーで表示されます"
+          location="bottom"
+          max-width="320"
+          content-class="help-tip"
+        >
+          <template #activator="{ props }">
+            <v-btn
+              v-bind="props"
+              data-test="help-toggle"
+              icon="mdi-help-circle-outline"
+              :color="ui.helpMode ? 'primary' : undefined"
+              :variant="ui.helpMode ? 'tonal' : 'text'"
+              aria-label="操作説明の表示切替"
+              :aria-pressed="ui.helpMode ? 'true' : 'false'"
+              class="me-2"
+              @click="ui.toggleHelpMode"
+            />
+          </template>
+        </v-tooltip>
         <span class="text-body-2 d-none d-sm-inline">{{ auth.email }}</span>
       </template>
       <template
@@ -184,3 +200,11 @@ async function logout(): Promise<void> {
     </v-snackbar>
   </v-app>
 </template>
+
+<style>
+/* オーバーレイは body へ teleport されるため scoped にしない（HelpTip.vue と同じ体裁） */
+.help-tip {
+  line-height: 1.5;
+  white-space: normal;
+}
+</style>

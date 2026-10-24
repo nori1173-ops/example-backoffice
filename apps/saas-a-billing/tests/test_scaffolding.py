@@ -92,7 +92,6 @@ def test_factories_return_design_defaults_and_accept_overrides():
     assert settings["target_env"] == "verification"
     assert settings["cutoff_day"] == 20
     assert settings["cutoff_time"] == "24:00"
-    assert settings["auto_retry_days"] == 5
     assert settings["auto_run_enabled"] is False
     assert settings["exclude_keywords"] == ["デモ"]
     assert settings["camera_format_names"] == []

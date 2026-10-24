@@ -277,7 +277,7 @@ def test_missing_ssm_raises_target_env_not_configured(aws, monkeypatch):
 
 
 @responses.activate
-def test_empty_price_table_seeds_default_2355(aws):
+def test_empty_price_table_seeds_default_2001(aws):
     """単価表が 1 版も無ければ既定値（support-tracker #2001）を自動シードして続行する。"""
     put_settings(aws)
     acquire()

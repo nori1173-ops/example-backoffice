@@ -20,6 +20,7 @@ const { mockApps } = vi.hoisted(() => ({
       title: 'サンプル請求',
       icon: 'mdi-file-chart-outline',
       requiredGroups: ['billing'],
+      helpMode: true,
       routes: [],
       nav: [
         { title: 'レポート一覧', to: '/sample-billing' },
@@ -56,7 +57,6 @@ function createTestRouter(): Router {
     history: createMemoryHistory(),
     routes: [
       { path: '/', name: 'home', component: StubView },
-      { path: '/mfa', name: 'mfa', component: StubView },
       { path: '/login', name: 'login', component: StubView },
       {
         path: '/sample-billing',
@@ -69,6 +69,12 @@ function createTestRouter(): Router {
         name: 'sample-billing-settings',
         component: StubView,
         meta: { appId: 'sample-billing' },
+      },
+      {
+        path: '/device-master',
+        name: 'device-master',
+        component: StubView,
+        meta: { appId: 'device-master' },
       },
     ],
   })
@@ -185,10 +191,10 @@ describe('ShellLayout', () => {
     expect(tabs).toEqual(['レポート一覧', '設定'])
   })
 
-  it('セキュリティとログアウトが末尾にある', async () => {
+  it('ログアウトが末尾にある', async () => {
     const wrapper = await mountShell()
 
-    expect(navTitles(wrapper).slice(-2)).toEqual(['セキュリティ', 'ログアウト'])
+    expect(navTitles(wrapper).slice(-1)).toEqual(['ログアウト'])
   })
 
   // dev サイトと本番サイトの取り違えを防ぐ常時表示（UI-12 / R7）
@@ -199,6 +205,42 @@ describe('ShellLayout', () => {
     expect(chip.exists()).toBe(true)
     expect(chip.text()).toBe('検証環境')
     expect(chip.classes()).toContain('bg-orange')
+  })
+
+  // 画面の語の意味が分からないという指摘への対応（#1012）
+  it('？トグルでヘルプモードが反転する', async () => {
+    const wrapper = await mountShell('/sample-billing')
+    const ui = useUiStore()
+
+    const toggle = wrapper.find('[data-test="help-toggle"]')
+    expect(toggle.attributes('aria-label')).toBe('操作説明の表示切替')
+    expect(toggle.attributes('aria-pressed')).toBe('false')
+
+    await toggle.trigger('click')
+    expect(ui.helpMode).toBe(true)
+    await nextTick()
+    expect(toggle.attributes('aria-pressed')).toBe('true')
+    expect(toggle.classes()).toContain('text-primary')
+
+    await toggle.trigger('click')
+    expect(ui.helpMode).toBe(false)
+  })
+
+  it('？トグルはメールアドレスの前に出る', async () => {
+    const wrapper = await mountShell('/sample-billing')
+
+    const html = wrapper.html()
+    const toggleAt = html.indexOf('help-toggle')
+    expect(toggleAt).toBeGreaterThan(-1)
+    expect(toggleAt).toBeLessThan(html.indexOf('user@example.co.jp'))
+  })
+
+  // HelpTip を持たないアプリでは ON にしても何も起きない「死んだトグル」になる
+  it('helpMode を宣言していないアプリでは？トグルが出ない', async () => {
+    expect((await mountShell('/device-master')).find('[data-test="help-toggle"]').exists()).toBe(
+      false,
+    )
+    expect((await mountShell('/')).find('[data-test="help-toggle"]').exists()).toBe(false)
   })
 
   it('VITE_SITE_ENV=prod なら本番チップが出る', async () => {

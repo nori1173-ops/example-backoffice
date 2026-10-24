@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { formatCount, formatDate, formatYen } from '@/utils/format'
+import HelpTip from '@/components/HelpTip.vue'
+import { HELP } from '../help'
 import type { Band, PriceTable, PriceVersion } from '../types'
 
 interface BandForm {
@@ -200,14 +202,19 @@ watch(() => props.versions, seed, { immediate: true })
     <template v-if="editable">
       <v-divider />
       <v-card-actions v-if="!formOpen">
-        <v-btn
-          data-test="price-revise-open"
-          color="primary"
-          variant="text"
-          @click="openForm"
-        >
-          単価を改定する
-        </v-btn>
+        <HelpTip :text="HELP.settings.priceRevise">
+          <template #default="{ props: tip }">
+            <v-btn
+              v-bind="tip"
+              data-test="price-revise-open"
+              color="primary"
+              variant="text"
+              @click="openForm"
+            >
+              単価を改定する
+            </v-btn>
+          </template>
+        </HelpTip>
         <span class="text-caption text-medium-emphasis">
           単価が変わったときに、新しい単価と適用開始日を登録します
         </span>
@@ -226,28 +233,38 @@ watch(() => props.versions, seed, { immediate: true })
               cols="12"
               sm="4"
             >
-              <v-text-field
-                v-model="effectiveFrom"
-                data-test="price-effective-from"
-                label="適用開始日"
-                placeholder="YYYY-MM-DD"
-                density="comfortable"
-                variant="outlined"
-                hide-details
-              />
+              <HelpTip :text="HELP.settings.priceEffectiveFrom">
+                <template #default="{ props: tip }">
+                  <v-text-field
+                    v-bind="tip"
+                    v-model="effectiveFrom"
+                    data-test="price-effective-from"
+                    label="適用開始日"
+                    placeholder="YYYY-MM-DD"
+                    density="comfortable"
+                    variant="outlined"
+                    hide-details
+                  />
+                </template>
+              </HelpTip>
             </v-col>
             <v-col
               cols="12"
               sm="8"
             >
-              <v-text-field
-                v-model="note"
-                data-test="price-note"
-                label="備考（改定の根拠など）"
-                density="comfortable"
-                variant="outlined"
-                hide-details
-              />
+              <HelpTip :text="HELP.settings.priceNote">
+                <template #default="{ props: tip }">
+                  <v-text-field
+                    v-bind="tip"
+                    v-model="note"
+                    data-test="price-note"
+                    label="備考（改定の根拠など）"
+                    density="comfortable"
+                    variant="outlined"
+                    hide-details
+                  />
+                </template>
+              </HelpTip>
             </v-col>
           </v-row>
 
@@ -350,15 +367,25 @@ watch(() => props.versions, seed, { immediate: true })
           >
             キャンセル
           </v-btn>
-          <v-btn
-            data-test="price-add"
-            color="primary"
-            variant="flat"
-            :disabled="Boolean(error)"
-            @click="submit"
-          >
-            改定を登録
-          </v-btn>
+          <!-- disabled なボタンはマウスイベントを受け取らないので、activator をラッパ側に置く -->
+          <HelpTip :text="HELP.settings.priceAdd">
+            <template #default="{ props: tip }">
+              <span
+                v-bind="tip"
+                class="d-inline-block"
+              >
+                <v-btn
+                  data-test="price-add"
+                  color="primary"
+                  variant="flat"
+                  :disabled="Boolean(error)"
+                  @click="submit"
+                >
+                  改定を登録
+                </v-btn>
+              </span>
+            </template>
+          </HelpTip>
         </v-card-actions>
       </template>
     </template>
